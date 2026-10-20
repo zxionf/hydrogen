@@ -1,0 +1,41 @@
+# Decisions
+## [1] 2026-10-20 08:24:40 UTC
+Change: 20261020-encrypted-persistence-core
+Context: 项目当前只有方向性目标；插件、同步、GUI 都是后续能力。
+Decision: 首个变更只实现加密持久化内核（命名空间/集合/记录 + 加密 + 事务），插件、同步与 FFI 实现后置。
+Consequences: 内核可独立验证；后续能力通过命名空间隔离与追加变更日志接入，不重写存储格式。
+## [2] 2026-10-20 08:24:40 UTC
+Change: 20261020-encrypted-persistence-core
+Context: 整库或页级加密实现复杂、失败面大；记录级加密能在不改 redb 的前提下控制粒度。
+Decision: 记录体使用 XChaCha20-Poly1305 做记录级 AEAD；DK 经 HKDF-SHA256 派生记录/元数据/校验子密钥；AAD 绑定命名空间、集合、ID 与 header。
+Consequences: 记录不可跨域搬运、header 篡改可检测；明文元数据仍泄露；轮换需逐条重加密。
+## [3] 2026-10-20 08:24:40 UTC
+Change: 20261020-encrypted-persistence-core
+Context: 需要跨 Android/桌面/服务端一致的口令解锁，且不能依赖系统钥匙串。
+Decision: 口令经 Argon2id（默认 m=65536KiB、t=3、p=1，参数随库存储）派生 KEK，KEK 仅用于包裹随机 DK；KEK 在会话内保留以支持改口令与轮换。
+Consequences: 无口令无法解密；改口令只重包裹 DK；会话内存持有 KEK/DK，关闭时清零；口令错误统一返回 InvalidKey。
+## [4] 2026-10-20 08:24:40 UTC
+Change: 20261020-encrypted-persistence-core
+Context: SPEC 暂定 serde_json，需要可读、易调试且与加密解耦的编码。
+Decision: 记录体用 serde + serde_json 编码后整体加密；编码属于载荷层，存储层只看到字节。
+Consequences: 调试与迁移直观；体积与性能弱于二进制；未来可替换编码而不改 RecordBlob，只需提升 data_version。
+## [5] 2026-10-20 08:24:40 UTC
+Change: 20261020-encrypted-persistence-core
+Context: 内核要服务笔记、剪贴板、备忘录等多功能，并为插件与多端同步留边界。
+Decision: 数据模型固定为命名空间 → 集合 → 记录；ID 用 UUIDv7；写入递增 rev；删除写墓碑；物理删除仅保留为本地 purge。
+Consequences: 跨端 ID 无冲突、删除可传播；墓碑会占用空间，需要后续压缩策略；列表暂只按 ID 升序。
+## [6] 2026-10-20 08:24:40 UTC
+Change: 20261020-encrypted-persistence-core
+Context: redb 是同步 API；上层需要 async，且 core 要适配 Android 与服务端。
+Decision: shio-core 保持同步、不依赖 tokio；shio 提供 tokio async facade，经 spawn_blocking 调用 core。
+Consequences: core 可复用、易测试；future 取消不会中止已开始的文件操作；关闭与并发需要显式协调。
+## [7] 2026-10-20 08:24:40 UTC
+Change: 20261020-encrypted-persistence-core
+Context: 需要单文件、嵌入式、事务与 MVCC；暂不需要 SQL 与多写进程。
+Decision: 使用 redb 单文件，固定 meta/keys/catalog/records 四张表；复合键用长度前缀编码，值自描述 header+nonce+密文。
+Consequences: 部署简单、无外部依赖；文件锁限制单写进程；表结构演进需提升 format 并显式迁移。
+## [8] 2026-10-20 08:37:53 UTC
+Change: 20261020-encrypted-persistence-core
+Context: CONTRACT 禁止 unsafe；用户澄清核心诉求是内核不得出现未定义行为、未处理错误或崩溃，稳定性优先。
+Decision: 把稳定性列为硬约束：core/facade 禁止 unsafe，可恢复失败一律返回 Result，非测试代码禁用 unwrap/expect/panic!，落盘输入先校验；FFI 若引入 unsafe 必须隔离、审计、catch_unwind 并经用户批准。
+Consequences: 崩溃面收敛到已证明的不变式；C++/Android 的 C ABI 暂缓；实现阶段需用 clippy、fuzz 与损坏输入测试兜底。

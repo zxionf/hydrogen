@@ -1,0 +1,17 @@
+[package]
+name = "shio"
+description = "shio 的 async facade：生命周期、句柄与 tokio 适配"
+edition.workspace = true
+version.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+secrecy.workspace = true
+serde.workspace = true
+shio-core.workspace = true
+tokio.workspace = true
+
+[lints]
+workspace = true

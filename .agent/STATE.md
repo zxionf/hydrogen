@@ -1,6 +1,6 @@
 # Agent State
 
 Active Change: 无
-Phase: 设计已关闭并折叠进 SPEC；实现未开始
-Blocked: 本机无 rustc/cargo；FFI 的 unsafe 边界待定
-Next: 安装 Rust 工具链 → 新开实现变更；先读 `.design/SPEC.md`、`api.md`、`data.md`
+Phase: 框架骨架完成；model/error/codec 可用，加密运算与 redb 事务未接线
+Blocked: 无
+Next: 新开变更接线 Argon2id/HKDF/AEAD 与四张 redb 表，再补 facade 的 open 与读写

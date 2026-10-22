@@ -39,3 +39,23 @@ Change: 20261020-encrypted-persistence-core
 Context: CONTRACT 禁止 unsafe；用户澄清核心诉求是内核不得出现未定义行为、未处理错误或崩溃，稳定性优先。
 Decision: 把稳定性列为硬约束：core/facade 禁止 unsafe，可恢复失败一律返回 Result，非测试代码禁用 unwrap/expect/panic!，落盘输入先校验；FFI 若引入 unsafe 必须隔离、审计、catch_unwind 并经用户批准。
 Consequences: 崩溃面收敛到已证明的不变式；C++/Android 的 C ABI 暂缓；实现阶段需用 clippy、fuzz 与损坏输入测试兜底。
+## [9] 2026-10-22 03:30:00 UTC
+Change: 20261022-rust-kernel-skeleton
+Context: 仓库此前只有 .design/.agent，没有任何 Cargo 结构；跨 crate 集成测试需要一个可编译目标承载
+Decision: 根目录用纯 workspace（无根包），成员为 crates/* 与 tests；tests 作为 workspace 成员包 shio-tests，关掉 autotests 并显式声明 smoke 测试目标
+Consequences: 根 Cargo.toml 不发布任何 crate；跨 crate 用例集中在 tests/，与 SPEC 的目录布局一致；后续加 crate 只需放进 crates/
+## [10] 2026-10-22 03:30:01 UTC
+Change: 20261022-rust-kernel-skeleton
+Context: 同时引入密码学、redb 事务与 async facade 会让首个实现承担过高风险，且三者互相依赖需要同时可验证
+Decision: 本轮只把不依赖外部世界的纯逻辑做完整：model（名称校验、RecordId、Timestamp、meta/分页类型）、error 全量枚举、codec（复合键、34 字节 header、RecordBlob 视图、三类 AAD）；crypto 与 store 只定型，facade 不提供 open
+Consequences: format=1 的字节契约在首次提交即固化并有单测覆盖；加密与存储接线只填实现不改结构；Kernel 暂无可构造入口，库使用者需等待下一个变更
+## [11] 2026-10-22 03:30:01 UTC
+Change: 20261022-rust-kernel-skeleton
+Context: CONTRACT 禁止 unsafe，并要求非测试代码不使用 unwrap/expect/panic；这些约束此前只写在文档里，没有机械兜底
+Decision: workspace 级 lints 打开 rust unsafe_code=forbid 与 clippy 的 unwrap_used/expect_used/panic/todo/unimplemented/dbg_macro=deny，各 crate 用 lints.workspace=true 继承，测试代码在 cfg(test) 或测试文件内局部放宽
+Consequences: 违规写法在 cargo clippy -D warnings 阶段直接失败；新增 crate 默认继承护栏；测试仍可使用 unwrap
+## [12] 2026-10-22 03:30:01 UTC
+Change: 20261022-rust-kernel-skeleton
+Context: 需要给出一条可复现的构建链；redb 4.4 的 MSRV 是 1.90，本机 stable 为 1.95.0
+Decision: workspace rust-version 定为 1.90，rust-toolchain.toml 固定 channel 1.95.0 并要求 rustfmt/clippy 组件
+Consequences: 低于 1.90 的工具链会被 cargo 拒绝；工具链随仓库固定，不依赖本机默认设置；升级 redb 时需同步检查 MSRV

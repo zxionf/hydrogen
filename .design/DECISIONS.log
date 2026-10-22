@@ -124,3 +124,8 @@ Change: 20261022-key-lifecycle
 Context: api.md 已冻结 Kernel::change_password(SecretString) 与 Kernel::rotate_data_key()，两者都是写操作且耗时（Argon2id、全量重加密）
 Decision: 两个方法都经 run_write + spawn_blocking；口令字节复制进 Zeroizing 后搬进闭包；只读句柄在进入阻塞线程前返回 ReadOnly
 Consequences: 与 api.md 签名一致；轮换会长时间占用阻塞线程池的一个线程和会话写锁；facade 不做轮换进度回调
+## [26] 2026-10-22 05:21:49 UTC
+Change: 20261022-version-query
+Context: 应用做关于页、日志与兼容性诊断时需要内核自身版本，但此前只能查询库的 format_version，且不应为此打开数据库
+Decision: shio-core 增加编译期常量 VERSION = env!("CARGO_PKG_VERSION")，shio 暴露 version() -> &'static str 返回该常量；数据格式版本仍从 Kernel::stats().format_version 读取
+Consequences: 版本随 Cargo 包版本自动更新，无需手工同步；不打开数据库、不需要口令，句柄关闭后仍可调用；纯增量 API，不影响存储格式

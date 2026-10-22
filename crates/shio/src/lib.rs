@@ -24,3 +24,22 @@ pub use shio_core::model::{
     DEFAULT_LIST_LIMIT, DEFAULT_MAX_VALUE_SIZE, MAX_LIST_LIMIT, MAX_NAME_LEN,
 };
 pub use shio_core::store::Stats;
+
+/// 查询内核版本。
+///
+/// 与 `shio-core` 的包版本一致，是编译期常量；不需要口令、不打开数据库，
+/// 句柄关闭后仍可调用。
+pub fn version() -> &'static str {
+    shio_core::VERSION
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn version_matches_package_version() {
+        assert_eq!(version(), env!("CARGO_PKG_VERSION"));
+        assert!(!version().is_empty());
+    }
+}

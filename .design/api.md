@@ -15,8 +15,8 @@
 
 | crate | 职责 | 允许依赖 |
 |---|---|---|
-| `shio-core` | 模型、ID、加密、redb 存储、事务 | redb、serde、argon2、chacha20poly1305、hkdf、zeroize、uuid、thiserror |
-| `shio` | async facade、生命周期、句柄 | `shio-core`、tokio、secrecy |
+| `shio-core` | 模型、ID、加密、redb 存储、事务 | redb、serde、serde_json、argon2、chacha20poly1305、hkdf、zeroize、uuid、getrandom、thiserror |
+| `shio` | async facade、生命周期、句柄 | `shio-core`、tokio、secrecy、serde、serde_json、zeroize |
 | `shio-ffi` | C ABI（后续） | `shio`、libc；唯一允许 unsafe 的 crate |
 | `shio-sync` | 多端同步（后续） | `shio-core` |
 
@@ -41,6 +41,7 @@ kernel.close().await?;
 - `close`：标记关闭、等待进行中的操作结束、释放文件锁。之后任何操作返回 `Error::Closed`。
 - 同一进程内可克隆 `Kernel` 句柄共享；跨进程由 redb 文件锁保证单写，冲突时返回 `Error::Locked`。
 - `open` 是唯一需要口令的入口；解锁后的密钥材料只驻留内存。
+- `shio::version()` 返回编译期内核版本（与包版本一致），不需要打开数据库；库的格式版本用 `Kernel::stats().format_version` 查询。
 
 ## 4. 核心类型
 
@@ -60,6 +61,7 @@ impl OpenOptions {
     pub fn create(self, yes: bool) -> Self;
     pub fn read_only(self, yes: bool) -> Self;
     pub fn max_value_size(self, bytes: usize) -> Self;
+    pub fn cache_size(self, bytes: usize) -> Self;
 }
 ```
 
@@ -275,6 +277,7 @@ pub enum Error {
     NotFound,
     Closed,
     ReadOnly,
+    Busy,
     Locked,
     ValueTooLarge { size: usize, max: usize },
     Corrupted(&'static str),
@@ -290,6 +293,7 @@ pub enum NameKind { Namespace, Collection }
 ```
 
 - `InvalidKey` 不区分口令错误与密钥损坏，避免口令预言机。
+- `Busy` 表示密钥轮换未完成（存在多行 key），需先完成轮换；锁冲突仍用 `Locked`。
 - `Corrupted` 表示结构或认证失败（AEAD tag 校验失败也归入此类，不泄露细节）。
 - 错误实现 `std::error::Error` 与 `Display`；不实现 `Clone`。
 - 可恢复错误不 panic；只有违反类型不变式（如内部状态机损坏）才允许 `debug_assert` 后返回 `Internal`。

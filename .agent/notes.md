@@ -5,7 +5,8 @@ sele CLI用于管理 `.design/` 与 `.agent/` 目录的 C++20 命令行工具，
 ## 构建与测试
 
 - `cargo build --workspace` 构建全部 crate；产物在 `target/`，已加入 `.gitignore`。
-- `cargo test --workspace`：66 个用例（shio-core 库内 34、引擎端到端 21、shio 库内 3、facade 端到端 5、跨 crate 集成 3）。
+- `cargo run -p shio --example notes` 运行最小示例（临时库，结束即删除）。
+- `cargo test --workspace`：68 个用例（shio-core 库内 35、引擎端到端 21、shio 库内 4、facade 端到端 5、跨 crate 集成 3）。
 - facade 端到端用默认 Argon2id 参数（64 MiB、t=3），5 个用例约 13 秒；不要在这一层加更多建库用例，参数下调放到 core 测试。
 - 提交前必过：`cargo fmt --all -- --check` 与 `cargo clippy --workspace --all-targets -- -D warnings`。
 - 工具链由 `rust-toolchain.toml` 固定为 1.95.0（rustfmt + clippy）；首次在该目录执行 cargo 时 rustup 会自动补齐。MSRV 1.90，因为 redb 4.4 要求。
@@ -32,6 +33,7 @@ sele CLI用于管理 `.design/` 与 `.agent/` 目录的 C++20 命令行工具，
 - `close().await` 会等待已开始的操作结束；之后新操作返回 `Closed`，重复 `close` 返回 `Ok`。
 - `read_only(true)` 现在真正以只读库打开，写操作（含改口令、轮换）返回 `ReadOnly`。
 - `change_password(SecretString)` 与 `rotate_data_key()` 都是 async；轮换会长时间占用一个阻塞线程。
+- `shio::version()` 返回编译期包版本，不需要打开数据库；库的格式版本从 `Kernel::stats().format_version` 读取。
 
 ## 踩坑
 

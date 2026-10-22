@@ -4,11 +4,11 @@
 //! [`shio`] facade 通过阻塞线程池调用。数据模型是「命名空间 → 集合 → 记录」，
 //! 记录体加密后落在 redb 单文件里。
 //!
-//! 当前阶段的边界：
+//! 当前形态：
 //!
 //! - [`model`]、[`error`]、[`codec`] 是完整实现，包含 `data.md` 定义的字节契约；
-//! - [`crypto`] 只有密钥材料类型，KDF 与 AEAD 运算尚未接线；
-//! - [`store`] 只有四张表的定义，读写事务尚未接线。
+//! - [`crypto`] 提供 Argon2id 密钥派生、HKDF 子密钥与 XChaCha20-Poly1305；
+//! - [`store::Engine`] 提供创建/打开、同步 CRUD、原子批量、改口令与数据密钥轮换。
 //!
 //! 约束：本 crate 禁止 `unsafe`；非测试代码不使用 `unwrap` / `expect` / `panic!`；
 //! 来自磁盘的字节一律先校验再使用。
@@ -24,3 +24,16 @@ pub mod store;
 
 pub use error::{Error, Result};
 pub use store::engine::{Engine, EngineOptions, RawWriteOp, Stats};
+
+/// 内核版本，与 crate 包版本一致（编译期常量）。
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn version_matches_package_version() {
+        assert_eq!(VERSION, env!("CARGO_PKG_VERSION"));
+    }
+}

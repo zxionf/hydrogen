@@ -129,3 +129,38 @@ Change: 20261022-version-query
 Context: 应用做关于页、日志与兼容性诊断时需要内核自身版本，但此前只能查询库的 format_version，且不应为此打开数据库
 Decision: shio-core 增加编译期常量 VERSION = env!("CARGO_PKG_VERSION")，shio 暴露 version() -> &'static str 返回该常量；数据格式版本仍从 Kernel::stats().format_version 读取
 Consequences: 版本随 Cargo 包版本自动更新，无需手工同步；不打开数据库、不需要口令，句柄关闭后仍可调用；纯增量 API，不影响存储格式
+## [27] 2026-10-22 06:31:26 UTC
+Change: 20261022-sync-design
+Context: 多端同步需要 128 位 key_id 才能让任意设备并发轮换不撞号；旧二进制若继续写入会不追加日志而静默掉队
+Decision: 同步库使用 format=2：meta/key2/record2 改为 16 字节 key_id 与 v2 AAD；enable_sync 在单事务内写 keys2 与 meta=2，再分批把 SHR1 记录迁移为 SHR2；新二进制读 1/2，旧二进制拒绝 2
+Consequences: 升级不可回退；升级期间混合解码、禁改口令与轮换；只读降级/导出工具排到后续版本
+## [28] 2026-10-22 06:31:26 UTC
+Change: 20261022-sync-design
+Context: u16 key_id 无法在无协调者时保证全局唯一，并发轮换会生成同号不同 DK
+Decision: key_id 改为 16 字节 CSPRNG 随机值，存于新表 shio.keys2；每次轮换生成新随机 id，不依赖计数器或设备槽位
+Consequences: 每条记录多 14 字节；碰撞概率可忽略；format=1 的 u16 key 行保留到升级完成
+## [29] 2026-10-22 06:31:26 UTC
+Change: 20261022-sync-design
+Context: 任意设备发起轮换且允许离线，无法用锁或共识选出唯一新 key
+Decision: 轮换形成 key DAG：DK_to 用 HKDF(from_DK, salt=db_id) 包裹，offer 随日志传播；安装时先补祖先；当前写 key 按 (created_at, key_id) 全序收敛
+Consequences: 并发轮换产生多个分支，记录按自身 key_id 解密仍可读；key 行数上限 32，靠 migrate_all + retire 收敛
+## [30] 2026-10-22 06:31:26 UTC
+Change: 20261022-sync-design
+Context: 日志与记录分离会丢变更，重复应用会回声
+Decision: 本地写入与 kind=0 日志同事务；应用整页在一个事务内完成并推进 peer 游标；记录冲突用 (updated_at, rev, blob 字节序) LWW，重复或更旧的远端条目跳过且不记日志
+Consequences: 崩溃可重试且幂等；跨设备时钟偏差会影响胜负，部署应启用 NTP
+## [31] 2026-10-22 06:31:26 UTC
+Change: 20261022-sync-design
+Context: 退役旧 key 时若还有设备保留旧记录，新配对设备可能缺少该 key
+Decision: migrate_all 完成后追加 kind=4 迁移完成公告；retire 要求本机无该 key 记录、所有已知设备 cur 不等于该 key、所有已知设备都有 mig 公告、且无未安装 offer
+Consequences: 退役保守，离线或未公告设备会阻止退役；需要显式全局确认
+## [32] 2026-10-22 06:31:26 UTC
+Change: 20261022-sync-design
+Context: 软轮换下快照可能包含多个历史 key 的记录，新设备只拿当前 DK 会读不了
+Decision: 配对包 SHB2 携带整条密钥链（最多 32 个 key_id + DK），新设备用新口令逐行重包裹；二维码 + 6 位指纹 + 10 分钟有效期
+Consequences: 新设备可直接读全部历史记录；配对包体积受 key 数上限约束
+## [33] 2026-10-22 06:31:26 UTC
+Change: 20261022-sync-design
+Context: 自动全量迁移并退役会破坏离线副本，且耗时不可控
+Decision: 默认软轮换：rotate_data_key 在同步模式下等于 begin_rotation + 本机 migrate_all，旧 key 行保留；retire 与 prune_rotation_offers 显式调用
+Consequences: 旧密文始终可读；旧 key 泄露的影响需显式迁移退役后才收敛

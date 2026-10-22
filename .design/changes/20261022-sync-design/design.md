@@ -385,6 +385,8 @@ u8 ns_len | ns | u8 coll_len | coll | 16 字节 UUID
 
 ## 公开接口
 
+公开面用 16 字节 `KeyId` / `DeviceId` 新类型表达 id，不再暴露裸数组；这是 `DECISIONS.log` #34 的类型层细化。下面用 `[u8;16]` 表示等价的字节语义。
+
 ### shio-core
 
 ```rust
@@ -455,7 +457,7 @@ impl<'a> Sync<'a> {
 ```
 
 - `shio-sync` 只依赖 `shio-core`；不依赖 tokio。
-- `PairingOffer { pub frame: Vec<u8>, pub secret: String, pub fingerprint: String }`；`secret` 用 `Zeroizing<String>` 或由调用方立即取走。
+- `PairingOffer { pub frame: Vec<u8>, pub secret: String, pub fingerprint: String }`；`secret` 是 Base32 文本，调用方应移入 `Zeroizing` 并在使用后清零；facade 可直接接收 `Zeroizing<String>`。
 - 传输层拿 `frame` 自行发；对端 `apply` 前校验 `db_id`。
 
 ### shio facade（可选 feature）

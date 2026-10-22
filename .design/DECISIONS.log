@@ -164,3 +164,8 @@ Change: 20261022-sync-design
 Context: 自动全量迁移并退役会破坏离线副本，且耗时不可控
 Decision: 默认软轮换：rotate_data_key 在同步模式下等于 begin_rotation + 本机 migrate_all，旧 key 行保留；retire 与 prune_rotation_offers 显式调用
 Consequences: 旧密文始终可读；旧 key 泄露的影响需显式迁移退役后才收敛
+## [34] 2026-10-22 06:57:30 UTC
+Change: 20261022-sync-design
+Context: format=2 的 key_id 是 16 字节，而现有 Stats.key_id 与 crypto::KeyId 仍是 u16；若同步 API 直接暴露裸数组，调用方容易把 db_id、device_id、key_id 混用
+Decision: 在 model 引入 16 字节新类型 KeyId 与 DeviceId，core 根导出；crypto::KeyId 改名 LegacyKeyId，仅供 format=1 内部与统计映射；Stats.key_id 在 M0 改为 KeyId（format=1 用前 14 字节 0 + 大端 u16 映射）
+Consequences: 这是 1.0 前允许的破坏性调整；应用层统一 16 字节 ID 并获得类型隔离；format=1 的 u16 仍可无损还原；M0 需同步更新 api.md 与 data.md

@@ -54,7 +54,7 @@ impl OpenOptions {
 
     /// 是否只读打开。
     ///
-    /// v0.1 在 facade 层拒绝写操作；底层仍以读写模式打开。
+    /// 只读句柄仍需要口令解锁，但所有写操作返回 [`Error::ReadOnly`]。
     pub fn read_only(mut self, yes: bool) -> Self {
         self.read_only = yes;
         self
@@ -239,6 +239,7 @@ impl Kernel {
 
         let mut engine_options = EngineOptions::new(options.path)
             .create(options.create)
+            .read_only(options.read_only)
             .max_value_size(options.max_value_size);
         if let Some(bytes) = options.cache_size {
             engine_options = engine_options.cache_size(bytes);
@@ -284,6 +285,25 @@ impl Kernel {
     /// 当前库的统计信息；同步调用，不进入阻塞线程池。
     pub fn stats(&self) -> Result<Stats> {
         self.inner.engine()?.stats()
+    }
+
+    /// 改口令：用新口令重新包裹数据密钥，不重写记录。
+    ///
+    /// 只读句柄返回 [`Error::ReadOnly`]。
+    pub async fn change_password(&self, new_password: SecretString) -> Result<()> {
+        let password = Zeroizing::new(new_password.expose_secret().as_bytes().to_vec());
+        self.inner
+            .run_write(move |engine| engine.change_password(password.as_slice()))
+            .await
+    }
+
+    /// 轮换数据密钥：生成新 `key_id` 并重加密全部记录。
+    ///
+    /// 只读句柄返回 [`Error::ReadOnly`]。
+    pub async fn rotate_data_key(&self) -> Result<()> {
+        self.inner
+            .run_write(|engine| engine.rotate_data_key())
+            .await
     }
 }
 

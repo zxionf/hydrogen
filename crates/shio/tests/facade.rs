@@ -4,9 +4,9 @@
 
 use std::path::Path;
 
+use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
 use shio::{Credential, Error, Kernel, ListOptions, Namespace, OpenOptions, RecordId, WriteOp};
-
 const PASSWORD: &str = "correct horse battery staple";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -209,11 +209,89 @@ async fn read_only_rejects_writes() {
         notes.batch(Vec::new()).await,
         Err(Error::ReadOnly)
     ));
+    assert!(matches!(
+        kernel.change_password(SecretString::from("nope")).await,
+        Err(Error::ReadOnly)
+    ));
+    assert!(matches!(
+        kernel.rotate_data_key().await,
+        Err(Error::ReadOnly)
+    ));
 
     let page = notes.list(ListOptions::default()).await.unwrap();
     assert_eq!(page.items.len(), 1);
     let stored = notes.get(&page.items[0].id).await.unwrap().unwrap();
     assert_eq!(stored.value, note("seed"));
 
+    kernel.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn change_password_and_rotate() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("shio.redb");
+
+    let id = {
+        let kernel = Kernel::open(create(&path), Credential::password(PASSWORD))
+            .await
+            .unwrap();
+        let notes = collection(&kernel);
+        let (id, _) = notes.insert(&note("survives")).await.unwrap();
+        assert_eq!(kernel.stats().unwrap().key_id, 1);
+
+        kernel
+            .change_password(SecretString::from("new password"))
+            .await
+            .unwrap();
+        assert_eq!(
+            notes.get(&id).await.unwrap().unwrap().value,
+            note("survives")
+        );
+        kernel.close().await.unwrap();
+        id
+    };
+
+    assert!(matches!(
+        Kernel::open(OpenOptions::new(&path), Credential::password(PASSWORD)).await,
+        Err(Error::InvalidKey)
+    ));
+
+    let kernel = Kernel::open(
+        OpenOptions::new(&path),
+        Credential::password("new password"),
+    )
+    .await
+    .unwrap();
+    let notes = collection(&kernel);
+    assert_eq!(
+        notes.get(&id).await.unwrap().unwrap().value,
+        note("survives")
+    );
+
+    kernel.rotate_data_key().await.unwrap();
+    assert_eq!(kernel.stats().unwrap().key_id, 2);
+    assert_eq!(
+        notes.get(&id).await.unwrap().unwrap().value,
+        note("survives")
+    );
+
+    // 轮换后旧 key 行已删除，仍可继续改口令。
+    kernel
+        .change_password(SecretString::from("third password"))
+        .await
+        .unwrap();
+    kernel.close().await.unwrap();
+
+    let kernel = Kernel::open(
+        OpenOptions::new(&path),
+        Credential::password("third password"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(kernel.stats().unwrap().key_id, 2);
+    assert_eq!(
+        collection(&kernel).get(&id).await.unwrap().unwrap().value,
+        note("survives")
+    );
     kernel.close().await.unwrap();
 }

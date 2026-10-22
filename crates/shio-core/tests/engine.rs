@@ -403,3 +403,242 @@ fn tampered_record_is_corrupted() {
     let error = engine.get::<Note>("notes", "notes", &id).unwrap_err();
     assert!(matches!(error, Error::Corrupted(_)), "{error:?}");
 }
+
+#[test]
+fn read_only_engine_rejects_writes() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("shio.db");
+
+    let id = {
+        let engine = create(&path);
+        engine
+            .insert("notes", "notes", &note("readonly"))
+            .unwrap()
+            .0
+    };
+
+    let engine = Engine::open(options(&path).read_only(true), PASSWORD).unwrap();
+    assert_eq!(
+        engine
+            .get::<Note>("notes", "notes", &id)
+            .unwrap()
+            .unwrap()
+            .value,
+        note("readonly")
+    );
+    assert_eq!(
+        engine
+            .list("notes", "notes", ListOptions::default())
+            .unwrap()
+            .items
+            .len(),
+        1
+    );
+    assert_eq!(engine.stats().unwrap().key_id, 1);
+
+    assert!(matches!(
+        engine.put("notes", "notes", RecordId::new_v7(), &note("x"), 1),
+        Err(Error::ReadOnly)
+    ));
+    assert!(matches!(
+        engine.delete("notes", "notes", &id),
+        Err(Error::ReadOnly)
+    ));
+    assert!(matches!(
+        engine.purge("notes", "notes", &id),
+        Err(Error::ReadOnly)
+    ));
+    assert!(matches!(
+        engine.batch("notes", "notes", &[WriteOp::<Note>::Delete { id }]),
+        Err(Error::ReadOnly)
+    ));
+    assert!(matches!(
+        engine.change_password(b"next"),
+        Err(Error::ReadOnly)
+    ));
+    assert!(matches!(engine.rotate_data_key(), Err(Error::ReadOnly)));
+}
+
+#[test]
+fn read_only_with_create_is_invalid() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("shio.db");
+
+    let error = Engine::open(options(&path).create(true).read_only(true), PASSWORD).unwrap_err();
+    assert!(matches!(error, Error::InvalidArgument(_)), "{error:?}");
+}
+
+#[test]
+fn change_password_rewraps_and_keeps_records() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("shio.db");
+
+    let id = {
+        let engine = create(&path);
+        let (id, meta) = engine.insert("notes", "notes", &note("secret")).unwrap();
+        engine.change_password(b"new password").unwrap();
+
+        let stored = engine.get::<Note>("notes", "notes", &id).unwrap().unwrap();
+        assert_eq!(stored.value, note("secret"));
+        assert_eq!(stored.meta.rev, meta.rev);
+
+        // 同一会话可以连续改口令。
+        engine.change_password(b"third password").unwrap();
+        id
+    };
+
+    let error = Engine::open(options(&path), PASSWORD).unwrap_err();
+    assert!(matches!(error, Error::InvalidKey), "{error:?}");
+
+    let engine = Engine::open(options(&path), b"third password").unwrap();
+    assert_eq!(
+        engine
+            .get::<Note>("notes", "notes", &id)
+            .unwrap()
+            .unwrap()
+            .value,
+        note("secret")
+    );
+    assert_eq!(engine.stats().unwrap().key_id, 1);
+}
+
+#[test]
+fn rotate_data_key_migrates_all_records() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("shio.db");
+
+    let ids = {
+        let engine = create(&path);
+        let ids: Vec<RecordId> = (0..300).map(|_| RecordId::new_v7()).collect();
+        let ops: Vec<WriteOp<Note>> = ids
+            .iter()
+            .map(|id| WriteOp::Put {
+                id: *id,
+                value: note("bulk"),
+            })
+            .collect();
+        engine.batch("notes", "notes", &ops).unwrap();
+        assert_eq!(engine.stats().unwrap().key_id, 1);
+
+        // 300 条跨过轮换的批边界（每批 256 条）。
+        engine.rotate_data_key().unwrap();
+        assert_eq!(engine.stats().unwrap().key_id, 2);
+        for id in &ids {
+            assert_eq!(
+                engine
+                    .get::<Note>("notes", "notes", id)
+                    .unwrap()
+                    .unwrap()
+                    .value,
+                note("bulk")
+            );
+        }
+        ids
+    };
+
+    let engine = open(&path);
+    assert_eq!(engine.stats().unwrap().key_id, 2);
+    for id in &ids {
+        assert!(engine.get::<Note>("notes", "notes", id).unwrap().is_some());
+    }
+
+    // 旧 key 行已删除，因此可以改口令。
+    engine.change_password(b"after rotation").unwrap();
+    drop(engine);
+
+    let engine = Engine::open(options(&path), b"after rotation").unwrap();
+    assert_eq!(engine.stats().unwrap().key_id, 2);
+    assert_eq!(
+        engine
+            .get::<Note>("notes", "notes", &ids[0])
+            .unwrap()
+            .unwrap()
+            .value,
+        note("bulk")
+    );
+}
+
+#[test]
+fn interrupted_rotation_is_resumable_and_blocks_change_password() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("shio.db");
+
+    let (first, second) = {
+        let engine = create(&path);
+        let first = engine.insert("notes", "notes", &note("a")).unwrap().0;
+        let second = engine.insert("notes", "notes", &note("b")).unwrap().0;
+        (first, second)
+    };
+
+    // 篡改一条记录，让第一次轮换在迁移中失败，留下两行 key。
+    let mut originals = Vec::new();
+    {
+        let db = Database::open(&path).unwrap();
+        let txn = db.begin_write().unwrap();
+        {
+            let mut table = txn.open_table(records::TABLE).unwrap();
+            for entry in table.iter().unwrap() {
+                let (key, value) = entry.unwrap();
+                originals.push((key.value().to_vec(), value.value().to_vec()));
+            }
+            let (key, value) = &originals[0];
+            let mut tampered = value.clone();
+            let last = tampered.len() - 1;
+            tampered[last] ^= 0x01;
+            table.insert(key.as_slice(), tampered.as_slice()).unwrap();
+        }
+        txn.commit().unwrap();
+    }
+
+    let engine = open(&path);
+    let error = engine.rotate_data_key().unwrap_err();
+    assert!(matches!(error, Error::Corrupted(_)), "{error:?}");
+    assert!(matches!(
+        engine.change_password(b"blocked"),
+        Err(Error::Busy)
+    ));
+    drop(engine);
+
+    // 还原记录后重开：应同时解包两行 key，并复用已写入的新 key 完成迁移。
+    {
+        let db = Database::open(&path).unwrap();
+        let txn = db.begin_write().unwrap();
+        {
+            let mut table = txn.open_table(records::TABLE).unwrap();
+            for (key, value) in &originals {
+                table.insert(key.as_slice(), value.as_slice()).unwrap();
+            }
+        }
+        txn.commit().unwrap();
+    }
+
+    let engine = open(&path);
+    assert_eq!(
+        engine
+            .get::<Note>("notes", "notes", &first)
+            .unwrap()
+            .unwrap()
+            .value,
+        note("a")
+    );
+    assert_eq!(
+        engine
+            .get::<Note>("notes", "notes", &second)
+            .unwrap()
+            .unwrap()
+            .value,
+        note("b")
+    );
+
+    engine.rotate_data_key().unwrap();
+    assert_eq!(engine.stats().unwrap().key_id, 2);
+    engine.change_password(b"resumed").unwrap();
+    drop(engine);
+
+    let engine = Engine::open(options(&path), b"resumed").unwrap();
+    assert_eq!(engine.stats().unwrap().key_id, 2);
+    assert!(engine
+        .get::<Note>("notes", "notes", &first)
+        .unwrap()
+        .is_some());
+}

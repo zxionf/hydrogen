@@ -99,3 +99,28 @@ Change: 20261022-async-facade
 Context: OpenOptions 自骨架期就有 cache_size 字段，但 EngineOptions 没有对应项，公开参数会被静默丢弃
 Decision: EngineOptions 增加 cache_size；open 时若为 Some，用 redb::Database::builder().set_cache_size 创建/打开，0 视为 InvalidArgument
 Consequences: facade 的 cache_size 真实生效；不设置时仍用 redb 默认值；非法值在打开前被拒绝
+## [21] 2026-10-22 04:59:49 UTC
+Change: 20261022-key-lifecycle
+Context: 轮换按批提交，崩溃后 meta 仍指向旧 key，而部分记录已用新 key 加密；若只加载 meta.key_id 指向的密钥，已迁移记录将无法解密
+Decision: Engine 打开时扫描整个 keys 表，用 meta 当前行的盐与参数派生 KEK 并解包所有行；Session 保存 key_id -> (KeyBlob, DK, Subkeys)，记录解密按 header.key_id 查表，写入使用 current。change_password 仍要求单行
+Consequences: 轮换中途崩溃后新旧记录都能读，重跑轮换可续；打开成本随 key 行数增长（正常 1-2 行）；多行状态让 change_password 返回 Busy
+## [22] 2026-10-22 04:59:56 UTC
+Change: 20261022-key-lifecycle
+Context: api.md 要求改口令只重新包裹 DK、O(1)、轮换未完成时返回 Busy，而错误枚举当时没有 Busy 变体
+Decision: change_password 仅在 keys 恰有一行时执行：重新生成 16B 盐与 KEK（Argon2id 参数沿用当前行），用新 KEK 与新 nonce 重新包裹会话内 DK，单行写事务替换 salt/params/nonce/wrapped_dk，保留 key_id/created_at/label；Error 新增 Busy
+Consequences: 旧口令提交后立即失效；不重写任何记录；存在多行 key 时要求先完成轮换；Busy 只用于密钥生命周期，不表示锁冲突
+## [23] 2026-10-22 05:00:30 UTC
+Change: 20261022-key-lifecycle
+Context: 轮换要崩溃安全、可重入，且不能与并发写竞争：迁移遍历之外的并发写会用旧 key 记录，若随后删除旧行就丢失可解密性
+Decision: new_key_id = current+1（超出 MAX_KEY_ID 返回 InvalidArgument）；若该行已存在视为上次中断并复用；否则先写新 key 行（独立事务）。迁移期间持有会话写锁，按 records 键序每 256 条一个写事务，按 header.key_id 解密、改写 key_id 与 nonce 后重加密，已迁移记录跳过。全部完成后在单事务内写 meta（新 key_id + 新 key check）并删除其余 key 行，再更新会话
+Consequences: 轮换期间本进程读写阻塞（本机单用户可接受）；崩溃后重新打开可读，重跑轮换从已写的新行继续；meta 切换前的新写入仍使用旧 key
+## [24] 2026-10-22 05:00:49 UTC
+Change: 20261022-key-lifecycle
+Context: 此前的 read_only 只是 facade 逻辑闸门，底层仍以读写模式打开并持有写锁，与 api.md「只读时写操作返回 ReadOnly、仍需口令解密」不符
+Decision: EngineOptions 增加 read_only，Engine 用 Handle 枚举区分 ReadWrite(Database) 与 ReadOnly(ReadOnlyDatabase)；读事务两者通用，写入口在 core 返回 ReadOnly；read_only 与 create 组合非法；facade 保留提前闸门并把 read_only 透传给引擎
+Consequences: 只读打开不再持有写锁，可用于多进程只读并发；直接使用 core 的调用者同样受保护；redb 只读库不支持写事务
+## [25] 2026-10-22 05:00:57 UTC
+Change: 20261022-key-lifecycle
+Context: api.md 已冻结 Kernel::change_password(SecretString) 与 Kernel::rotate_data_key()，两者都是写操作且耗时（Argon2id、全量重加密）
+Decision: 两个方法都经 run_write + spawn_blocking；口令字节复制进 Zeroizing 后搬进闭包；只读句柄在进入阻塞线程前返回 ReadOnly
+Consequences: 与 api.md 签名一致；轮换会长时间占用阻塞线程池的一个线程和会话写锁；facade 不做轮换进度回调

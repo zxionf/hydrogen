@@ -40,6 +40,10 @@ pub enum Error {
     #[error("read-only kernel")]
     ReadOnly,
 
+    /// 密钥轮换尚未完成（存在多行 key），需先完成轮换。
+    #[error("key rotation in progress")]
+    Busy,
+
     /// 文件锁被其他进程占用。
     #[error("database is locked by another process")]
     Locked,

@@ -106,6 +106,15 @@ impl From<redb::Error> for Error {
 
 impl From<redb::DatabaseError> for Error {
     fn from(value: redb::DatabaseError) -> Self {
+        match value {
+            redb::DatabaseError::DatabaseAlreadyOpen => Self::Locked,
+            other => Self::Database(other.to_string()),
+        }
+    }
+}
+
+impl From<redb::CommitError> for Error {
+    fn from(value: redb::CommitError) -> Self {
         Self::Database(value.to_string())
     }
 }

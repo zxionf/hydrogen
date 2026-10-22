@@ -4,9 +4,12 @@
 //! 本模块只声明表结构，读写事务与 blob 编解码尚未接线。
 
 pub mod catalog;
+pub mod engine;
 pub mod keys;
 pub mod meta;
 pub mod records;
+
+pub use engine::{Engine, EngineOptions, Stats};
 
 /// 当前数据库格式版本。
 pub const FORMAT: u16 = 1;

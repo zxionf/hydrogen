@@ -229,6 +229,13 @@ impl<'a> RecordBlob<'a> {
     }
 }
 
+/// 编码命名空间前缀：`u8 len | ns`，用于按命名空间扫描 catalog。
+pub fn encode_namespace_prefix(namespace: &str) -> Result<Vec<u8>> {
+    let mut out = Vec::with_capacity(1 + namespace.len());
+    push_name(&mut out, NameKind::Namespace, namespace)?;
+    Ok(out)
+}
+
 /// 编码 `CatalogKey`：`u8 len | ns | u8 len | coll`。
 pub fn encode_catalog_key(namespace: &str, collection: &str) -> Result<Vec<u8>> {
     let mut out = Vec::with_capacity(2 + namespace.len() + collection.len());

@@ -39,6 +39,9 @@ pub const INFO_META_KEY: &[u8] = b"shio/v1/meta-key";
 /// 密钥校验子密钥的 HKDF info。
 pub const INFO_CHECK_KEY: &[u8] = b"shio/v1/check-key";
 
+/// 轮换包裹密钥的 HKDF info。
+pub const INFO_ROTATION_KEY: &[u8] = b"shio/v2/rotation-key";
+
 /// 由数据密钥派生出的三个子密钥。
 #[derive(Clone)]
 pub struct Subkeys {
@@ -182,6 +185,15 @@ pub fn derive_subkeys(data_key: &DataKey) -> Result<Subkeys> {
         meta: MetaKey::from_bytes(meta),
         check: CheckKey::from_bytes(check),
     })
+}
+
+/// 由源数据密钥派生轮换包裹密钥：`HKDF-SHA256(salt=db_id, info=...)`。
+pub fn derive_rotation_key(data_key: &DataKey, db_id: &[u8; 16]) -> Result<RecordKey> {
+    let hkdf = Hkdf::<Sha256>::new(Some(db_id), data_key.as_bytes());
+    let mut out = [0u8; KEY_LEN];
+    hkdf.expand(INFO_ROTATION_KEY, &mut out)
+        .map_err(|_| Error::Internal("hkdf expand failed for rotation key"))?;
+    Ok(RecordKey::from_bytes(out))
 }
 
 #[cfg(test)]

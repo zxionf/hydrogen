@@ -20,9 +20,9 @@ pub const MAX_KEY_ID: u16 = 65_534;
 
 /// 数据密钥编号。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct KeyId(u16);
+pub struct LegacyKeyId(u16);
 
-impl KeyId {
+impl LegacyKeyId {
     /// 构造 `key_id`，取值范围 `1..=65534`。
     pub const fn new(value: u16) -> Result<Self> {
         if value < MIN_KEY_ID || value > MAX_KEY_ID {
@@ -46,7 +46,7 @@ impl KeyId {
     }
 }
 
-impl fmt::Display for KeyId {
+impl fmt::Display for LegacyKeyId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Display::fmt(&self.0, f)
     }
@@ -109,10 +109,13 @@ mod tests {
 
     #[test]
     fn key_id_range() {
-        assert!(KeyId::new(0).is_err());
-        assert!(KeyId::new(1).is_ok());
-        assert_eq!(KeyId::new(MAX_KEY_ID).unwrap().next(), None);
-        assert_eq!(KeyId::new(1).unwrap().next().map(KeyId::get), Some(2));
+        assert!(LegacyKeyId::new(0).is_err());
+        assert!(LegacyKeyId::new(1).is_ok());
+        assert_eq!(LegacyKeyId::new(MAX_KEY_ID).unwrap().next(), None);
+        assert_eq!(
+            LegacyKeyId::new(1).unwrap().next().map(LegacyKeyId::get),
+            Some(2)
+        );
     }
 
     #[test]

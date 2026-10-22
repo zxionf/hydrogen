@@ -17,13 +17,20 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
 pub mod codec;
+pub mod codec2;
 pub mod crypto;
 pub mod error;
 pub mod model;
 pub mod store;
+pub mod sync;
 
 pub use error::{Error, Result};
+pub use model::{DeviceId, KeyId};
 pub use store::engine::{Engine, EngineOptions, RawWriteOp, Stats};
+pub use sync::{
+    ApplyReport, ChangeEntry, ChangePage, OfferPage, PairingOffer, RecordChange, RotationInfo,
+    RotationOffer, SnapshotPage, SnapshotRecord, SyncInfo,
+};
 
 /// 内核版本，与 crate 包版本一致（编译期常量）。
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

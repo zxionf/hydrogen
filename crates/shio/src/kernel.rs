@@ -9,10 +9,14 @@
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+#[cfg(feature = "sync")]
+use std::time::Duration;
 
 use secrecy::{ExposeSecret, SecretString};
 use shio_core::model::{validate_name, NameKind, DEFAULT_MAX_VALUE_SIZE};
 use shio_core::store::{Engine, EngineOptions, Stats};
+#[cfg(feature = "sync")]
+use shio_sync::{PairingOffer, Sync as SyncApi, SyncHandle, SyncInfo};
 use tokio::sync::Notify;
 use zeroize::Zeroizing;
 
@@ -231,25 +235,30 @@ impl fmt::Debug for Kernel {
     }
 }
 
+fn engine_options(options: &OpenOptions) -> EngineOptions {
+    let mut engine_options = EngineOptions::new(options.path.clone())
+        .create(options.create)
+        .read_only(options.read_only)
+        .max_value_size(options.max_value_size);
+    if let Some(bytes) = options.cache_size {
+        engine_options = engine_options.cache_size(bytes);
+    }
+    engine_options
+}
+
+fn password_bytes(credential: Credential) -> Zeroizing<Vec<u8>> {
+    match credential {
+        Credential::Password(secret) => Zeroizing::new(secret.expose_secret().as_bytes().to_vec()),
+    }
+}
+
 impl Kernel {
     /// 打开或创建数据库，并完成口令派生、DK 解包与校验。
     pub async fn open(options: OpenOptions, credential: Credential) -> Result<Self> {
         options.validate()?;
         let read_only = options.read_only;
-
-        let mut engine_options = EngineOptions::new(options.path)
-            .create(options.create)
-            .read_only(options.read_only)
-            .max_value_size(options.max_value_size);
-        if let Some(bytes) = options.cache_size {
-            engine_options = engine_options.cache_size(bytes);
-        }
-
-        let password = match credential {
-            Credential::Password(secret) => {
-                Zeroizing::new(secret.expose_secret().as_bytes().to_vec())
-            }
-        };
+        let engine_options = engine_options(&options);
+        let password = password_bytes(credential);
 
         let engine =
             tokio::task::spawn_blocking(move || Engine::open(engine_options, password.as_slice()))
@@ -287,6 +296,26 @@ impl Kernel {
         self.inner.engine()?.stats()
     }
 
+    /// 同步摘要；未启用同步时返回 [`Error::SyncDisabled`]。
+    #[cfg(feature = "sync")]
+    pub fn sync_info(&self) -> Result<SyncInfo> {
+        self.inner.engine()?.sync_info()
+    }
+
+    /// 取同步句柄，与当前内核共享同一引擎；句柄关闭后返回 [`Error::Closed`]。
+    #[cfg(feature = "sync")]
+    pub fn sync(&self) -> Result<SyncHandle> {
+        Ok(SyncHandle::new(self.inner.engine()?))
+    }
+
+    /// 生成配对包；Argon2id 派生在阻塞线程池执行。
+    #[cfg(feature = "sync")]
+    pub async fn create_pairing_offer(&self, ttl: Duration) -> Result<PairingOffer> {
+        self.inner
+            .run(move |engine| SyncApi::new(engine).pairing_offer(ttl))
+            .await
+    }
+
     /// 改口令：用新口令重新包裹数据密钥，不重写记录。
     ///
     /// 只读句柄返回 [`Error::ReadOnly`]。
@@ -305,6 +334,33 @@ impl Kernel {
             .run_write(|engine| engine.rotate_data_key())
             .await
     }
+}
+
+/// 用配对包创建新库；目标必须不存在或为空。
+///
+/// `secret` 是配对 offer 中的 Base32 文本，调用方用 [`Zeroizing`] 搬运。
+#[cfg(feature = "sync")]
+pub async fn open_with_pairing(
+    options: OpenOptions,
+    credential: Credential,
+    offer: &PairingOffer,
+    secret: Zeroizing<String>,
+) -> Result<Kernel> {
+    options.validate()?;
+    let engine_options = engine_options(&options);
+    let password = password_bytes(credential);
+    let offer = offer.clone();
+
+    let engine = tokio::task::spawn_blocking(move || {
+        let secret = shio_sync::decode_pairing_secret(&secret)?;
+        SyncApi::accept_pairing(engine_options, password.as_slice(), &offer, &secret)
+    })
+    .await
+    .map_err(|_| Error::Internal("blocking task panicked"))??;
+
+    Ok(Kernel {
+        inner: Arc::new(Inner::new(engine, false)),
+    })
 }
 
 /// 命名空间句柄。

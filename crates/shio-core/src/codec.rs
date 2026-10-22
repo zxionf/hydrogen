@@ -4,7 +4,7 @@
 //! 所有长度先校验再切片；输入来自磁盘时一律视为不可信，非法结构返回
 //! [`Error::Corrupted`]，越界与整数溢出都不可能发生。
 
-use crate::crypto::keys::{KeyId, MAX_KEY_ID, MIN_KEY_ID};
+use crate::crypto::keys::{LegacyKeyId, MAX_KEY_ID, MIN_KEY_ID};
 use crate::error::{Error, Result};
 use crate::model::{validate_name, NameKind, RecordId, MAX_NAME_LEN};
 
@@ -298,7 +298,7 @@ pub fn record_aad(
 }
 
 /// 构造密钥包裹 AAD：`"shio/v1/keywrap" || u16 key_id`。
-pub fn keywrap_aad(key_id: KeyId) -> Vec<u8> {
+pub fn keywrap_aad(key_id: LegacyKeyId) -> Vec<u8> {
     let mut out = Vec::with_capacity(AAD_KEYWRAP_DOMAIN.len() + 2);
     out.extend_from_slice(AAD_KEYWRAP_DOMAIN);
     out.extend_from_slice(&key_id.get().to_be_bytes());
@@ -518,8 +518,8 @@ mod tests {
 
     #[test]
     fn keywrap_and_keycheck_aad() {
-        let first = KeyId::new(1).unwrap();
-        let second = KeyId::new(2).unwrap();
+        let first = LegacyKeyId::new(1).unwrap();
+        let second = LegacyKeyId::new(2).unwrap();
         assert_ne!(keywrap_aad(first), keywrap_aad(second));
         assert_eq!(keywrap_aad(first).len(), AAD_KEYWRAP_DOMAIN.len() + 2);
         assert_eq!(keycheck_aad(), b"shio/v1/keycheck");

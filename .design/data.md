@@ -2,7 +2,7 @@
 
 <!-- 持久化格式的稳定契约。改字节布局、AAD 或密钥派生前，必须先追加 DECISIONS.log。 -->
 
-本文描述 `format=1`（当前实现）与 `format=2`（同步库，设计已定、M0 实现）的落盘格式。API 契约见 `api.md`；定位与取舍见 `changes/20261020-encrypted-persistence-core/design.md` 与 `changes/20261022-sync-design/design.md`。
+本文描述 `format=1`（基础库）与 `format=2`（同步库，M0–M5 已实现）的落盘格式。API 契约见 `api.md`；定位与取舍见 `changes/20261020-encrypted-persistence-core/design.md` 与 `changes/20261022-sync-design/design.md`。
 
 ## 1. 文件与引擎
 
@@ -319,7 +319,7 @@ password (UTF-8 bytes)
 
 ## 15. format 2（同步库）
 
-> 本节是 `20261022-sync-design` 的字节契约，随 M0–M4 实现；当前二进制仍只写 `format=1`。
+> 本节是 `20261022-sync-design` 的字节契约，M0–M5 已实现；新库仍先写 `format=1`，`enable_sync` 后升级为 `format=2`。
 
 `format=2` 保留 `format=1` 的四张表与 `RecordKey` / `CatalogKey` 布局，只改变 meta、key、record 的字段宽度与 AAD 域，并新增 `shio.keys2`、`shio.changes`、`shio.sync`。升级期间新旧记录并存，按每条记录的 `format` 字节选择解码器。
 
@@ -519,8 +519,9 @@ password (UTF-8 bytes)
 5. 更新 `peer/<sender> = next`，提交。任一步失败整页回滚。
 
 - 重复页、同页重复条目、相同 blob 都是幂等的；相等或更小直接跳过。
+- `migrate_all` 重加密时推进 `updated_at`，因此旧密钥的旧日志不会在 LWW 里覆盖已迁移副本。
 - `after + 1 < log_start` → `SyncResyncRequired { log_start }`；`after > log_end` → `InvalidArgument`。
-- `snapshot_start()` 在只读事务取 `at_seq = log_end`；`snapshot_page(after_key, limit)` 按键序返回 `record_key + RecordBlob`。应用完快照后从 `at_seq + 1` 续拉；快照期间的新更新仍在日志里。
+- `snapshot_start()` 在只读事务取 `at_seq = log_end`；`snapshot_page(after_key, limit)` 按键序返回 `record_key + RecordBlob`，它返回的 `at_seq` 是该次读取时的 `log_end`，续拉锚点应使用 `shio-sync` 迭代器保存的起始 `at_seq`。应用完快照后从起始 `at_seq + 1` 续拉；快照期间的新更新仍在日志里。
 - `compact_changes(before)` 删除序号 `< before` 的条目并前移 `log_start`，返回删除条数；`before` 超出 `1..=log_end+1` 返回 `InvalidArgument`。本版只手动压缩。
 
 ### 15.9 帧 `SHY2`
@@ -544,7 +545,7 @@ password (UTF-8 bytes)
 
 - `frame_kind=0`：entry 为 `ChangeBlob`；`after/next/log_start/log_end` 是发送方日志语义。
 - `frame_kind=1`：entry 为 `kind=1` offer，按 `created_at` 升序；`after=0`。
-- `frame_kind=2`：entry 为 `u16 key_len | record_key | u32 blob_len | RecordBlob`；`next` 为下一个快照键游标（M2 定稿具体游标编码）。
+- `frame_kind=2`：entry 为 `u16 key_len | record_key | u32 blob_len | RecordBlob`；`sender` 为全 0，`after=0`，`log_start=log_end=at_seq`，`next=1` 表示还有下一页、`0` 表示结束。快照游标不放进帧头：接收方用本页最后一条记录的 `record_key` 作为下一页的 `after_key`；这与 `snapshot_page` 的排他游标一致。
 - 解码顺序：`frame_len` → magic/format/kind/db_id → `count` → 逐条 `entry_len`；先限额再分配。单帧默认上限 4 MiB、`count ≤ 1000`，调用方可调小。
 - 帧 `format` 与数据库 `format` 独立演进；未知版本返回 `UnsupportedFormat`。
 
@@ -590,7 +591,7 @@ password (UTF-8 bytes)
 
 - `begin_rotation`：生成 `to`，写 `shio.keys2` 行与 `rot/<to>`，追加 `kind=1`，更新 `meta.key_id` 与 key check，追加 `kind=3`，写 `cur/<dev>`；全部同事务。
 - 安装 offer：校验 `db_id` 与祖先 key，解包 `DK_to`，用本机 KEK 重包裹，写 `shio.keys2`，追加 `kind=2` ack；若 `to` 更大则同时切 `meta.key_id` 并追加 `kind=3`。
-- `migrate_all(to)`：每 256 条重加密，完成后对不再被引用的 key 追加 `kind=4` 并写 `mig/<key>/<dev>`。
+- `migrate_all(to)`：每 256 条重加密，重加密时把 `updated_at` 推进到 `max(now, 旧值 + 1)`（避免旧密钥的同一逻辑版本在 LWW 的 blob 次序里翻回旧密钥）；完成后对不再被引用的 key 追加 `kind=4` 并写 `mig/<key>/<dev>`。
 - `retire(from)`：仅在本机无 `from` 记录、无设备以 `from` 为 `cur`、所有已知设备都有 `mig/from/<dev>`、且无未安装的 `from` offer 时删除 key 行。
 - `prune_rotation_offers(to)`：所有已知设备都有 `ack/to/<dev>` 后删除 `rot/<to>`；不触碰记录表。
 - 同步模式的 `change_password` 重新包裹所有 `shio.keys2` 行（同一新 salt/KEK、各自 nonce，单事务）；`format=1` 仍要求单行。

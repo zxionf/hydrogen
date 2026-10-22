@@ -10,5 +10,5 @@ pub mod keys;
 pub use aead::{Nonce, NONCE_LEN, TAG_LEN};
 pub use kdf::{KdfId, KdfParams};
 pub use keys::{
-    CheckKey, DataKey, Kek, KeyId, MetaKey, RecordKey, KEY_LEN, MAX_KEY_ID, MIN_KEY_ID,
+    CheckKey, DataKey, Kek, LegacyKeyId, MetaKey, RecordKey, KEY_LEN, MAX_KEY_ID, MIN_KEY_ID,
 };

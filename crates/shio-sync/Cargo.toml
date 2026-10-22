@@ -1,6 +1,6 @@
 [package]
 name = "shio-sync"
-description = "shio 的多端同步（设计占位，尚未实现）"
+description = "shio 的多端同步：SHY2 帧、配对文本与拥有型同步句柄"
 edition.workspace = true
 version.workspace = true
 rust-version.workspace = true
@@ -9,6 +9,9 @@ publish.workspace = true
 
 [dependencies]
 shio-core.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
 
 [lints]
 workspace = true

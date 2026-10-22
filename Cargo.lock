@@ -448,6 +448,7 @@ dependencies = [
  "serde",
  "serde_json",
  "shio-core",
+ "shio-sync",
  "tempfile",
  "tokio",
  "zeroize",
@@ -483,6 +484,7 @@ name = "shio-sync"
 version = "0.1.0"
 dependencies = [
  "shio-core",
+ "tempfile",
 ]
 
 [[package]]

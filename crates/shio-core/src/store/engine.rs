@@ -3,9 +3,9 @@
 //! 事务边界：每次公开写操作是一个 redb 写事务，`batch` 的所有操作在同一事务内，
 //! 任一失败则整批不生效。读操作使用独立读事务，看到一致快照。
 //!
-//! 密钥生命周期：会话持有 `keys` 表中的全部密钥，记录按自身 header 的 `key_id`
-//! 选择密钥解密，因此轮换中途崩溃后新旧记录都能读。改口令只重包裹 DK；轮换生成
-//! 新 `key_id`、分批重加密记录，最后切换 meta 并删除旧行。
+//! 密钥生命周期：会话同时持有 `format=1` 的旧密钥与 `format=2` 的新密钥，记录按
+//! 自身 header 的 `key_id` 选择解密器，因此升级与轮换中途崩溃后两种记录都能读。
+//! 同步相关方法集中在子模块 [`engine_sync`]，配对包在 [`pairing`]。
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -13,21 +13,31 @@ use std::ops::Bound;
 use std::path::PathBuf;
 use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
-use redb::{Database, ReadOnlyDatabase, ReadableDatabase, ReadableTable, Table};
+use redb::{
+    Database, ReadOnlyDatabase, ReadableDatabase, ReadableTable, Table, TableHandle,
+    WriteTransaction,
+};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use zeroize::Zeroizing;
 
-use crate::codec::{self, RecordBlob, RecordHeader, CT_OFFSET, NONCE_LEN};
+use crate::codec::{self, CT_OFFSET, NONCE_LEN};
+use crate::codec2;
 use crate::crypto::aead::{self, Nonce};
 use crate::crypto::kdf::{self, KdfId, KdfParams, Subkeys};
-use crate::crypto::keys::{DataKey, Kek, KeyId, KEY_LEN};
+use crate::crypto::keys::{DataKey, Kek, LegacyKeyId, KEY_LEN};
 use crate::error::{Error, Result};
 use crate::model::{
-    validate_name, ListOptions, NameKind, Page, RecordId, RecordMeta, Stored, Timestamp, WriteOp,
-    DEFAULT_MAX_VALUE_SIZE,
+    validate_name, DeviceId, KeyId, ListOptions, NameKind, Page, RecordId, RecordMeta, Stored,
+    Timestamp, WriteOp, DEFAULT_MAX_VALUE_SIZE,
 };
-use crate::store::{catalog, keys, meta, records, META_KEY};
+use crate::store::{
+    catalog, changes, keys, keys2, meta, meta2, records, sync_state, FORMAT, FORMAT_V2, META_KEY,
+};
+use crate::sync::{ChangeEntry, RecordChange};
+
+mod engine_sync;
+mod pairing;
 
 /// 轮换时每个写事务迁移的记录条数。
 const ROTATE_BATCH: usize = 256;
@@ -108,7 +118,7 @@ pub struct Stats {
     /// 数据库格式版本。
     pub format_version: u16,
     /// 当前数据密钥编号。
-    pub key_id: u16,
+    pub key_id: KeyId,
     /// 库文件字节数。
     pub db_bytes: u64,
 }
@@ -174,29 +184,155 @@ impl Handle {
     }
 }
 
-/// 会话密钥状态：meta、当前密钥编号、按编号索引的密钥与 KEK。
+/// 会话密钥状态：格式版本、当前密钥编号、按编号索引的密钥与 KEK。
+///
+/// `format=2` 使用 [`keys2`]；升级期间同时保留 `shio.keys` 的旧行，直到迁移完成。
 struct Session {
-    meta: meta::MetaBlob,
+    format: u16,
+    created_at: i64,
+    app_id: String,
     current: KeyId,
-    keys: BTreeMap<u16, KeyEntry>,
+    keys: BTreeMap<KeyId, KeyEntry>,
+    legacy_current: Option<u16>,
+    legacy_keys: BTreeMap<u16, LegacyKeyEntry>,
+    legacy_map: BTreeMap<u16, KeyId>,
     kek: Kek,
+    salt: [u8; 16],
+    kdf_id: u8,
+    kdf_params: KdfParams,
+    key_check_nonce: [u8; NONCE_LEN],
+    key_check_ct: [u8; meta::KEY_CHECK_CT_LEN],
+    sync: Option<DeviceId>,
+    upgrading: bool,
 }
 
 impl Session {
-    fn active(&self) -> Result<(KeyId, &KeyEntry)> {
+    fn active(&self) -> Result<&KeyEntry> {
+        self.keys
+            .get(&self.current)
+            .ok_or(Error::Internal("active data key missing"))
+    }
+
+    fn legacy_active(&self) -> Result<(u16, &LegacyKeyEntry)> {
+        let id = self
+            .legacy_current
+            .ok_or(Error::Internal("active legacy data key missing"))?;
         let entry = self
-            .keys
-            .get(&self.current.get())
-            .ok_or(Error::Internal("active data key missing"))?;
-        Ok((self.current, entry))
+            .legacy_keys
+            .get(&id)
+            .ok_or(Error::Internal("active legacy data key missing"))?;
+        Ok((id, entry))
+    }
+
+    fn key_created_at(&self, key_id: KeyId) -> Option<i64> {
+        self.keys
+            .get(&key_id)
+            .map(|entry| entry.blob.created_at)
+            .or_else(|| {
+                key_id
+                    .as_u16()
+                    .and_then(|id| self.legacy_keys.get(&id))
+                    .map(|entry| entry.blob.created_at)
+            })
+    }
+
+    fn meta2_bytes(
+        &self,
+        current: KeyId,
+        key_check_nonce: [u8; NONCE_LEN],
+        key_check_ct: [u8; meta::KEY_CHECK_CT_LEN],
+    ) -> Result<Vec<u8>> {
+        meta2::MetaBlob::new(
+            current,
+            self.created_at,
+            &self.app_id,
+            key_check_nonce,
+            key_check_ct,
+        )?
+        .encode()
     }
 }
 
-/// 一把已解包的密钥：落盘 blob、DK 与派生出的子密钥。
+/// 一把 `format=2` 的已解包密钥。
 struct KeyEntry {
+    blob: keys2::KeyBlob,
+    data_key: DataKey,
+    subkeys: Subkeys,
+}
+
+/// 一把 `format=1` 的已解包密钥。
+struct LegacyKeyEntry {
     blob: keys::KeyBlob,
     data_key: DataKey,
     subkeys: Subkeys,
+}
+
+/// 已校验结构的记录值视图：`SHR1` 或 `SHR2`。
+enum BlobView<'a> {
+    V1(codec::RecordBlob<'a>),
+    V2(codec2::RecordBlob<'a>),
+}
+
+impl<'a> BlobView<'a> {
+    fn decode(value: &'a [u8]) -> Result<Self> {
+        if value.len() < 5 {
+            return Err(Error::Corrupted("record blob too short"));
+        }
+        match &value[..4] {
+            b"SHR1" => Ok(Self::V1(codec::RecordBlob::decode(value)?)),
+            b"SHR2" => Ok(Self::V2(codec2::RecordBlob::decode(value)?)),
+            _ => Err(Error::Corrupted("record magic mismatch")),
+        }
+    }
+
+    fn key_id(&self) -> KeyId {
+        match self {
+            Self::V1(blob) => KeyId::from_u16(blob.header.key_id),
+            Self::V2(blob) => blob.header.key_id,
+        }
+    }
+
+    fn rev(&self) -> u64 {
+        match self {
+            Self::V1(blob) => blob.header.rev,
+            Self::V2(blob) => blob.header.rev,
+        }
+    }
+
+    fn created_at(&self) -> i64 {
+        match self {
+            Self::V1(blob) => blob.header.created_at,
+            Self::V2(blob) => blob.header.created_at,
+        }
+    }
+
+    fn updated_at(&self) -> i64 {
+        match self {
+            Self::V1(blob) => blob.header.updated_at,
+            Self::V2(blob) => blob.header.updated_at,
+        }
+    }
+
+    fn data_version(&self) -> u16 {
+        match self {
+            Self::V1(blob) => blob.header.data_version,
+            Self::V2(blob) => blob.header.data_version,
+        }
+    }
+
+    fn is_deleted(&self) -> bool {
+        match self {
+            Self::V1(blob) => blob.header.is_deleted(),
+            Self::V2(blob) => blob.header.is_deleted(),
+        }
+    }
+
+    fn ciphertext(&self) -> &'a [u8] {
+        match self {
+            Self::V1(blob) => blob.ciphertext,
+            Self::V2(blob) => blob.ciphertext,
+        }
+    }
 }
 
 impl fmt::Debug for Engine {
@@ -206,8 +342,8 @@ impl fmt::Debug for Engine {
             .field("read_only", &self.handle.is_read_only())
             .field("max_value_size", &self.max_value_size);
         if let Ok(session) = self.session.read() {
-            out.field("format", &session.meta.format)
-                .field("key_id", &session.current.get());
+            out.field("format", &session.format)
+                .field("key_id", &session.current);
         }
         out.finish_non_exhaustive()
     }
@@ -343,7 +479,7 @@ impl Engine {
         };
         let meta = {
             let mut table = txn.open_table(records::TABLE)?;
-            self.stage_put(&session, &mut table, path, plaintext, data_version)?
+            self.stage_put(&session, &txn, &mut table, path, plaintext, data_version)?
         };
         self.stage_catalog(&txn, namespace, collection)?;
         txn.commit()?;
@@ -385,8 +521,8 @@ impl Engine {
             return Ok(None);
         };
 
-        let blob = RecordBlob::decode(&raw)?;
-        if blob.header.is_deleted() {
+        let blob = BlobView::decode(&raw)?;
+        if blob.is_deleted() {
             return Ok(None);
         }
 
@@ -397,11 +533,9 @@ impl Engine {
                 collection,
                 id: *id,
             },
-            &blob.header,
-            blob.nonce,
-            blob.ciphertext,
+            &blob,
         )?;
-        let meta = record_meta(*id, &blob.header, blob.ciphertext.len())?;
+        let meta = record_meta(*id, &blob)?;
         Ok(Some((meta, plaintext)))
     }
 
@@ -416,6 +550,7 @@ impl Engine {
             let mut table = txn.open_table(records::TABLE)?;
             self.stage_delete(
                 &session,
+                &txn,
                 &mut table,
                 RecordPath {
                     namespace,
@@ -433,6 +568,9 @@ impl Engine {
     pub fn purge(&self, namespace: &str, collection: &str, id: &RecordId) -> Result<bool> {
         let key = codec::encode_record_key(namespace, collection, id)?;
         self.require_writable()?;
+        if self.read_session()?.sync.is_some() {
+            return Err(Error::SyncEnabled);
+        }
 
         let txn = self.handle.begin_write()?;
         let existed = {
@@ -473,12 +611,12 @@ impl Engine {
                 }
             }
 
-            let blob = RecordBlob::decode(value.value())?;
-            if blob.header.is_deleted() && !options.include_deleted {
+            let blob = BlobView::decode(value.value())?;
+            if blob.is_deleted() && !options.include_deleted {
                 continue;
             }
 
-            items.push(record_meta(id, &blob.header, blob.ciphertext.len())?);
+            items.push(record_meta(id, &blob)?);
             if items.len() > options.limit {
                 items.pop();
                 next = items.last().map(|meta| meta.id);
@@ -554,6 +692,7 @@ impl Engine {
                         has_put = true;
                         metas.push(self.stage_put(
                             &session,
+                            &txn,
                             &mut table,
                             RecordPath {
                                 namespace,
@@ -568,6 +707,7 @@ impl Engine {
                         let meta = self
                             .stage_delete(
                                 &session,
+                                &txn,
                                 &mut table,
                                 RecordPath {
                                     namespace,
@@ -619,8 +759,8 @@ impl Engine {
         let session = self.read_session()?;
         let db_bytes = std::fs::metadata(&self.path).map_or(0, |meta| meta.len());
         Ok(Stats {
-            format_version: session.meta.format,
-            key_id: session.current.get(),
+            format_version: session.format,
+            key_id: session.current,
             db_bytes,
         })
     }
@@ -634,44 +774,107 @@ impl Engine {
 
     /// 改口令：用新盐与新 KEK 重新包裹会话内的 DK，不触碰记录。
     ///
-    /// 存在多行 key（轮换未完成）时返回 [`Error::Busy`]。
+    /// 升级期间返回 [`Error::Busy`]；`format=1` 仍要求只有一行 key。
     pub fn change_password(&self, new_password: &[u8]) -> Result<()> {
         self.require_writable()?;
         let mut session = self.write_session()?;
 
-        if session.keys.len() != 1 {
+        if session.upgrading {
             return Err(Error::Busy);
         }
 
-        let key_id = session.current;
-        let (new_kek, blob) = {
-            let entry = session
-                .keys
-                .get(&key_id.get())
-                .ok_or(Error::Internal("active data key missing"))?;
+        if session.format == FORMAT {
+            if session.legacy_keys.len() != 1 {
+                return Err(Error::Busy);
+            }
 
-            let mut salt = [0u8; kdf::SALT_LEN];
-            getrandom::fill(&mut salt)
-                .map_err(|_| Error::Internal("operating system CSPRNG unavailable"))?;
-            let params = entry.blob.kdf_params();
-            let new_kek = kdf::derive_kek(new_password, &salt, &params)?;
+            let (key_id_u16, new_kek, salt, blob) = {
+                let (key_id_u16, entry) = session.legacy_active()?;
 
+                let mut salt = [0u8; kdf::SALT_LEN];
+                getrandom::fill(&mut salt)
+                    .map_err(|_| Error::Internal("operating system CSPRNG unavailable"))?;
+                let params = entry.blob.kdf_params();
+                let new_kek = kdf::derive_kek(new_password, &salt, &params)?;
+
+                let key_id = LegacyKeyId::new(key_id_u16)?;
+                let wrap_nonce = Nonce::random()?;
+                let wrapped = aead::seal(
+                    new_kek.as_bytes(),
+                    &wrap_nonce,
+                    &codec::keywrap_aad(key_id),
+                    entry.data_key.as_bytes(),
+                )?;
+                let wrapped_dk: [u8; keys::WRAPPED_DK_LEN] = wrapped
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| Error::Internal("wrapped data key has unexpected length"))?;
+
+                let blob = keys::KeyBlob {
+                    key_id: key_id_u16,
+                    kdf_id: entry.blob.kdf_id,
+                    flags: entry.blob.flags,
+                    m_cost_kib: entry.blob.m_cost_kib,
+                    t_cost: entry.blob.t_cost,
+                    p_cost: entry.blob.p_cost,
+                    salt,
+                    wrap_nonce: *wrap_nonce.as_bytes(),
+                    wrapped_dk,
+                    created_at: entry.blob.created_at,
+                    label: entry.blob.label.clone(),
+                };
+                (key_id_u16, new_kek, salt, blob)
+            };
+
+            let bytes = blob.encode()?;
+            let txn = self.handle.begin_write()?;
+            {
+                let mut table = txn.open_table(keys::TABLE)?;
+                table.insert(key_id_u16, bytes.as_slice())?;
+            }
+            txn.commit()?;
+
+            session.kek = new_kek;
+            session.salt = salt;
+            session.kdf_id = blob.kdf_id;
+            session.kdf_params = blob.kdf_params();
+            if let Some(entry) = session.legacy_keys.get_mut(&key_id_u16) {
+                entry.blob = blob;
+            }
+            return Ok(());
+        }
+
+        if !session.legacy_keys.is_empty() {
+            return Err(Error::Busy);
+        }
+        if session.keys.is_empty() {
+            return Err(Error::Internal("no data key available"));
+        }
+
+        let mut salt = [0u8; kdf::SALT_LEN];
+        getrandom::fill(&mut salt)
+            .map_err(|_| Error::Internal("operating system CSPRNG unavailable"))?;
+        let params = session.kdf_params;
+        let new_kek = kdf::derive_kek(new_password, &salt, &params)?;
+
+        let mut rewritten: Vec<(KeyId, keys2::KeyBlob, Vec<u8>)> =
+            Vec::with_capacity(session.keys.len());
+        for entry in session.keys.values() {
             let wrap_nonce = Nonce::random()?;
             let wrapped = aead::seal(
                 new_kek.as_bytes(),
                 &wrap_nonce,
-                &codec::keywrap_aad(key_id),
+                &codec2::keywrap_aad(entry.blob.key_id),
                 entry.data_key.as_bytes(),
             )?;
-            let wrapped_dk: [u8; keys::WRAPPED_DK_LEN] = wrapped
+            let wrapped_dk: [u8; keys2::WRAPPED_DK_LEN] = wrapped
                 .as_slice()
                 .try_into()
                 .map_err(|_| Error::Internal("wrapped data key has unexpected length"))?;
-
-            let blob = keys::KeyBlob {
-                key_id: key_id.get(),
+            let blob = keys2::KeyBlob {
+                key_id: entry.blob.key_id,
                 kdf_id: entry.blob.kdf_id,
-                flags: entry.blob.flags,
+                flags: 0,
                 m_cost_kib: entry.blob.m_cost_kib,
                 t_cost: entry.blob.t_cost,
                 p_cost: entry.blob.p_cost,
@@ -681,44 +884,57 @@ impl Engine {
                 created_at: entry.blob.created_at,
                 label: entry.blob.label.clone(),
             };
-            (new_kek, blob)
-        };
+            let bytes = blob.encode()?;
+            rewritten.push((blob.key_id, blob, bytes));
+        }
 
-        let bytes = blob.encode()?;
         let txn = self.handle.begin_write()?;
         {
-            let mut table = txn.open_table(keys::TABLE)?;
-            table.insert(key_id.get(), bytes.as_slice())?;
+            let mut table = txn.open_table(keys2::TABLE)?;
+            for (key_id, _, bytes) in &rewritten {
+                table.insert(key_id.as_bytes().as_slice(), bytes.as_slice())?;
+            }
         }
         txn.commit()?;
 
         session.kek = new_kek;
-        if let Some(entry) = session.keys.get_mut(&key_id.get()) {
-            entry.blob = blob;
+        session.salt = salt;
+        session.kdf_params = params;
+        for (key_id, blob, _) in rewritten {
+            if let Some(entry) = session.keys.get_mut(&key_id) {
+                entry.blob = blob;
+            }
         }
         Ok(())
     }
 
-    /// 轮换数据密钥：生成新 `key_id`、重加密全部记录、切换 meta、删除旧 key 行。
+    /// 轮换数据密钥。
     ///
-    /// 迁移期间持有会话写锁，其它读写会等待；新 key 行先落盘，因此中途崩溃后
-    /// 重新打开仍可读新旧两种记录，下次调用可继续迁移。
+    /// `format=1` 使用递增 u16 编号并在结束时删除旧行；`format=2` 生成随机
+    /// `key_id`、写公告与迁移公告，并保留旧 key 直到 [`Self::retire_key`]。
     pub fn rotate_data_key(&self) -> Result<()> {
         self.require_writable()?;
+
+        if self.read_session()?.format == FORMAT_V2 {
+            let info = self.begin_rotation()?;
+            self.migrate_all(info.to)?;
+            return Ok(());
+        }
+
         let mut session = self.write_session()?;
-
-        let old_id = session.current;
-        let new_id = old_id
+        let old_id = session
+            .legacy_current
+            .ok_or(Error::Internal("active legacy data key missing"))?;
+        let new_id = LegacyKeyId::new(old_id)?
             .next()
-            .ok_or(Error::InvalidArgument("data key id space exhausted"))?;
+            .ok_or(Error::InvalidArgument("data key id space exhausted"))?
+            .get();
 
-        // 1. 用当前 KEK 包裹新 DK，写新 key 行（独立事务）。若上次轮换在迁移中
-        //    中断，新行已存在，直接复用它继续迁移。
-        if !session.keys.contains_key(&new_id.get()) {
+        if !session.legacy_keys.contains_key(&new_id) {
             let (data_key, subkeys, key_blob) = {
                 let old = session
-                    .keys
-                    .get(&old_id.get())
+                    .legacy_keys
+                    .get(&old_id)
                     .ok_or(Error::Internal("active data key missing"))?;
 
                 let mut dk_bytes = [0u8; KEY_LEN];
@@ -731,7 +947,7 @@ impl Engine {
                 let wrapped = aead::seal(
                     session.kek.as_bytes(),
                     &wrap_nonce,
-                    &codec::keywrap_aad(new_id),
+                    &codec::keywrap_aad(LegacyKeyId::new(new_id)?),
                     data_key.as_bytes(),
                 )?;
                 let wrapped_dk: [u8; keys::WRAPPED_DK_LEN] = wrapped
@@ -740,7 +956,7 @@ impl Engine {
                     .map_err(|_| Error::Internal("wrapped data key has unexpected length"))?;
 
                 let blob = keys::KeyBlob {
-                    key_id: new_id.get(),
+                    key_id: new_id,
                     kdf_id: old.blob.kdf_id,
                     flags: 0,
                     m_cost_kib: old.blob.m_cost_kib,
@@ -759,13 +975,13 @@ impl Engine {
             let txn = self.handle.begin_write()?;
             {
                 let mut table = txn.open_table(keys::TABLE)?;
-                table.insert(new_id.get(), key_bytes.as_slice())?;
+                table.insert(new_id, key_bytes.as_slice())?;
             }
             txn.commit()?;
 
-            session.keys.insert(
-                new_id.get(),
-                KeyEntry {
+            session.legacy_keys.insert(
+                new_id,
+                LegacyKeyEntry {
                     blob: key_blob,
                     data_key,
                     subkeys,
@@ -773,14 +989,12 @@ impl Engine {
             );
         }
 
-        // 2. 分批迁移记录。
-        self.migrate_records(&session, new_id)?;
+        self.migrate_records_v1(&session, new_id)?;
 
-        // 3. 用新 check-key 重写 meta，并删除旧 key 行。
-        let new_meta = {
+        let (new_meta, old_ids) = {
             let entry = session
-                .keys
-                .get(&new_id.get())
+                .legacy_keys
+                .get(&new_id)
                 .ok_or(Error::Internal("new data key missing"))?;
             let check_nonce = Nonce::random()?;
             let check_ct = aead::seal(
@@ -794,21 +1008,24 @@ impl Engine {
                 .try_into()
                 .map_err(|_| Error::Internal("key check has unexpected length"))?;
 
-            let mut new_meta = session.meta.clone();
-            new_meta.key_id = new_id.get();
-            new_meta.key_check_nonce = *check_nonce.as_bytes();
-            new_meta.key_check_ct = check_ct;
-            new_meta
+            let new_meta = meta::MetaBlob::new(
+                new_id,
+                session.created_at,
+                &session.app_id,
+                *check_nonce.as_bytes(),
+                check_ct,
+            )?;
+
+            let old_ids: Vec<u16> = session
+                .legacy_keys
+                .keys()
+                .copied()
+                .filter(|id| *id != new_id)
+                .collect();
+            (new_meta, old_ids)
         };
 
         let meta_bytes = new_meta.encode()?;
-        let old_ids: Vec<u16> = session
-            .keys
-            .keys()
-            .copied()
-            .filter(|id| *id != new_id.get())
-            .collect();
-
         let txn = self.handle.begin_write()?;
         {
             let mut table = txn.open_table(meta::TABLE)?;
@@ -822,16 +1039,18 @@ impl Engine {
         }
         txn.commit()?;
 
-        session.meta = new_meta;
-        session.current = new_id;
-        session.keys.retain(|id, _| *id == new_id.get());
+        session.legacy_current = Some(new_id);
+        session.current = KeyId::from_u16(new_id);
+        session.key_check_nonce = new_meta.key_check_nonce;
+        session.key_check_ct = new_meta.key_check_ct;
+        session.legacy_keys.retain(|id, _| *id == new_id);
         Ok(())
     }
 
-    fn migrate_records(&self, session: &Session, new_id: KeyId) -> Result<()> {
+    fn migrate_records_v1(&self, session: &Session, new_id: u16) -> Result<()> {
         let new_entry = session
-            .keys
-            .get(&new_id.get())
+            .legacy_keys
+            .get(&new_id)
             .ok_or(Error::Internal("new data key missing"))?;
 
         let mut after: Option<Vec<u8>> = None;
@@ -862,8 +1081,8 @@ impl Engine {
             {
                 let mut table = txn.open_table(records::TABLE)?;
                 for (key, value) in &batch {
-                    let blob = RecordBlob::decode(value)?;
-                    if blob.header.key_id == new_id.get() {
+                    let blob = BlobView::decode(value)?;
+                    if blob.key_id() == KeyId::from_u16(new_id) {
                         continue;
                     }
 
@@ -873,12 +1092,22 @@ impl Engine {
                         collection: &collection,
                         id,
                     };
-                    let plaintext =
-                        self.decrypt(session, path, &blob.header, blob.nonce, blob.ciphertext)?;
+                    let plaintext = self.decrypt(session, path, &blob)?;
 
-                    let mut header = blob.header;
-                    header.key_id = new_id.get();
-                    let out = self.build_record(&new_entry.subkeys, path, &plaintext, header)?;
+                    let legacy_id = blob
+                        .key_id()
+                        .as_u16()
+                        .ok_or(Error::Corrupted("v1 record has a v2 key id"))?;
+                    let header = codec::RecordHeader::new(
+                        new_id,
+                        blob.rev(),
+                        blob.created_at(),
+                        blob.updated_at(),
+                        blob.data_version(),
+                    )
+                    .with_deleted(blob.is_deleted());
+                    let _ = legacy_id;
+                    let out = self.build_record_v1(&new_entry.subkeys, path, &plaintext, header)?;
                     table.insert(key.as_slice(), out.as_slice())?;
                 }
             }
@@ -928,6 +1157,7 @@ impl Engine {
     fn stage_put(
         &self,
         session: &Session,
+        txn: &WriteTransaction,
         table: &mut Table<'_, &[u8], &[u8]>,
         path: RecordPath<'_>,
         plaintext: &[u8],
@@ -939,30 +1169,72 @@ impl Engine {
             .map(|guard| guard.value().to_vec());
 
         let now = Timestamp::now().as_millis();
-        let (rev, created_at) = match existing {
+        let (rev, created_at, previous_updated) = match &existing {
             Some(raw) => {
-                let blob = RecordBlob::decode(&raw)?;
+                let blob = BlobView::decode(raw)?;
                 let rev = blob
-                    .header
-                    .rev
+                    .rev()
                     .checked_add(1)
                     .ok_or(Error::Internal("record revision overflow"))?;
-                (rev, blob.header.created_at)
+                (rev, blob.created_at(), blob.updated_at())
             }
-            None => (1, now),
+            None => (1, now, now),
+        };
+        let updated_at = if session.sync.is_some() {
+            now.max(previous_updated.saturating_add(1))
+        } else {
+            now
         };
 
-        let (key_id, entry) = session.active()?;
-        let header = RecordHeader::new(key_id.get(), rev, created_at, now, data_version);
-        let blob = self.build_record(&entry.subkeys, path, plaintext, header)?;
+        let (id, blob) = if session.format == FORMAT {
+            let (legacy_id, entry) = session.legacy_active()?;
+            let header =
+                codec::RecordHeader::new(legacy_id, rev, created_at, updated_at, data_version);
+            let blob = self.build_record_v1(&entry.subkeys, path, plaintext, header)?;
+            (KeyId::from_u16(legacy_id), blob)
+        } else {
+            let entry = session.active()?;
+            let header = codec2::RecordHeader::new(
+                session.current,
+                rev,
+                created_at,
+                updated_at,
+                data_version,
+            );
+            let blob = self.build_record_v2(&entry.subkeys, path, plaintext, header)?;
+            (session.current, blob)
+        };
         table.insert(key.as_slice(), blob.as_slice())?;
 
-        record_meta(path.id, &header, blob.len() - CT_OFFSET)
+        let meta = record_meta_from(&blob, path.id)?;
+
+        if let Some(device) = session.sync {
+            if session.format == FORMAT_V2 {
+                append_change(
+                    txn,
+                    device,
+                    &ChangeEntry::Record(RecordChange {
+                        namespace: path.namespace.to_owned(),
+                        collection: path.collection.to_owned(),
+                        id: path.id,
+                        key_id: id,
+                        rev,
+                        updated_at: Timestamp::from_millis(updated_at),
+                        deleted: false,
+                        writer: device,
+                        blob,
+                    }),
+                )?;
+            }
+        }
+
+        Ok(meta)
     }
 
     fn stage_delete(
         &self,
         session: &Session,
+        txn: &WriteTransaction,
         table: &mut Table<'_, &[u8], &[u8]>,
         path: RecordPath<'_>,
     ) -> Result<Option<RecordMeta>> {
@@ -974,37 +1246,77 @@ impl Engine {
             return Ok(None);
         };
 
-        let blob = RecordBlob::decode(&raw)?;
-        let plaintext = self.decrypt(session, path, &blob.header, blob.nonce, blob.ciphertext)?;
+        let blob = BlobView::decode(&raw)?;
+        let plaintext = self.decrypt(session, path, &blob)?;
 
         let rev = blob
-            .header
-            .rev
+            .rev()
             .checked_add(1)
             .ok_or(Error::Internal("record revision overflow"))?;
         let now = Timestamp::now().as_millis();
-        let (key_id, entry) = session.active()?;
-        let header = RecordHeader::new(
-            key_id.get(),
-            rev,
-            blob.header.created_at,
-            now,
-            blob.header.data_version,
-        )
-        .with_deleted(true);
+        let updated_at = if session.sync.is_some() {
+            now.max(blob.updated_at().saturating_add(1))
+        } else {
+            now
+        };
 
-        let out = self.build_record(&entry.subkeys, path, &plaintext, header)?;
+        let (id, out) = if session.format == FORMAT {
+            let (legacy_id, entry) = session.legacy_active()?;
+            let header = codec::RecordHeader::new(
+                legacy_id,
+                rev,
+                blob.created_at(),
+                updated_at,
+                blob.data_version(),
+            )
+            .with_deleted(true);
+            let out = self.build_record_v1(&entry.subkeys, path, &plaintext, header)?;
+            (KeyId::from_u16(legacy_id), out)
+        } else {
+            let entry = session.active()?;
+            let header = codec2::RecordHeader::new(
+                session.current,
+                rev,
+                blob.created_at(),
+                updated_at,
+                blob.data_version(),
+            )
+            .with_deleted(true);
+            let out = self.build_record_v2(&entry.subkeys, path, &plaintext, header)?;
+            (session.current, out)
+        };
         table.insert(key.as_slice(), out.as_slice())?;
 
-        Ok(Some(record_meta(path.id, &header, out.len() - CT_OFFSET)?))
+        let meta = record_meta_from(&out, path.id)?;
+        if let Some(device) = session.sync {
+            if session.format == FORMAT_V2 {
+                append_change(
+                    txn,
+                    device,
+                    &ChangeEntry::Record(RecordChange {
+                        namespace: path.namespace.to_owned(),
+                        collection: path.collection.to_owned(),
+                        id: path.id,
+                        key_id: id,
+                        rev,
+                        updated_at: Timestamp::from_millis(updated_at),
+                        deleted: true,
+                        writer: device,
+                        blob: out,
+                    }),
+                )?;
+            }
+        }
+
+        Ok(Some(meta))
     }
 
-    fn build_record(
+    fn build_record_v1(
         &self,
         subkeys: &Subkeys,
         path: RecordPath<'_>,
         plaintext: &[u8],
-        header: RecordHeader,
+        header: codec::RecordHeader,
     ) -> Result<Vec<u8>> {
         let header_bytes = header.encode();
         let aad = codec::record_aad(path.namespace, path.collection, &path.id, &header_bytes)?;
@@ -1021,22 +1333,79 @@ impl Engine {
         Ok(out)
     }
 
+    fn build_record_v2(
+        &self,
+        subkeys: &Subkeys,
+        path: RecordPath<'_>,
+        plaintext: &[u8],
+        header: codec2::RecordHeader,
+    ) -> Result<Vec<u8>> {
+        let header_bytes = header.encode();
+        let aad = codec2::record_aad(path.namespace, path.collection, &path.id, &header_bytes)?;
+        let nonce = Nonce::random()?;
+        let ciphertext = aead::seal(subkeys.record.as_bytes(), &nonce, &aad, plaintext)?;
+        let ct_len = u32::try_from(ciphertext.len())
+            .map_err(|_| Error::Internal("ciphertext length overflow"))?;
+
+        let mut out = Vec::with_capacity(codec2::CT_OFFSET + ciphertext.len());
+        out.extend_from_slice(&header_bytes);
+        out.extend_from_slice(nonce.as_bytes());
+        out.extend_from_slice(&ct_len.to_be_bytes());
+        out.extend_from_slice(&ciphertext);
+        Ok(out)
+    }
+
     fn decrypt(
         &self,
         session: &Session,
         path: RecordPath<'_>,
-        header: &RecordHeader,
-        nonce: &[u8; NONCE_LEN],
-        ciphertext: &[u8],
+        blob: &BlobView<'_>,
     ) -> Result<Zeroizing<Vec<u8>>> {
-        let entry = session
-            .keys
-            .get(&header.key_id)
-            .ok_or(Error::Corrupted("record references an unknown data key"))?;
-        let aad = codec::record_aad(path.namespace, path.collection, &path.id, &header.encode())?;
-        let nonce = Nonce::from_bytes(*nonce);
-        let plaintext = aead::open(entry.subkeys.record.as_bytes(), &nonce, &aad, ciphertext)?;
-        Ok(Zeroizing::new(plaintext))
+        match blob {
+            BlobView::V1(blob) => {
+                let entry = session
+                    .legacy_keys
+                    .get(&blob.header.key_id)
+                    .ok_or(Error::Corrupted("record references an unknown data key"))?;
+                let aad = codec::record_aad(
+                    path.namespace,
+                    path.collection,
+                    &path.id,
+                    &blob.header.encode(),
+                )?;
+                let nonce = Nonce::from_bytes(*blob.nonce);
+                let plaintext = aead::open(
+                    entry.subkeys.record.as_bytes(),
+                    &nonce,
+                    &aad,
+                    blob.ciphertext,
+                )?;
+                Ok(Zeroizing::new(plaintext))
+            }
+            BlobView::V2(blob) => {
+                let entry =
+                    session
+                        .keys
+                        .get(&blob.header.key_id)
+                        .ok_or(Error::RotationRequired {
+                            key_id: blob.header.key_id,
+                        })?;
+                let aad = codec2::record_aad(
+                    path.namespace,
+                    path.collection,
+                    &path.id,
+                    &blob.header.encode(),
+                )?;
+                let nonce = Nonce::from_bytes(*blob.nonce);
+                let plaintext = aead::open(
+                    entry.subkeys.record.as_bytes(),
+                    &nonce,
+                    &aad,
+                    blob.ciphertext,
+                )?;
+                Ok(Zeroizing::new(plaintext))
+            }
+        }
     }
 
     fn stage_catalog(
@@ -1066,7 +1435,7 @@ fn initialize(db: &Database, password: &[u8], options: &EngineOptions) -> Result
         }
     }
 
-    let key_id = KeyId::new(1)?;
+    let key_id = LegacyKeyId::new(1)?;
     let mut salt = [0u8; kdf::SALT_LEN];
     getrandom::fill(&mut salt)
         .map_err(|_| Error::Internal("operating system CSPRNG unavailable"))?;
@@ -1145,31 +1514,247 @@ fn initialize(db: &Database, password: &[u8], options: &EngineOptions) -> Result
 
 fn unlock(handle: &Handle, password: &[u8]) -> Result<Session> {
     let txn = handle.begin_read()?;
-    let meta_blob = {
+    let raw = {
         let table = txn.open_table(meta::TABLE)?;
-        let raw = table.get(META_KEY)?.ok_or(Error::NotFound)?;
-        meta::MetaBlob::decode(raw.value())?
+        table
+            .get(META_KEY)?
+            .map(|guard| guard.value().to_vec())
+            .ok_or(Error::NotFound)?
     };
-    let key_blobs = {
-        let table = txn.open_table(keys::TABLE)?;
-        let mut out = Vec::new();
-        for item in table.iter()? {
-            let (_, value) = item?;
-            out.push(keys::KeyBlob::decode(value.value())?);
-        }
-        out
-    };
-    drop(txn);
+    if raw.len() < 6 || &raw[0..4] != meta::MAGIC {
+        return Err(Error::Corrupted("meta magic mismatch"));
+    }
+    let format = u16::from_be_bytes([raw[4], raw[5]]);
 
-    let current_blob = key_blobs
+    match format {
+        FORMAT => unlock_v1(&txn, password, &raw),
+        FORMAT_V2 => unlock_v2(&txn, password, &raw),
+        other => Err(Error::UnsupportedFormat {
+            found: other,
+            supported: FORMAT_V2,
+        }),
+    }
+}
+
+fn unlock_v1(txn: &redb::ReadTransaction, password: &[u8], raw: &[u8]) -> Result<Session> {
+    let meta_blob = meta::MetaBlob::decode(raw)?;
+    let blobs = load_legacy_blobs(txn)?;
+
+    let current_blob = blobs
+        .get(&meta_blob.key_id)
+        .ok_or(Error::Corrupted("meta references a missing data key"))?;
+    let kek = kdf::derive_kek(password, &current_blob.salt, &current_blob.kdf_params())?;
+    let map = unwrap_legacy(blobs, &kek)?;
+
+    let current_entry = map
+        .get(&meta_blob.key_id)
+        .ok_or(Error::Corrupted("meta references a missing data key"))?;
+    let check_nonce = Nonce::from_bytes(meta_blob.key_check_nonce);
+    let check = Zeroizing::new(
+        aead::open(
+            current_entry.subkeys.check.as_bytes(),
+            &check_nonce,
+            codec::keycheck_aad(),
+            &meta_blob.key_check_ct,
+        )
+        .map_err(|_| Error::InvalidKey)?,
+    );
+    if check.as_slice() != meta::KEY_CHECK_PLAINTEXT.as_slice() {
+        return Err(Error::InvalidKey);
+    }
+
+    let salt = current_entry.blob.salt;
+    let kdf_params = current_entry.blob.kdf_params();
+    let kdf_id = current_entry.blob.kdf_id;
+    Ok(Session {
+        format: FORMAT,
+        created_at: meta_blob.created_at,
+        app_id: meta_blob.app_id.clone(),
+        current: KeyId::from_u16(meta_blob.key_id),
+        keys: BTreeMap::new(),
+        legacy_current: Some(meta_blob.key_id),
+        legacy_keys: map,
+        legacy_map: BTreeMap::new(),
+        kek,
+        salt,
+        kdf_id,
+        kdf_params,
+        key_check_nonce: meta_blob.key_check_nonce,
+        key_check_ct: meta_blob.key_check_ct,
+        sync: None,
+        upgrading: false,
+    })
+}
+
+fn unlock_v2(txn: &redb::ReadTransaction, password: &[u8], raw: &[u8]) -> Result<Session> {
+    let meta_blob = meta2::MetaBlob::decode(raw)?;
+    let key2_blobs = load_key2_blobs(txn)?;
+
+    let current_blob = key2_blobs
         .iter()
         .find(|blob| blob.key_id == meta_blob.key_id)
         .ok_or(Error::Corrupted("meta references a missing data key"))?;
     let kek = kdf::derive_kek(password, &current_blob.salt, &current_blob.kdf_params())?;
 
-    let mut map = BTreeMap::new();
-    for blob in key_blobs {
-        let key_id = KeyId::new(blob.key_id).map_err(|_| Error::Corrupted("invalid key id"))?;
+    let mut keys = BTreeMap::new();
+    for blob in key2_blobs {
+        let wrap_nonce = Nonce::from_bytes(blob.wrap_nonce);
+        let unwrapped = Zeroizing::new(
+            aead::open(
+                kek.as_bytes(),
+                &wrap_nonce,
+                &codec2::keywrap_aad(blob.key_id),
+                &blob.wrapped_dk,
+            )
+            .map_err(|_| Error::InvalidKey)?,
+        );
+        let dk_bytes: [u8; KEY_LEN] = unwrapped
+            .as_slice()
+            .try_into()
+            .map_err(|_| Error::Corrupted("unwrapped data key has wrong length"))?;
+        let data_key = DataKey::from_bytes(dk_bytes);
+        let subkeys = kdf::derive_subkeys(&data_key)?;
+        keys.insert(
+            blob.key_id,
+            KeyEntry {
+                blob,
+                data_key,
+                subkeys,
+            },
+        );
+    }
+
+    let current_entry = keys
+        .get(&meta_blob.key_id)
+        .ok_or(Error::Corrupted("meta references a missing data key"))?;
+    let check_nonce = Nonce::from_bytes(meta_blob.key_check_nonce);
+    let check = Zeroizing::new(
+        aead::open(
+            current_entry.subkeys.check.as_bytes(),
+            &check_nonce,
+            codec2::keycheck_aad(),
+            &meta_blob.key_check_ct,
+        )
+        .map_err(|_| Error::InvalidKey)?,
+    );
+    if check.as_slice() != codec2::KEY_CHECK_PLAINTEXT.as_slice() {
+        return Err(Error::InvalidKey);
+    }
+
+    let salt = current_entry.blob.salt;
+    let kdf_id = current_entry.blob.kdf_id;
+    let kdf_params = current_entry.blob.kdf_params();
+    let mut session = Session {
+        format: FORMAT_V2,
+        created_at: meta_blob.created_at,
+        app_id: meta_blob.app_id.clone(),
+        current: meta_blob.key_id,
+        keys,
+        legacy_current: None,
+        legacy_keys: BTreeMap::new(),
+        legacy_map: BTreeMap::new(),
+        kek,
+        salt,
+        kdf_id,
+        kdf_params,
+        key_check_nonce: meta_blob.key_check_nonce,
+        key_check_ct: meta_blob.key_check_ct,
+        sync: None,
+        upgrading: false,
+    };
+
+    if table_exists(txn, "shio.keys")? {
+        let blobs = load_legacy_blobs(txn)?;
+        if !blobs.is_empty() {
+            let legacy = unwrap_legacy(blobs, &session.kek)?;
+            session.legacy_current = legacy.keys().next().copied();
+            session.legacy_keys = legacy;
+        }
+        if table_exists(txn, "shio.sync")? {
+            let table = txn.open_table(sync_state::TABLE)?;
+            if let Some(value) = table.get(sync_state::KEY_UPGRADE)? {
+                let (_, cursor) = sync_state::decode_upgrade(value.value())?;
+                let _ = cursor;
+                session.upgrading = true;
+            }
+            let prefix = sync_state::upgrade_key_prefix();
+            for item in table.range(prefix..)? {
+                let (key, value) = item?;
+                let key = key.value();
+                if !key.starts_with(prefix) {
+                    break;
+                }
+                if key.len() != prefix.len() + 2 || value.value().len() != 16 {
+                    return Err(Error::Corrupted("upgrade key mapping is malformed"));
+                }
+                let legacy = u16::from_be_bytes([key[prefix.len()], key[prefix.len() + 1]]);
+                let mapped: [u8; 16] = value
+                    .value()
+                    .try_into()
+                    .map_err(|_| Error::Corrupted("upgrade key mapping has wrong length"))?;
+                session.legacy_map.insert(legacy, KeyId::from_bytes(mapped));
+            }
+        }
+    }
+
+    if table_exists(txn, "shio.sync")? {
+        let table = txn.open_table(sync_state::TABLE)?;
+        if let Some(value) = table.get(sync_state::KEY_DEVICE)? {
+            if value.value().len() != 16 {
+                return Err(Error::Corrupted("sync device id has wrong length"));
+            }
+            let bytes: [u8; 16] = value
+                .value()
+                .try_into()
+                .map_err(|_| Error::Corrupted("sync device id has wrong length"))?;
+            let device = DeviceId::from_bytes(bytes);
+            if device.is_zero() {
+                return Err(Error::Corrupted("sync device id is zero"));
+            }
+            session.sync = Some(device);
+        }
+    }
+
+    Ok(session)
+}
+
+fn table_exists(txn: &redb::ReadTransaction, name: &str) -> Result<bool> {
+    for handle in txn.list_tables()? {
+        if handle.name() == name {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn load_key2_blobs(txn: &redb::ReadTransaction) -> Result<Vec<keys2::KeyBlob>> {
+    let table = txn.open_table(keys2::TABLE)?;
+    let mut out = Vec::new();
+    for item in table.iter()? {
+        let (_, value) = item?;
+        out.push(keys2::KeyBlob::decode(value.value())?);
+    }
+    Ok(out)
+}
+
+fn load_legacy_blobs(txn: &redb::ReadTransaction) -> Result<BTreeMap<u16, keys::KeyBlob>> {
+    let table = txn.open_table(keys::TABLE)?;
+    let mut out = BTreeMap::new();
+    for item in table.iter()? {
+        let (_, value) = item?;
+        let blob = keys::KeyBlob::decode(value.value())?;
+        out.insert(blob.key_id, blob);
+    }
+    Ok(out)
+}
+
+fn unwrap_legacy(
+    blobs: BTreeMap<u16, keys::KeyBlob>,
+    kek: &Kek,
+) -> Result<BTreeMap<u16, LegacyKeyEntry>> {
+    let mut out = BTreeMap::new();
+    for (id, blob) in blobs {
+        let key_id = LegacyKeyId::new(id).map_err(|_| Error::Corrupted("invalid key id"))?;
         let wrap_nonce = Nonce::from_bytes(blob.wrap_nonce);
         let unwrapped = Zeroizing::new(
             aead::open(
@@ -1186,39 +1771,44 @@ fn unlock(handle: &Handle, password: &[u8]) -> Result<Session> {
             .map_err(|_| Error::Corrupted("unwrapped data key has wrong length"))?;
         let data_key = DataKey::from_bytes(dk_bytes);
         let subkeys = kdf::derive_subkeys(&data_key)?;
-        map.insert(
-            blob.key_id,
-            KeyEntry {
+        out.insert(
+            id,
+            LegacyKeyEntry {
                 blob,
                 data_key,
                 subkeys,
             },
         );
     }
+    Ok(out)
+}
 
-    let current = KeyId::new(meta_blob.key_id).map_err(|_| Error::Corrupted("invalid key id"))?;
-    let current_entry = map
-        .get(&current.get())
-        .ok_or(Error::Corrupted("meta references a missing data key"))?;
-    let check_nonce = Nonce::from_bytes(meta_blob.key_check_nonce);
-    let check = Zeroizing::new(
-        aead::open(
-            current_entry.subkeys.check.as_bytes(),
-            &check_nonce,
-            codec::keycheck_aad(),
-            &meta_blob.key_check_ct,
-        )
-        .map_err(|_| Error::InvalidKey)?,
-    );
-    if check.as_slice() != meta::KEY_CHECK_PLAINTEXT.as_slice() {
-        return Err(Error::InvalidKey);
-    }
+fn record_meta_from(raw: &[u8], id: RecordId) -> Result<RecordMeta> {
+    let blob = BlobView::decode(raw)?;
+    let ciphertext_len = u32::try_from(blob.ciphertext().len())
+        .map_err(|_| Error::Internal("ciphertext length overflow"))?;
+    Ok(RecordMeta {
+        id,
+        rev: blob.rev(),
+        created_at: Timestamp::from_millis(blob.created_at()),
+        updated_at: Timestamp::from_millis(blob.updated_at()),
+        data_version: blob.data_version(),
+        deleted: blob.is_deleted(),
+        ciphertext_len,
+    })
+}
 
-    Ok(Session {
-        meta: meta_blob,
-        current,
-        keys: map,
-        kek,
+fn record_meta(id: RecordId, blob: &BlobView<'_>) -> Result<RecordMeta> {
+    let ciphertext_len = u32::try_from(blob.ciphertext().len())
+        .map_err(|_| Error::Internal("ciphertext length overflow"))?;
+    Ok(RecordMeta {
+        id,
+        rev: blob.rev(),
+        created_at: Timestamp::from_millis(blob.created_at()),
+        updated_at: Timestamp::from_millis(blob.updated_at()),
+        data_version: blob.data_version(),
+        deleted: blob.is_deleted(),
+        ciphertext_len,
     })
 }
 
@@ -1228,16 +1818,17 @@ fn validate_names(namespace: &str, collection: &str) -> Result<()> {
     Ok(())
 }
 
-fn record_meta(id: RecordId, header: &RecordHeader, ciphertext_len: usize) -> Result<RecordMeta> {
-    let ciphertext_len =
-        u32::try_from(ciphertext_len).map_err(|_| Error::Internal("ciphertext length overflow"))?;
-    Ok(RecordMeta {
-        id,
-        rev: header.rev,
-        created_at: Timestamp::from_millis(header.created_at),
-        updated_at: Timestamp::from_millis(header.updated_at),
-        data_version: header.data_version,
-        deleted: header.is_deleted(),
-        ciphertext_len,
-    })
+/// 追加一条本地变更日志，返回分配到的序号。
+fn append_change(txn: &WriteTransaction, _device: DeviceId, entry: &ChangeEntry) -> Result<u64> {
+    let bytes = changes::encode(entry)?;
+    let mut table = txn.open_table(changes::TABLE)?;
+    let next = match table.last()? {
+        Some((key, _)) => key
+            .value()
+            .checked_add(1)
+            .ok_or(Error::Internal("change log sequence overflow"))?,
+        None => 1,
+    };
+    table.insert(next, bytes.as_slice())?;
+    Ok(next)
 }

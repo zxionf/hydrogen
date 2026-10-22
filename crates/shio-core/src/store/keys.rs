@@ -10,7 +10,7 @@ use redb::TableDefinition;
 
 use crate::codec::NONCE_LEN;
 use crate::crypto::kdf::{KdfId, KdfParams};
-use crate::crypto::keys::{KeyId, MAX_KEY_ID};
+use crate::crypto::keys::{LegacyKeyId, MAX_KEY_ID};
 use crate::error::{Error, Result};
 
 /// 键为 `key_id`，值为 `KeyBlob`。
@@ -72,7 +72,7 @@ impl KeyBlob {
 
     /// 编码为落盘字节。
     pub fn encode(&self) -> Result<Vec<u8>> {
-        KeyId::new(self.key_id)?;
+        LegacyKeyId::new(self.key_id)?;
         if self.flags != 0 {
             return Err(Error::InvalidArgument("key blob flags are reserved"));
         }
@@ -107,7 +107,7 @@ impl KeyBlob {
         if key_id > MAX_KEY_ID {
             return Err(Error::Corrupted("key blob id out of range"));
         }
-        KeyId::new(key_id).map_err(|_| Error::Corrupted("key blob id out of range"))?;
+        LegacyKeyId::new(key_id).map_err(|_| Error::Corrupted("key blob id out of range"))?;
 
         let kdf_id = bytes[KDF_ID_OFFSET];
         KdfId::from_u8(kdf_id)?;

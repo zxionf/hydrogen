@@ -7,7 +7,6 @@ use shio::{
     RecordMeta, Timestamp, DEFAULT_LIST_LIMIT, MAX_NAME_LEN,
 };
 use shio_core::codec::{decode_record_key, encode_record_key, RecordHeader, HEADER_LEN};
-use shio_core::crypto::keys::KeyId;
 
 #[test]
 fn facade_and_core_share_the_same_model() {
@@ -36,7 +35,7 @@ fn facade_and_core_share_the_same_model() {
 
 #[test]
 fn codec_header_matches_core_contract() {
-    let header = RecordHeader::new(KeyId::new(1).unwrap().get(), 1, 0, 0, 1);
+    let header = RecordHeader::new(1, 1, 0, 0, 1);
     let encoded = header.encode();
     assert_eq!(encoded.len(), HEADER_LEN);
     assert_eq!(RecordHeader::decode(&encoded).unwrap(), header);

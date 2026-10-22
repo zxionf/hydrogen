@@ -75,6 +75,130 @@ pub fn validate_name(kind: NameKind, value: &str) -> Result<()> {
     Ok(())
 }
 
+/// `format=2` 的数据密钥编号：16 字节随机值。
+///
+/// `format=1` 的 u16 编号通过 [`KeyId::from_u16`] 映射为「前 14 字节 0 + 后 2 字节
+/// 大端」，因此两种格式在公开面上使用同一个类型。
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct KeyId([u8; 16]);
+
+impl KeyId {
+    /// 由 16 字节原始值构造。全零值保留，表示未设置。
+    pub const fn from_bytes(bytes: [u8; 16]) -> Self {
+        Self(bytes)
+    }
+
+    /// 原始 16 字节。
+    pub const fn as_bytes(&self) -> &[u8; 16] {
+        &self.0
+    }
+
+    /// `format=1` 的 u16 编号映射。
+    pub const fn from_u16(value: u16) -> Self {
+        let bytes = value.to_be_bytes();
+        let mut out = [0u8; 16];
+        out[14] = bytes[0];
+        out[15] = bytes[1];
+        Self(out)
+    }
+
+    /// 若该编号是 `format=1` 映射，返回原始 u16。
+    pub const fn as_u16(&self) -> Option<u16> {
+        let mut index = 0;
+        while index < 14 {
+            if self.0[index] != 0 {
+                return None;
+            }
+            index += 1;
+        }
+        Some(u16::from_be_bytes([self.0[14], self.0[15]]))
+    }
+
+    /// 是否为全零值。
+    pub const fn is_zero(&self) -> bool {
+        let mut index = 0;
+        while index < self.0.len() {
+            if self.0[index] != 0 {
+                return false;
+            }
+            index += 1;
+        }
+        true
+    }
+}
+
+impl fmt::Debug for KeyId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "KeyId(")?;
+        for byte in self.0 {
+            write!(f, "{byte:02x}")?;
+        }
+        f.write_str(")")
+    }
+}
+
+impl fmt::Display for KeyId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for byte in self.0 {
+            write!(f, "{byte:02x}")?;
+        }
+        Ok(())
+    }
+}
+
+impl PartialEq<u16> for KeyId {
+    fn eq(&self, other: &u16) -> bool {
+        self.as_u16() == Some(*other)
+    }
+}
+
+/// 设备标识：首次启用同步时生成，之后不可更换。
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct DeviceId([u8; 16]);
+
+impl DeviceId {
+    /// 由 16 字节原始值构造。
+    pub const fn from_bytes(bytes: [u8; 16]) -> Self {
+        Self(bytes)
+    }
+
+    /// 原始 16 字节。
+    pub const fn as_bytes(&self) -> &[u8; 16] {
+        &self.0
+    }
+
+    /// 是否为全零值。
+    pub const fn is_zero(&self) -> bool {
+        let mut index = 0;
+        while index < self.0.len() {
+            if self.0[index] != 0 {
+                return false;
+            }
+            index += 1;
+        }
+        true
+    }
+}
+
+impl fmt::Debug for DeviceId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "DeviceId(")?;
+        for byte in self.0 {
+            write!(f, "{byte:02x}")?;
+        }
+        f.write_str(")")
+    }
+}
+
+impl fmt::Display for DeviceId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for byte in self.0 {
+            write!(f, "{byte:02x}")?;
+        }
+        Ok(())
+    }
+}
+
 /// 记录 ID：UUIDv7 的 16 字节原始值。
 ///
 /// 时间有序，跨端无需协调即可生成且不冲突。
@@ -295,6 +419,23 @@ mod tests {
     #[test]
     fn timestamp_now_is_positive() {
         assert!(Timestamp::now().as_millis() > 0);
+    }
+
+    #[test]
+    fn key_id_maps_legacy_u16() {
+        let legacy = KeyId::from_u16(0x1234);
+        assert_eq!(legacy.as_u16(), Some(0x1234));
+        assert_eq!(legacy.to_string(), "00000000000000000000000000001234");
+        assert!(!legacy.is_zero());
+        assert!(KeyId::from_bytes([0; 16]).is_zero());
+        assert_eq!(KeyId::from_bytes([1; 16]).as_u16(), None);
+    }
+
+    #[test]
+    fn device_id_display_is_hex() {
+        let device = DeviceId::from_bytes([0xAB; 16]);
+        assert_eq!(device.to_string(), "ab".repeat(16));
+        assert!(format!("{device:?}").starts_with("DeviceId(ab"));
     }
 
     #[test]

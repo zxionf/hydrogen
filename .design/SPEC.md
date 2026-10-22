@@ -10,13 +10,13 @@
 - 异步：tokio 1.54（仅外层 facade；core 保持同步）
 - 加密：Argon2id（口令派生，argon2 0.6）、HKDF-SHA256（子密钥，hkdf 0.13 + sha2 0.11）、XChaCha20-Poly1305（AEAD，chacha20poly1305 0.11）
 - 错误：thiserror 2；标识：UUIDv7（uuid 1.28）；随机数：getrandom 0.4；密钥清零：zeroize 1.9；口令封装：secrecy 0.10
-- 稳定性：`shio-core` 与 `shio` 使用 `#![forbid(unsafe_code)]`；可恢复失败只返回错误，不以 panic 表达
+- 稳定性：`shio-core`、`shio` 与 `shio-sync` 使用 `#![forbid(unsafe_code)]`；可恢复失败只返回错误，不以 panic 表达
 
 ## 目标
 - 可嵌入的加密持久化内核：命名空间 → 集合 → 记录，单文件 redb，记录级 AEAD。
 - 内核同步、facade async；两者禁止 unsafe，可恢复失败一律以 `Result` 返回。
-- 当前形态：core 与 facade 均已可用——Argon2id/HKDF/AEAD、四张 redb 表、同步 CRUD、异步句柄、改口令、数据密钥轮换、真正的只读打开；多端同步与 FFI 仍是占位。
-- 记录格式 `format=1` 从首个实现起保持向后兼容；API 在 1.0 前允许调整。
+- 当前形态：core 与 facade 均已可用——Argon2id/HKDF/AEAD、redb 表、同步 CRUD、异步句柄、改口令、数据密钥轮换、真正的只读打开；多端同步（format 2、设备配对、变更日志、快照、轮换）已可用；FFI 仍是占位。
+- 记录格式 `format=1` 从首个实现起保持向后兼容；同步库使用不可回退的 `format=2`；API 在 1.0 前允许调整。
 
 ## 约束
 - 稳定性优先：内核不得因未定义行为、越界、未处理错误或 panic 而崩溃；可恢复失败一律以 `Result` 返回。
@@ -25,8 +25,8 @@
 - `shio-core` 与 `shio` 禁止 unsafe；FFI 若引入 unsafe，必须隔离、审计并证明无 UB，且需用户批准。
 - 密钥、口令、明文不得出现在日志、错误信息或 panic 信息中。
 - 单写多读；每次公开写操作必须原子提交。
-- `format=1` 的记录布局与 AAD 是兼容性契约；变更需提升版本并提供迁移。
-- 不引入服务端或网络依赖；内核可离线运行。
+- `format=1` 与 `format=2` 的记录布局与 AAD 都是兼容性契约；变更需提升版本并提供迁移。
+- 不引入服务端或网络依赖；内核可离线运行；`shio-sync` 只生产/消费字节帧，不持有连接或后台线程。
 
 ## 分层与目录结构
 依赖方向严格单向，core 不依赖 tokio，保证 Android、服务端与未来守护进程复用同一内核。
@@ -41,26 +41,30 @@ shio/
 │   │   ├── src/
 │   │   │   ├── lib.rs
 │   │   │   ├── error.rs        # 错误分类，全量
-│   │   │   ├── model.rs        # 名称校验、RecordId、Timestamp、meta/分页类型，全量
-│   │   │   ├── codec.rs        # 复合键、34 字节 header、RecordBlob 视图、三类 AAD，全量
+│   │   │   ├── model.rs        # 名称校验、RecordId、KeyId、DeviceId、Timestamp、meta/分页类型
+│   │   │   ├── codec.rs        # format 1 复合键、header、RecordBlob 视图、AAD
+│   │   │   ├── codec2.rs       # format 2 记录 header/blob 与 16 字节 key_id AAD
+│   │   │   ├── sync.rs         # 同步公开类型、限额与配对指纹
 │   │   │   ├── crypto/         # kdf.rs / aead.rs / keys.rs：Argon2id、HKDF、AEAD 与密钥类型
-│   │   │   └── store/          # meta / keys / catalog / records 编解码与 engine.rs（redb 事务）
-│   │   └── tests/engine.rs     # 真实临时文件的端到端用例
+│   │   │   └── store/          # meta/meta2、keys/keys2、catalog、records、changes、sync_state、engine
+│   │   └── tests/{engine,sync}.rs
 │   ├── shio/                   # async facade（forbid unsafe）
 │   │   ├── src/{lib,kernel,collection}.rs
-│   │   ├── examples/notes.rs   # 最小可运行示例
-│   │   └── tests/facade.rs     # 异步端到端用例
+│   │   ├── examples/{notes,sync}.rs
+│   │   └── tests/{facade,sync}.rs
 │   ├── shio-ffi/               # C ABI：文档占位，受 unsafe 约束未实现
-│   └── shio-sync/              # 多端同步：文档占位
+│   └── shio-sync/              # SHY2 帧、配对文本与拥有型同步句柄
+│       ├── src/{lib,frame,base32}.rs
+│       └── tests/frames.rs
 └── tests/                      # shio-tests：跨 crate 集成测试包
     ├── src/lib.rs
     └── smoke.rs
 ```
 
-- `shio-core`：无 async、无 tokio；持有 redb 与密钥材料，所有操作为同步函数。`model`/`error`/`codec` 完整可用；`crypto` 提供 KDF、子密钥派生与 AEAD；`store::Engine` 提供创建/打开、泛型读写与接收已序列化明文的 `*_raw` 接口。
-- `shio`：把 core 的阻塞调用经 `spawn_blocking` 暴露为 async；管理句柄生命周期、在途操作与关闭等待；写路径在调用线程序列化，读路径在阻塞线程反序列化；`examples/notes.rs` 给出最小可运行用法。
+- `shio-core`：无 async、无 tokio；持有 redb 与密钥材料，所有操作为同步函数。`model`/`error`/`codec`/`codec2` 完整可用；`crypto` 提供 KDF、子密钥派生与 AEAD；`store::Engine` 提供创建/打开、泛型读写、`*_raw`、同步日志/快照/轮换/配对接口。
+- `shio`：把 core 的阻塞调用经 `spawn_blocking` 暴露为 async；管理句柄生命周期、在途操作与关闭等待；写路径在调用线程序列化，读路径在阻塞线程反序列化；`examples/notes.rs` 与 `examples/sync.rs` 给出最小可运行用法；`sync` feature 暴露 `Kernel::sync()` 与配对。
 - `shio-ffi`：仅为 C++/Vulkan GUI 与 Android 提供 C ABI，不承载业务逻辑；未取得 unsafe 例外前不导出任何符号。
-- `shio-sync`：后续接入，只依赖 core 的模型与存储接口，不修改记录格式。
+- `shio-sync`：只依赖 `shio-core`，不引入网络/TLS/后台线程；负责 `SHY2` 帧、Crockford Base32 配对 secret 与拥有型 `SyncHandle`。
 - `tests`：`autotests = false` 的成员包，通过显式 `[[test]]` 承载跨 crate 用例。
 
 ## 数据模型
@@ -94,10 +98,13 @@ DK ──HKDF-SHA256(info 区分用途)──▶ 记录密钥 / 元数据密钥 
 - **记录级 AEAD**：每条记录独立 nonce（24 字节随机），AAD 绑定命名空间、集合、记录 ID 与明文 header（域分隔符 `shio/v1/record`）。
 - AAD 使记录无法在命名空间/集合/ID 之间搬运，header 篡改会导致解密失败；keywrap 与 keycheck 各自使用独立域分隔符。
 - 解锁失败统一返回 `InvalidKey`，不区分“口令错误”和“数据损坏”，避免口令预言机。
-- **多密钥会话**：打开时扫描 `keys` 表并用当前行的盐与参数派生 KEK，解包全部密钥行；记录按自身 header 的 `key_id` 选择记录密钥解密。这样轮换中途崩溃后，meta 仍指向旧密钥时已迁移记录也能读。
-- **改口令**只重新包裹 DK：生成新盐与新 KEK，用新 nonce 重写该行的 salt/参数/nonce/包裹值，单行原子提交，代价 O(1)，不触碰记录；存在多行 key（轮换未完成）时返回 `Busy`。
-- **轮换数据密钥**：`key_id` 递增（超上限拒绝），先用当前 KEK 包裹新 DK 并写入新 key 行，再按 256 条一批重加密记录（改写 header 的 `key_id` 与 nonce），最后单事务更新 meta 的 `key_id`/key check 并删除旧行；迁移期间持有会话写锁，崩溃后重跑可复用已写入的新行继续。
-- 会话保留 KEK 与 DK 供改口令/轮换使用；所有密钥材料用 `zeroize` 在离开作用域时清零；错误信息、日志、panic 信息不得包含密钥或明文。
+- **多密钥会话**：打开时扫描 `keys2`（format 2）或 `keys`（format 1/升级期），用当前行的盐与参数派生 KEK，解包全部密钥行；记录按自身 header 的 `key_id` 选择记录密钥解密。这样轮换中途崩溃后，meta 仍指向旧密钥时已迁移记录也能读。
+- **format 2**：`key_id` 为 16 字节随机值；记录 header 与 AAD 使用 v2 布局，`shio.keys2` 每行独立 nonce。format 1 的 u16 `key_id` 只在升级期与旧库中保留。
+- **改口令**只重新包裹 DK：生成新盐与新 KEK，用新 nonce 重写密钥行；format 2 在同一事务内重包裹所有 `keys2` 行，format 1 仍要求单行。存在升级/轮换工作状态时返回 `Busy`。
+- **format 1 轮换**：`key_id` 递增（超上限拒绝），先写新 key 行，再按 256 条一批重加密记录，最后更新 meta 并删除旧行。
+- **format 2 轮换**：任意设备可 `begin_rotation`，生成随机 `to` 并发布 `kind=1` offer 与 `kind=3` 公告；其他设备安装 offer 后回 ack。写 key 按 `(created_at, key_id)` 收敛，并发轮换形成 key DAG。`migrate_all(to)` 分批重加密，`retire(from)` 需所有已知设备公告迁移完成。
+- **设备配对**：`SHB2` 明文携带整条密钥链（≤32），用 32 字节 pairing secret 经 Argon2id 派生的密钥加密为 `SHW2`；secret 以 Crockford Base32 文本进入二维码，指纹为外层 SHA-256 前 3 字节。目标设备得到同一组 DK 与新 device id，直接是 format 2。
+- 会话保留 KEK 与 DK 供改口令/轮换/配对使用；所有密钥材料用 `zeroize` 在离开作用域时清零；错误信息、日志、panic 信息不得包含密钥或明文。
 - Argon2id 默认参数：`m=65536 KiB, t=3, p=1`，盐 16 字节；参数随库存储，允许未来升级与按设备下调（包括测试用的小参数）。
 - 只读打开同样需要口令：解包与 key check 不变，只是句柄不允许写。
 
@@ -105,20 +112,22 @@ DK ──HKDF-SHA256(info 区分用途)──▶ 记录密钥 / 元数据密钥 
 
 ## 存储布局
 - 单文件 redb，默认文件名 `shio.redb`，位于应用私有目录。
-- 四张表：`meta`（格式版本与当前密钥）、`keys`（按 `key_id` 存放被包裹的 DK）、`catalog`（命名空间/集合清单）、`records`（复合键 → 记录 blob）。
-- 创建库时在单个写事务内写 `meta` 与 `keys`，并把 `records`/`catalog` 一并建表；读路径只读不建表，缺表视为损坏。
+- format 1 四张表：`meta`（格式版本与当前密钥）、`keys`（按 u16 `key_id` 存放被包裹的 DK）、`catalog`（命名空间/集合清单）、`records`（复合键 → 记录 blob）。
+- format 2 在保留 `catalog`/`records` 的同时新增 `meta2`、`keys2`（16 字节 `key_id`）、`changes`（本地变更日志）与 `sync`（db/device/游标/轮换状态）。
+- 创建新库仍写 format 1；`enable_sync` 在单事务内建立 format 2 meta/keys/日志并切到不可回退的 format 2，再分批把 `SHR1` 迁成 `SHR2`。
 - 复合键采用**长度前缀编码**，不依赖分隔符，避免 `a/b` 与 `a`+`/b` 之类的歧义；catalog 键与记录键共享同一前缀布局。
-- 记录值 = 明文 header + nonce + 密文；列表操作只读 header，不解密。
-- 每次公开写操作是一个 redb 写事务，天然原子；批量写在同一事务内提交，任一操作失败则整批回滚。
+- 记录值 = 明文 header + nonce + 密文；format 2 header 为 76 字节、`key_id` 16 字节；列表操作只读 header，不解密。
+- 每次公开写操作是一个 redb 写事务，天然原子；批量写在同一事务内提交，任一操作失败则整批回滚；同步模式把记录与 `kind=0` 日志写在同一事务。
 - `batch` 中删除不存在的记录返回 `NotFound` 并回滚，使返回的元信息与输入一一对应；单条 `delete` 对不存在的记录返回 `false`，不产生墓碑。
-- 格式版本 `format=1`；未知主版本拒绝打开，不猜测、不降级。
+- 未知主版本拒绝打开，不猜测、不降级；旧二进制在 meta 阶段拒绝 format 2。
 
 ## API 风格
 - 对外 async（tokio），内核同步；阻塞调用统一走 `spawn_blocking`，不占用 executor 线程。
 - core 的同步入口是 `store::Engine`：`Engine::open(EngineOptions, password)`，选项含路径、是否创建、是否只读、明文上限、`app_id`、建库 KDF 参数与 redb 页缓存。
-- `Engine` 提供 `insert`/`put`/`get`/`delete`/`purge`/`list`/`batch`/`collections`/`stats`/`flush`、密钥生命周期的 `change_password`/`rotate_data_key`，以及收发已序列化明文的 `insert_raw`/`put_raw`/`get_raw`/`batch_raw`；`Send + Sync`。
+- `Engine` 提供 `insert`/`put`/`get`/`delete`/`purge`/`list`/`batch`/`collections`/`stats`/`flush`、密钥生命周期的 `change_password`/`rotate_data_key`，以及收发已序列化明文的 `insert_raw`/`put_raw`/`get_raw`/`batch_raw`；同步面提供 `enable_sync`/`sync_info`/`changes_since`/`apply_page`/快照/轮换/配对；`Send + Sync`。
 - facade 的 `Kernel::open(OpenOptions, Credential)` 完成参数校验、口令派生与解锁；`Credential::password` 接收 `Into<SecretString>`，`Debug` 输出脱敏。
-- `Kernel` 是廉价可克隆句柄（内部 `Arc`），`Send + Sync`；提供 `namespace`、`flush`、`close`、`stats`、`change_password`、`rotate_data_key`。`close` 标记关闭并等待在途操作结束，之后新操作返回 `Closed`，重复调用返回 `Ok(())`。
+- `Kernel` 是廉价可克隆句柄（内部 `Arc`），`Send + Sync`；提供 `namespace`、`flush`、`close`、`stats`、`change_password`、`rotate_data_key`；`sync` feature 下提供 `sync_info`、`sync()` 与 `create_pairing_offer`。`close` 标记关闭并等待在途操作结束，之后新操作返回 `Closed`，重复调用返回 `Ok(())`。
+- `shio-sync` 的 `Sync<'a>` 借用 `Engine`，`SyncHandle` 持有 `Arc<Engine>`；二者负责 `SHY2` 编解码、快照迭代与配对文本，不自带传输层。`shio::open_with_pairing` 只创建新库，secret 用 `Zeroizing<String>` 搬运。
 - `shio::version()` 返回编译期内核版本（与包版本一致），不需要打开数据库；库的数据格式版本从 `Kernel::stats().format_version` 读取。
 - `Namespace` 与 `Collection<T>` 是从 `Kernel` 派生的轻量句柄，不复制连接；名称在构造时校验，不访问磁盘。`Namespace` 提供 `collections`，`Collection<T>` 提供 `insert/put/get/delete/purge/list/batch`。
 - 线程边界：写路径在调用线程把 `T` 序列化为 `Zeroizing<Vec<u8>>`，再由阻塞线程加密落盘；读路径在阻塞线程解密并反序列化。`T` 只需 `Serialize + DeserializeOwned + Send + Sync + 'static`，不要求 `Clone`。
@@ -136,12 +145,13 @@ DK ──HKDF-SHA256(info 区分用途)──▶ 记录密钥 / 元数据密钥 
 - 由于所有写操作都会读取并复用已有 header，写入路径同样执行完整解码与校验。
 - 长度与偏移计算使用 `checked_*`，防止整数溢出；不靠 unsafe 做性能捷径。
 - 内存分配失败、文件锁冲突、磁盘只读等环境错误都返回错误，不 abort；redb 的 `DatabaseAlreadyOpen` 映射为 `Locked`，其余存储错误归入 `Database`。
-- DK 解包与 key check 失败映射为 `InvalidKey`；记录结构或认证失败映射为 `Corrupted`；库文件缺失映射为 `NotFound`；轮换未完成导致的工作状态冲突映射为 `Busy`；只读句柄的写操作映射为 `ReadOnly`。
-- 密钥轮换的每个中断点都保持可读：新 key 行先落盘，记录按自身 `key_id` 解密，meta 最后切换；重跑轮换会复用已存在的新行并跳过已迁移记录。
+- DK 解包与 key check 失败映射为 `InvalidKey`；记录结构或认证失败映射为 `Corrupted`；库文件缺失映射为 `NotFound`；轮换/升级未完成导致的工作状态冲突映射为 `Busy`；只读句柄的写操作映射为 `ReadOnly`。
+- 同步错误：未启用同步返回 `SyncDisabled`，游标被压缩返回 `SyncResyncRequired`，缺记录 key 返回 `RotationRequired`，同步模式物理删除返回 `SyncEnabled`，配对过期/失败返回 `PairingExpired`/`PairingInvalid`。
+- 密钥轮换/升级的每个中断点都保持可读：新 key 行与升级状态先落盘，记录按自身 `key_id` 解密，meta 最后切换；重跑轮换/升级可复用已写入状态并从中断处继续。
 - facade 不把 panic 带过线程边界：`spawn_blocking` 的 `JoinError` 统一转为 `Internal`；句柄状态锁与密钥会话锁中毒同样返回 `Internal`。
 - 关闭语义：取引擎时登记在途计数，`close` 置空引擎并等待计数归零；已开始的操作持有 `Arc<Engine>` 完成，之后数据库才释放文件锁。
 - FFI 边界（未来）必须用 `catch_unwind` 把 panic 转为错误码，绝不让 panic 跨 C ABI 传播。
-- 测试覆盖截断值、随机字节、错误口令、并发关闭与磁盘只读；关键编解码做 fuzz/property 测试。当前已覆盖错误口令、截断/篡改的 blob 与记录、分页、批量回滚、句柄关闭、只读拒写、改口令、全量轮换与轮换中断后重跑。
+- 测试覆盖截断值、随机字节、错误口令、并发关闭与磁盘只读；关键编解码做 fuzz/property 测试。当前已覆盖错误口令、截断/篡改的 blob 与记录、分页、批量回滚、句柄关闭、只读拒写、改口令、全量轮换与轮换中断后重跑，以及同步升级、双端 LWW/墓碑、快照/压缩、轮换/ack/退役、配对密钥链、帧截断/超限/`db_id` 不匹配。
 - 静态护栏：workspace lints 拒绝 `unsafe`、`unwrap` / `expect` / `panic!` 与未实现的占位宏，新增 crate 默认继承。
 - 编解码用例必须覆盖损坏输入：魔数不符、未知格式版本、`key_id` 越界、截断、`ct_len` 与总长不符、尾随字节。
 
@@ -150,45 +160,47 @@ DK ──HKDF-SHA256(info 区分用途)──▶ 记录密钥 / 元数据密钥 
 - **C++/Vulkan GUI 与 Android**：经 `shio-ffi` 的 C ABI 调用；句柄不透明，字节串带长度，错误用显式错误码 + 线程局部错误详情。
 - **Android**：数据库放应用私有目录；不依赖系统钥匙串，口令解锁因此在无头/服务环境同样可用。
 - **服务端**：同一存储格式，仅改变打开路径、并发部署与备份策略，不引入第二套内核。
-- **稳定性与 unsafe**：内核的首要要求是不出现未定义行为、不因内部错误崩溃。`shio-core` / `shio` 保持 `forbid(unsafe_code)`；C ABI 若未来引入 unsafe，必须隔离在最小边界、逐条审计并证明无 UB，且经用户明确批准后才实施。FFI 当前仅停留在设计。
+- **稳定性与 unsafe**：内核的首要要求是不出现未定义行为、不因内部错误崩溃。`shio-core` / `shio` / `shio-sync` 保持 `forbid(unsafe_code)`；C ABI 若未来引入 unsafe，必须隔离在最小边界、逐条审计并证明无 UB，且经用户明确批准后才实施。FFI 当前仅停留在设计。
 - 未来插件系统通过“每插件独立命名空间 + 能力白名单”接入，不改变存储格式；本次只预留命名空间隔离。
 
-## 同步预留
-多端同步不在本次范围，但当前模型必须不挡路：
-
-- UUIDv7 提供跨端无协调的全局唯一 ID。
-- `rev` + `updated_at` 提供记录级因果比较的起点。
-- 墓碑保留删除事实，避免“删除后又被旧副本复活”。
-- 记录格式中的 `key_id` 与 `format_version` 支持密钥轮换与格式迁移。
-- 后续 `shio-sync` 以**追加变更日志**的方式接入，记录格式不因同步而改写；变更日志表在同步设计时新增。
-- 多端共享同一 DK 的密钥分发（设备配对、密钥包裹）留到同步阶段单独决策。
+## 多端同步
+- 逻辑库有随机 16 字节 `db_id`，每设备有独立 `device_id`；UUIDv7 提供跨端无协调的记录 ID。
+- 本地写在同一事务内追加 `shio.changes` 的 `kind=0` 日志；`changes_since` 按本地序号拉页，`apply_page` 整页原子应用并推进 `peer/<sender>`。
+- 冲突按 LWW `(updated_at, rev, RecordBlob 字节序)` 收敛；墓碑保留删除事实；`migrate_all` 重加密时推进 `updated_at`，避免旧 key 的同一逻辑版本翻回。
+- 新设备用配对包拿到整条密钥链并标记基线完成，记录通过已有设备的 `snapshot_start/page` 重建；日志被压缩时同样走快照，再从 `at_seq+1` 续拉；`compact_changes` 只手动调用。
+- 任意设备可发起随机 `key_id` 轮换；offer/ack/`kind=3` 公告形成 key DAG，写 key 按 `(created_at, key_id)` 收敛；`retire` 需所有已知设备公告迁移完成。
+- 传输层不在内核：`shio-sync` 只定义 `SHY2` 帧与 Crockford Base32 配对文本；网络、TLS、二维码与重试由应用负责。
+- 同步库 `format=2` 不支持回退；升级完成后旧二进制在 meta 阶段拒绝打开。
 
 ## 范围边界
-当前范围：加密持久化内核（命名空间/集合/记录、加密、事务）；详细契约见 `api.md` 与 `data.md`。
+当前范围：加密持久化内核（命名空间/集合/记录、加密、事务）与多端同步字节层（变更日志、快照、轮换、配对、`SHY2` 帧）；详细契约见 `api.md` 与 `data.md`。
 
 明确不做：
 
 - 插件运行时、权限模型、插件间通信
-- 同步协议、变更日志、冲突解决、设备配对
+- 网络传输、TLS、后台同步线程与服务端部署；这些由应用在 `shio-sync` 之上实现
 - 全文检索、二级索引、压缩
 - GUI/渲染、剪贴板监听、Markdown 渲染等应用功能
-- 多写进程、网络服务端部署
+- 多写进程
 - FFI 的实际实现（受 unsafe 约束，先决策后动工）
 
 ## 影响与兼容性
-- 不改变 `format=1`、AAD 与 blob 布局；已有数据库无需迁移。
-- `change_password`、`rotate_data_key` 与 `read_only` 已按 `api.md` 落地；facade 签名不变。
-- `read_only` 现在真正以 redb 只读库打开，不再持有写锁，可用于多进程只读并发。
-- 轮换中途崩溃会留下两行 key：库仍可读，但 `change_password` 返回 `Busy`；重新执行轮换即可完成并删除旧行。
+- format 1 的 AAD 与 blob 布局不变；不启用同步的已有数据库无需迁移。
+- `enable_sync` 把库升级为 format 2 后不可回退；旧二进制在 meta 阶段拒绝打开。升级按记录批提交，可中断续跑。
+- `change_password` 在 format 2 下重包裹全部 `keys2` 行；`rotate_data_key` 在同步模式下等价于 `begin_rotation` + `migrate_all`，不自动退役。
+- `read_only` 真正以 redb 只读库打开，不再持有写锁，可用于多进程只读并发。
+- 轮换/升级中途崩溃会留下工作状态：库仍可读，但相关写操作返回 `Busy`；重跑或继续升级即可完成。
+- `sync` feature 是可选依赖：关闭时 `shio` 的默认 API 与依赖不变；开启时新增 `Kernel::sync()`、`Kernel::create_pairing_offer` 与 `shio::open_with_pairing`。
 - 新增 `shio::version()` 与 `shio_core::VERSION`，纯增量，不影响已有签名、记录格式与密钥层级。
 - API 在 1.0 前允许调整，但任何影响记录格式或密钥层级的变化都必须追加 `DECISIONS.log`。
 
 ## 构建与验证
 - 工具链由 `rust-toolchain.toml` 固定（1.95.0），MSRV 1.90（redb 4.4 的要求）；低于 MSRV 时 cargo 直接拒绝。
 - `cargo build --workspace` 构建全部 crate，产物落 `target/`（不入库）。
-- `cargo run -p shio --example notes` 运行最小示例（临时库，结束即删除）。
-- `cargo test --workspace`：当前 68 个用例（core 库内 35、引擎端到端 21、facade 库内 4、facade 端到端 5、跨 crate 集成 3）。
-- 引擎端到端使用 `tempfile` 与 8 MiB 的 Argon2id 参数，含 300 条记录的跨批轮换与「篡改记录 → 轮换中断 → 还原 → 续跑」；facade 端到端用默认参数（64 MiB、t=3），5 个用例约 13 秒。
+- `cargo run -p shio --example notes` 与 `cargo run -p shio --features sync --example sync` 运行最小示例（临时库，结束即删除）。
+- `cargo test --workspace`：当前 97 个用例（core 库内 49、引擎端到端 21、core 同步 8、facade 库内 4、facade 端到端 5、`shio-sync` 库内 3、帧端到端 4、跨 crate 集成 3）。
+- `cargo test -p shio --features sync` 额外跑 facade 的配对/同步端到端用例。
+- 引擎端到端使用 `tempfile` 与 8 MiB 的 Argon2id 参数，含 300 条记录的跨批轮换与「篡改记录 → 轮换中断 → 还原 → 续跑」；facade 端到端用默认参数（64 MiB、t=3）。
 - 版本查询断言常量与 `CARGO_PKG_VERSION` 一致，且不依赖打开数据库。
-- `cargo clippy --workspace --all-targets -- -D warnings` 与 `cargo fmt --all -- --check` 是合并前的必过项。
+- `cargo clippy --workspace --all-targets -- -D warnings`、`cargo clippy -p shio --features sync --all-targets -- -D warnings` 与 `cargo fmt --all -- --check` 是合并前的必过项。
 - 依赖版本由 `Cargo.lock` 锁定并随仓库提交；升级依赖需重新跑上述三项检查。

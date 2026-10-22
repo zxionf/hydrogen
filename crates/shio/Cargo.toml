@@ -7,16 +7,25 @@ rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 
+[features]
+default = []
+sync = ["dep:shio-sync"]
+
 [dependencies]
 secrecy.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 shio-core.workspace = true
+shio-sync = { workspace = true, optional = true }
 tokio.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+
+[[example]]
+name = "sync"
+required-features = ["sync"]
 
 [lints]
 workspace = true

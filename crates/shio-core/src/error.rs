@@ -3,7 +3,7 @@
 //! 错误分类是公共契约：调用方依赖它做重试与提示，因此新增变体需要追加决策。
 //! 错误信息不得包含口令、密钥或明文。
 
-use crate::model::NameKind;
+use crate::model::{KeyId, NameKind};
 
 /// 内核统一错误类型。
 ///
@@ -43,6 +43,36 @@ pub enum Error {
     /// 密钥轮换尚未完成（存在多行 key），需先完成轮换。
     #[error("key rotation in progress")]
     Busy,
+
+    /// 未启用多端同步。
+    #[error("sync is not enabled")]
+    SyncDisabled,
+
+    /// 同步模式下禁止物理删除。
+    #[error("purge is disabled while sync is enabled")]
+    SyncEnabled,
+
+    /// 游标早于日志起点，需要走快照。
+    #[error("sync log was compacted; resync from {log_start}")]
+    SyncResyncRequired {
+        /// 当前保留的最早日志序号。
+        log_start: u64,
+    },
+
+    /// 缺少记录引用的数据密钥，需要先安装轮换 offer。
+    #[error("data key {key_id} is required before applying this page")]
+    RotationRequired {
+        /// 缺失的 key。
+        key_id: KeyId,
+    },
+
+    /// 配对包已过期。
+    #[error("pairing offer has expired")]
+    PairingExpired,
+
+    /// 配对包无效或认证失败。
+    #[error("pairing offer is invalid")]
+    PairingInvalid,
 
     /// 文件锁被其他进程占用。
     #[error("database is locked by another process")]

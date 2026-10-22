@@ -2,13 +2,13 @@
 
 <!-- 公共 API 的稳定契约。实现可演进；改变签名、语义或错误分类前，先追加 DECISIONS.log。 -->
 
-本文描述**当前有效**的 API 契约；已定但尚未实现的同步接口集中在第 12 节，单独标注，不构成可用 API。实现细节（表、字节、AAD）见 `data.md`；定位与取舍见 `changes/20261020-encrypted-persistence-core/design.md` 与 `changes/20261022-sync-design/design.md`。
+本文描述**当前有效**的 API 契约；多端同步公开面见第 12 节，已随 `shio-sync` 与 `shio` 的 `sync` feature 落地。实现细节（表、字节、AAD）见 `data.md`；定位与取舍见 `changes/20261020-encrypted-persistence-core/design.md` 与 `changes/20261022-sync-design/design.md`。
 
 ## 1. 范围与稳定性
 
 - 目标平台：Rust 应用（原生）、Android、C++/Vulkan GUI（经 C ABI）。
 - 近期形态：嵌入式库。同一内核可被服务端直接链接，不引入 daemon 协议。
-- 版本策略：1.0 前 API 允许调整；记录格式 `format=1` 从首版起保持向后兼容。
+- 版本策略：1.0 前 API 允许调整；记录格式 `format=1` 从首版起保持向后兼容，同步库的 `format=2` 不可回退。
 - 线程模型：对外 async（tokio），内核同步；所有阻塞工作离开 executor。
 
 ## 2. crate 与模块
@@ -528,16 +528,16 @@ pub enum RawWriteOp<'a> {
 - core 不调用 `spawn_blocking`；调用方负责把阻塞操作移出 async executor。
 - `codec` 与 `crypto` 模块虽然公开，但属于落盘/密码学内部契约，不承诺应用层稳定性；应用应使用本节与 `model` 的类型。
 
-## 12. 多端同步（已定设计，未实现）
+## 12. 多端同步（当前有效）
 
-> 本节是 `20261022-sync-design` 的公开面，M0–M5 实现前不构成可用 API。
+> 本节是 `20261022-sync-design` 的公开面；M0–M5 已实现，`shio-sync` 与 `shio` 的 `sync` feature 均已可用。
 
 ### 12.1 crate 与 feature
 
 - `shio-sync` 只依赖 `shio-core`，同步、无 tokio、无网络；只生产/消费字节帧。
 - `shio` 增加可选 `sync` feature；开启后依赖 `shio-sync`，关闭时默认 API 与依赖不变。
 - 同步库使用 `format=2`：`key_id` 为 16 字节随机值，新增 `shio.keys2`、`shio.changes`、`shio.sync`。
-- 导出面：`shio-core` 根重新导出 `KeyId` / `DeviceId` 与同步类型；`shio-sync` 重新导出其公开类型；`shio` 在 `sync` feature 下重新导出 `SyncInfo`、`ChangePage`、`ChangeEntry`、`RotationOffer`、`OfferPage`、`RotationInfo`、`ApplyReport`、`SnapshotPage`、`SnapshotRecord`、`PairingOffer`、`KeyId`、`DeviceId` 与 `SyncHandle`。
+- 导出面：`shio-core` 根重新导出 `KeyId` / `DeviceId` 与同步类型；`shio-sync` 重新导出其公开类型；`shio` 在 `sync` feature 下重新导出 `SyncInfo`、`ChangePage`、`ChangeEntry`、`RotationOffer`、`OfferPage`、`RotationInfo`、`ApplyReport`、`SnapshotPage`、`SnapshotRecord`、`SnapshotIter`、`PairingOffer`、`KeyId`、`DeviceId` 与 `SyncHandle`。
 
 ### 12.2 标识类型
 
@@ -656,7 +656,7 @@ pub struct PairingOffer {
 }
 ```
 
-`ChangeEntry` 的变体与 `data.md` 的 `kind=0..4` 一一对应；新变体通过 `#[non_exhaustive]` 追加。`PairingOffer.secret` 是 Base32 文本，调用方应移入 `Zeroizing` 并在使用后清零；facade 可直接接收 `Zeroizing<String>`。
+`ChangeEntry` 的变体与 `data.md` 的 `kind=0..4` 一一对应；新变体通过 `#[non_exhaustive]` 追加。`PairingOffer.secret` 是 Base32 文本，调用方应移入 `Zeroizing` 并在使用后清零；`PairingOffer` 的 `Debug` 只输出帧长度、指纹与 `<redacted>`，不输出 secret；facade 可直接接收 `Zeroizing<String>`。
 
 ### 12.4 `shio-core` 同步接口
 
@@ -669,6 +669,7 @@ impl Engine {
     pub fn snapshot_start(&self) -> Result<u64>;
     pub fn snapshot_page(&self, after: Option<&[u8]>, limit: usize) -> Result<SnapshotPage>;
     pub fn apply_page(&self, page: &ChangePage) -> Result<ApplyReport>;
+    pub fn apply_snapshot_page(&self, page: &SnapshotPage) -> Result<ApplyReport>;
 
     pub fn begin_rotation(&self) -> Result<RotationInfo>;
     pub fn rotation_state(&self) -> Result<Option<RotationInfo>>;
@@ -681,6 +682,10 @@ impl Engine {
     pub fn compact_changes(&self, before: u64) -> Result<u64>;
 
     pub fn create_pairing_bundle(&self, ttl: Duration) -> Result<Vec<u8>>;
+    pub fn create_pairing_bundle_with_secret(
+        &self,
+        ttl: Duration,
+    ) -> Result<(Vec<u8>, [u8; 32])>;
     pub fn open_with_pairing(
         options: EngineOptions,
         password: &[u8],
@@ -692,10 +697,13 @@ impl Engine {
 
 - `enable_sync` 在 `format=1` 上执行不可回退升级；`format=2` 直接初始化。
 - `apply_page` 整页一个写事务，推进 `peer/<sender>` 游标；缺 key 返回 `RotationRequired`。
+- `apply_snapshot_page` 同样整页原子，写入的记录日志以本机 `device_id` 为 `writer`；缺 key 返回 `RotationRequired`。
 - `begin_rotation` 任意设备可调用；并发轮换产生不同随机 `to`，写 key 按 `(created_at, key_id)` 收敛。
+- `migrate_all` 重加密记录时推进 `updated_at`（至少 +1），避免旧密钥的同一逻辑版本在 LWW 的 blob 次序里把已迁移记录翻回旧密钥。
 - `rotate_data_key` 在同步模式下等价于 `begin_rotation` + `migrate_all(to)`，不自动退役。
 - 同步模式的 `change_password` 在同一事务内重新包裹所有 `shio.keys2` 行（同一新 salt/KEK、各自 nonce）；`format=1` 仍要求单行。
-- `open_with_pairing` 只创建新库，目标必须不存在或为空；成功时直接是 `format=2`。
+- `open_with_pairing` 只创建新库，目标必须不存在或为空；成功时直接是 `format=2`，失败不会留下半成品文件。
+- 配对包不携带 TTL；接收端固定按 `DEFAULT_PAIRING_TTL`（10 分钟）窗口校验 `created_at`，`ttl` 由调用方用于展示与过期控制。
 - `read_only` 句柄上的 `enable_sync`、`apply_page`、轮换/迁移/退役/压缩均返回 `ReadOnly`。
 
 ### 12.5 `shio-sync` 包装
@@ -705,6 +713,7 @@ pub struct Sync<'a> { /* &Engine */ }
 
 impl<'a> Sync<'a> {
     pub fn new(engine: &'a Engine) -> Self;
+    pub fn enable_sync(&self, device_id: Option<DeviceId>) -> Result<SyncInfo>;
     pub fn info(&self) -> Result<SyncInfo>;
     pub fn changes_since(&self, after: u64, limit: usize) -> Result<ChangePage>;
     pub fn encode(&self, page: &ChangePage) -> Result<Vec<u8>>;
@@ -713,9 +722,14 @@ impl<'a> Sync<'a> {
 
     pub fn offers(&self) -> Result<OfferPage>;
     pub fn encode_offers(&self, page: &OfferPage) -> Result<Vec<u8>>;
+    pub fn decode_offers(&self, frame: &[u8]) -> Result<OfferPage>;
     pub fn apply_offers(&self, frame: &[u8]) -> Result<()>;
 
-    pub fn snapshot(&self) -> Result<SnapshotIter<'_>>;
+    pub fn snapshot(&self) -> Result<SnapshotIter<'a>>;
+    pub fn encode_snapshot(&self, page: &SnapshotPage) -> Result<Vec<u8>>;
+    pub fn decode_snapshot(&self, frame: &[u8]) -> Result<SnapshotPage>;
+    pub fn apply_snapshot(&self, page: &SnapshotPage) -> Result<ApplyReport>;
+    pub fn apply_snapshot_frame(&self, frame: &[u8]) -> Result<ApplyReport>;
 
     pub fn begin_rotation(&self) -> Result<RotationInfo>;
     pub fn rotation_offers(&self) -> Result<Vec<RotationOffer>>;
@@ -732,12 +746,19 @@ impl<'a> Sync<'a> {
         secret: &[u8],
     ) -> Result<Engine>;
 }
+pub struct SnapshotIter<'a> { /* Engine 或 Arc<Engine> + 游标 */ }
+
+impl<'a> SnapshotIter<'a> {
+    pub fn at_seq(&self) -> u64;
+    pub fn next_page(&mut self, limit: usize) -> Result<Option<SnapshotPage>>;
+}
+
 pub struct SyncHandle { /* Arc<Engine> */ }
 ```
 
-`SyncHandle` 是 `Sync` 的拥有型版本（持有 `Arc<Engine>`），方法集与 `Sync` 相同；facade 的 `Kernel::sync()` 返回它。
+`SyncHandle` 是 `Sync` 的拥有型版本（持有 `Arc<Engine>`），方法集与 `Sync` 相同；`snapshot()` 返回拥有型迭代器，可脱离句柄借用生命周期；facade 的 `Kernel::sync()` 返回它。快照续拉锚点用 `SnapshotIter::at_seq()`（取自 `snapshot_start`），不要把后续 `SnapshotPage::at_seq` 当作固定起点。
 
-帧格式（`SHY2`、变更页/offer 页/快照页）与字节布局见 `data.md` 第 15 节；同步层不引入网络、TLS 或后台线程。
+帧格式（`SHY2`、变更页/offer 页/快照页）与字节布局见 `data.md` 第 15 节；同步层不引入网络、TLS 或后台线程。`decode*` 均校验 `db_id` 与本库一致，变更页还会校验 `ChangeEntry` 与 `RecordBlob` header 一致。
 
 ### 12.6 facade（`sync` feature）
 
@@ -745,8 +766,8 @@ pub struct SyncHandle { /* Arc<Engine> */ }
 #[cfg(feature = "sync")]
 impl Kernel {
     pub fn sync_info(&self) -> Result<SyncInfo>;
-    pub fn sync(&self) -> SyncHandle; // 绑定同一 Arc<Engine>
-    pub fn create_pairing_offer(&self, ttl: Duration) -> Result<PairingOffer>;
+    pub fn sync(&self) -> Result<SyncHandle>; // 绑定同一 Arc<Engine>；关闭后返回 Closed
+    pub async fn create_pairing_offer(&self, ttl: Duration) -> Result<PairingOffer>;
 }
 
 #[cfg(feature = "sync")]
@@ -758,7 +779,7 @@ pub async fn open_with_pairing(
 ) -> Result<Kernel>;
 ```
 
-所有同步方法与现有 facade 一样经 `spawn_blocking`；口令与 pairing secret 用 `Zeroizing` 搬运，`Debug` 不输出内容。`SyncHandle` 拥有同一 `Arc<Engine>`，方法集与 `shio_sync::Sync` 相同，避免 facade 句柄生命周期外借。
+`sync_info` 与 `sync` 是廉价的同步调用（与 `stats` 一致）；`create_pairing_offer` 与 `open_with_pairing` 经 `spawn_blocking`。口令与 pairing secret 用 `Zeroizing` 搬运，`Debug` 不输出内容。`SyncHandle` 拥有同一 `Arc<Engine>`，方法集与 `shio_sync::Sync` 相同，避免 facade 句柄生命周期外借。
 
 ### 12.7 新增错误变体
 

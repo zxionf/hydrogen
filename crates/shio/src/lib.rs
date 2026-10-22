@@ -16,6 +16,8 @@ pub mod collection;
 pub mod kernel;
 
 pub use collection::Collection;
+#[cfg(feature = "sync")]
+pub use kernel::open_with_pairing;
 pub use kernel::{Credential, Kernel, Namespace, OpenOptions};
 
 pub use shio_core::error::{Error, Result};
@@ -24,6 +26,13 @@ pub use shio_core::model::{
     DEFAULT_LIST_LIMIT, DEFAULT_MAX_VALUE_SIZE, MAX_LIST_LIMIT, MAX_NAME_LEN,
 };
 pub use shio_core::store::Stats;
+#[cfg(feature = "sync")]
+pub use shio_core::{DeviceId, KeyId};
+#[cfg(feature = "sync")]
+pub use shio_sync::{
+    ApplyReport, ChangeEntry, ChangePage, OfferPage, PairingOffer, RotationInfo, RotationOffer,
+    SnapshotIter, SnapshotPage, SnapshotRecord, SyncHandle, SyncInfo,
+};
 
 /// 查询内核版本。
 ///

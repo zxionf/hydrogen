@@ -8,7 +8,7 @@
 use redb::TableDefinition;
 
 use crate::codec::{NONCE_LEN, TAG_LEN};
-use crate::crypto::keys::KeyId;
+use crate::crypto::keys::LegacyKeyId;
 use crate::error::{Error, Result};
 use crate::store::FORMAT;
 
@@ -62,7 +62,7 @@ impl MetaBlob {
         key_check_nonce: [u8; NONCE_LEN],
         key_check_ct: [u8; KEY_CHECK_CT_LEN],
     ) -> Result<Self> {
-        KeyId::new(key_id)?;
+        LegacyKeyId::new(key_id)?;
         if app_id.len() > MAX_APP_ID_LEN {
             return Err(Error::InvalidArgument("app id exceeds 64 bytes"));
         }
@@ -78,7 +78,7 @@ impl MetaBlob {
 
     /// 编码为落盘字节。
     pub fn encode(&self) -> Result<Vec<u8>> {
-        KeyId::new(self.key_id)?;
+        LegacyKeyId::new(self.key_id)?;
         let app_id_len = u8::try_from(self.app_id.len())
             .map_err(|_| Error::InvalidArgument("app id exceeds 64 bytes"))?;
         if usize::from(app_id_len) > MAX_APP_ID_LEN {
@@ -115,7 +115,7 @@ impl MetaBlob {
         }
 
         let key_id = u16::from_be_bytes([bytes[KEY_ID_OFFSET], bytes[KEY_ID_OFFSET + 1]]);
-        KeyId::new(key_id).map_err(|_| Error::Corrupted("meta key id out of range"))?;
+        LegacyKeyId::new(key_id).map_err(|_| Error::Corrupted("meta key id out of range"))?;
 
         let created_at = i64::from_be_bytes(
             bytes[CREATED_AT_OFFSET..APP_ID_LEN_OFFSET]

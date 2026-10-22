@@ -10,8 +10,13 @@ publish.workspace = true
 [dependencies]
 secrecy.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 shio-core.workspace = true
 tokio.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
 
 [lints]
 workspace = true

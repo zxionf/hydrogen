@@ -79,3 +79,23 @@ Change: 20261022-crypto-and-store
 Context: catalog 的键是长度前缀编码，直接按字节序返回会得到 beta 在 alpha 之前这种反直觉顺序，facade 与用户会误以为结果稳定可读
 Decision: Engine::collections 在返回前按集合名排序；catalog 的扫描顺序仍由键编码决定，不外泄给调用方
 Consequences: 调用方拿到稳定升序结果；排序发生在内存中，单命名空间集合数量远小于记录数，开销可忽略
+## [17] 2026-10-22 04:46:37 UTC
+Change: 20261022-async-facade
+Context: api.md 要求 close 等待进行中的操作并释放文件锁，而 Clone 句柄共享同一引擎；只用 AtomicBool 会出现「close 返回后仍有操作在写」的窗口
+Decision: Inner 用 std Mutex 保护 State{engine: Option<Arc<Engine>>, in_flight}，取引擎时登记在途；close 置空后循环等待 in_flight 归零，用 tokio Notify 唤醒；spawn_blocking 的 JoinError 统一转为 Internal，重复 close 返回 Ok
+Consequences: 关闭后新操作立即 Closed，已开始的操作持有 Arc<Engine> 完成后再释放文件锁；锁只在判断和计数时短暂持有，不跨 await；panic 不会穿过 facade
+## [18] 2026-10-22 04:46:37 UTC
+Change: 20261022-async-facade
+Context: facade 的 Collection<T> 方法接收 &T，但 tokio 的 spawn_blocking 要求闭包 'static，不能把借用搬进阻塞线程；若不处理，只能 unsafe transmute 或要求 T: Clone，两者都不可接受
+Decision: core 增加原始字节接口 insert_raw/put_raw/get_raw/batch_raw（RawWriteOp），facade 在调用线程 serde 序列化并交给阻塞线程；读路径在阻塞线程解密并反序列化，明文用 Zeroizing 封装。泛型 API 保留为原始接口的薄封装
+Consequences: 无需 unsafe、无需 Clone 约束，公开签名与 api.md 一致；序列化开销落在调用线程，反序列化落在阻塞线程；core 多一组可直接操作明文字节的接口
+## [19] 2026-10-22 04:46:44 UTC
+Change: 20261022-async-facade
+Context: api.md 承诺 read_only 时写操作返回 ReadOnly，并要求仍用口令解密；但 redb 的 ReadOnlyDatabase 与 Database 是两套类型，这一轮直接接会扩散改动
+Decision: v0.1 的 read_only 是 facade 逻辑闸门：仍以读写模式打开数据库，写方法在进入阻塞线程前返回 Error::ReadOnly；只读并发与文件锁语义留待后续变更用 redb 只读库实现
+Consequences: 调用方可按契约得到 ReadOnly，读路径完整可用；read_only 不能用于规避写锁或多进程只读并发，文档必须写明
+## [20] 2026-10-22 04:46:44 UTC
+Change: 20261022-async-facade
+Context: OpenOptions 自骨架期就有 cache_size 字段，但 EngineOptions 没有对应项，公开参数会被静默丢弃
+Decision: EngineOptions 增加 cache_size；open 时若为 Some，用 redb::Database::builder().set_cache_size 创建/打开，0 视为 InvalidArgument
+Consequences: facade 的 cache_size 真实生效；不设置时仍用 redb 默认值；非法值在打开前被拒绝

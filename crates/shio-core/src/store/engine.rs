@@ -37,6 +37,8 @@ pub struct EngineOptions {
     pub app_id: String,
     /// 库创建时使用的 Argon2id 参数。
     pub kdf: KdfParams,
+    /// redb 页缓存字节数；`None` 表示使用 redb 默认值。
+    pub cache_size: Option<usize>,
 }
 
 impl EngineOptions {
@@ -48,6 +50,7 @@ impl EngineOptions {
             max_value_size: DEFAULT_MAX_VALUE_SIZE,
             app_id: String::new(),
             kdf: KdfParams::default(),
+            cache_size: None,
         }
     }
 
@@ -74,6 +77,12 @@ impl EngineOptions {
         self.kdf = kdf;
         self
     }
+
+    /// redb 页缓存字节数。
+    pub fn cache_size(mut self, bytes: usize) -> Self {
+        self.cache_size = Some(bytes);
+        self
+    }
 }
 
 /// 引擎统计信息。
@@ -85,6 +94,23 @@ pub struct Stats {
     pub key_id: u16,
     /// 库文件字节数。
     pub db_bytes: u64,
+}
+
+/// 批量写操作，载荷为已序列化的明文。
+#[derive(Debug, Clone, Copy)]
+pub enum RawWriteOp<'a> {
+    /// 指定 ID 的 upsert。
+    Put {
+        /// 目标记录 ID。
+        id: RecordId,
+        /// 已序列化的明文。
+        plaintext: &'a [u8],
+    },
+    /// 写入墓碑。
+    Delete {
+        /// 目标记录 ID。
+        id: RecordId,
+    },
 }
 
 /// 同步内核句柄。
@@ -137,14 +163,31 @@ impl Engine {
             ));
         }
 
+        if options.cache_size == Some(0) {
+            return Err(Error::InvalidArgument("cache_size must be positive"));
+        }
+
         if !options.create && !options.path.exists() {
             return Err(Error::NotFound);
         }
 
-        let db = if options.create {
-            Database::create(&options.path)?
-        } else {
-            Database::open(&options.path)?
+        let db = match options.cache_size {
+            Some(bytes) => {
+                let mut builder = Database::builder();
+                builder.set_cache_size(bytes);
+                if options.create {
+                    builder.create(&options.path)?
+                } else {
+                    builder.open(&options.path)?
+                }
+            }
+            None => {
+                if options.create {
+                    Database::create(&options.path)?
+                } else {
+                    Database::open(&options.path)?
+                }
+            }
         };
 
         if options.create {
@@ -171,8 +214,19 @@ impl Engine {
         collection: &str,
         value: &T,
     ) -> Result<(RecordId, RecordMeta)> {
+        let plaintext = self.encode_value(value)?;
+        self.insert_raw(namespace, collection, &plaintext)
+    }
+
+    /// 生成 UUIDv7 并插入已序列化的明文。
+    pub fn insert_raw(
+        &self,
+        namespace: &str,
+        collection: &str,
+        plaintext: &[u8],
+    ) -> Result<(RecordId, RecordMeta)> {
         let id = RecordId::new_v7();
-        let meta = self.put(namespace, collection, id, value, 1)?;
+        let meta = self.put_raw(namespace, collection, id, plaintext, 1)?;
         Ok((id, meta))
     }
 
@@ -185,8 +239,23 @@ impl Engine {
         value: &T,
         data_version: u16,
     ) -> Result<RecordMeta> {
-        validate_names(namespace, collection)?;
         let plaintext = self.encode_value(value)?;
+        self.put_raw(namespace, collection, id, &plaintext, data_version)
+    }
+
+    /// 指定 ID 的 upsert，接收已序列化的明文。
+    ///
+    /// 供 facade 使用：facade 在调用线程序列化，再把字节搬进阻塞线程池。
+    pub fn put_raw(
+        &self,
+        namespace: &str,
+        collection: &str,
+        id: RecordId,
+        plaintext: &[u8],
+        data_version: u16,
+    ) -> Result<RecordMeta> {
+        validate_names(namespace, collection)?;
+        self.check_plaintext_len(plaintext.len())?;
 
         let txn = self.db.begin_write()?;
         let meta = {
@@ -196,7 +265,7 @@ impl Engine {
                 namespace,
                 collection,
                 id,
-                &plaintext,
+                plaintext,
                 data_version,
             )?
         };
@@ -212,6 +281,20 @@ impl Engine {
         collection: &str,
         id: &RecordId,
     ) -> Result<Option<Stored<T>>> {
+        let Some((meta, plaintext)) = self.get_raw(namespace, collection, id)? else {
+            return Ok(None);
+        };
+        let value = serde_json::from_slice(&plaintext).map_err(Error::Deserialize)?;
+        Ok(Some(Stored { meta, value }))
+    }
+
+    /// 读取一条记录的元信息与明文；返回的明文在离开作用域时清零。
+    pub fn get_raw(
+        &self,
+        namespace: &str,
+        collection: &str,
+        id: &RecordId,
+    ) -> Result<Option<(RecordMeta, Zeroizing<Vec<u8>>)>> {
         let key = codec::encode_record_key(namespace, collection, id)?;
 
         let txn = self.db.begin_read()?;
@@ -238,12 +321,8 @@ impl Engine {
             blob.nonce,
             blob.ciphertext,
         )?;
-        let value = serde_json::from_slice(&plaintext).map_err(Error::Deserialize)?;
-
-        Ok(Some(Stored {
-            meta: record_meta(*id, &blob.header, blob.ciphertext.len())?,
-            value,
-        }))
+        let meta = record_meta(*id, &blob.header, blob.ciphertext.len())?;
+        Ok(Some((meta, plaintext)))
     }
 
     /// 写入墓碑；记录不存在时返回 `false`。
@@ -324,7 +403,49 @@ impl Engine {
         collection: &str,
         ops: &[WriteOp<T>],
     ) -> Result<Vec<RecordMeta>> {
+        let mut encoded: Vec<Zeroizing<Vec<u8>>> = Vec::new();
+        for op in ops {
+            if let WriteOp::Put { value, .. } = op {
+                encoded.push(self.encode_value(value)?);
+            }
+        }
+
+        let mut raw = Vec::with_capacity(ops.len());
+        let mut next = 0;
+        for op in ops {
+            match op {
+                WriteOp::Put { id, .. } => {
+                    let plaintext = encoded
+                        .get(next)
+                        .ok_or(Error::Internal("batch encoding mismatch"))?;
+                    raw.push(RawWriteOp::Put {
+                        id: *id,
+                        plaintext: plaintext.as_slice(),
+                    });
+                    next += 1;
+                }
+                WriteOp::Delete { id } => raw.push(RawWriteOp::Delete { id: *id }),
+            }
+        }
+
+        self.batch_raw(namespace, collection, &raw)
+    }
+
+    /// 原子批量写，接收已序列化的明文。
+    ///
+    /// 所有操作在同一个 redb 写事务内；任一失败则整批回滚。
+    pub fn batch_raw(
+        &self,
+        namespace: &str,
+        collection: &str,
+        ops: &[RawWriteOp<'_>],
+    ) -> Result<Vec<RecordMeta>> {
         validate_names(namespace, collection)?;
+        for op in ops {
+            if let RawWriteOp::Put { plaintext, .. } = op {
+                self.check_plaintext_len(plaintext.len())?;
+            }
+        }
 
         let txn = self.db.begin_write()?;
         let mut metas = Vec::with_capacity(ops.len());
@@ -334,14 +455,13 @@ impl Engine {
             let mut table = txn.open_table(records::TABLE)?;
             for op in ops {
                 match op {
-                    WriteOp::Put { id, value } => {
+                    RawWriteOp::Put { id, plaintext } => {
                         has_put = true;
-                        let plaintext = self.encode_value(value)?;
                         metas.push(
-                            self.stage_put(&mut table, namespace, collection, *id, &plaintext, 1)?,
+                            self.stage_put(&mut table, namespace, collection, *id, plaintext, 1)?,
                         );
                     }
-                    WriteOp::Delete { id } => {
+                    RawWriteOp::Delete { id } => {
                         let meta = self
                             .stage_delete(&mut table, namespace, collection, id)?
                             .ok_or(Error::NotFound)?;
@@ -402,13 +522,18 @@ impl Engine {
 
     fn encode_value<T: Serialize>(&self, value: &T) -> Result<Zeroizing<Vec<u8>>> {
         let bytes = serde_json::to_vec(value).map_err(Error::Serialize)?;
-        if bytes.len() > self.max_value_size {
+        self.check_plaintext_len(bytes.len())?;
+        Ok(Zeroizing::new(bytes))
+    }
+
+    fn check_plaintext_len(&self, size: usize) -> Result<()> {
+        if size > self.max_value_size {
             return Err(Error::ValueTooLarge {
-                size: bytes.len(),
+                size,
                 max: self.max_value_size,
             });
         }
-        Ok(Zeroizing::new(bytes))
+        Ok(())
     }
 
     fn stage_put(

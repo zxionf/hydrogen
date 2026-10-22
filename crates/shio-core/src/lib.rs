@@ -23,4 +23,4 @@ pub mod model;
 pub mod store;
 
 pub use error::{Error, Result};
-pub use store::engine::{Engine, EngineOptions, Stats};
+pub use store::engine::{Engine, EngineOptions, RawWriteOp, Stats};

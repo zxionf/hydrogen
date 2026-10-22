@@ -9,7 +9,7 @@ pub mod keys;
 pub mod meta;
 pub mod records;
 
-pub use engine::{Engine, EngineOptions, Stats};
+pub use engine::{Engine, EngineOptions, RawWriteOp, Stats};
 
 /// 当前数据库格式版本。
 pub const FORMAT: u16 = 1;

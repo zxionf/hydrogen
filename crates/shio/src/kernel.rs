@@ -2,16 +2,22 @@
 //!
 //! `Kernel` 是廉价可克隆的句柄，内部共享同一份引擎状态；`Namespace` 与
 //! `Collection<T>` 由它派生，不复制连接，也不缓存数据。
+//!
+//! 所有触及存储的调用都经 `spawn_blocking` 搬到阻塞线程池；句柄关闭后新操作
+//! 返回 [`Error::Closed`]，关闭前已开始的操作会自然完成。
 
 use std::fmt;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
-use secrecy::SecretString;
+use secrecy::{ExposeSecret, SecretString};
 use shio_core::model::{validate_name, NameKind, DEFAULT_MAX_VALUE_SIZE};
+use shio_core::store::{Engine, EngineOptions, Stats};
+use tokio::sync::Notify;
+use zeroize::Zeroizing;
 
 use crate::collection::Collection;
-use crate::Error;
+use crate::{Error, Result};
 
 /// 打开数据库的参数。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -47,6 +53,8 @@ impl OpenOptions {
     }
 
     /// 是否只读打开。
+    ///
+    /// v0.1 在 facade 层拒绝写操作；底层仍以读写模式打开。
     pub fn read_only(mut self, yes: bool) -> Self {
         self.read_only = yes;
         self
@@ -64,8 +72,8 @@ impl OpenOptions {
         self
     }
 
-    /// 校验参数组合；真正的打开在存储层接线后进行。
-    pub fn validate(&self) -> Result<(), Error> {
+    /// 校验参数组合。
+    pub fn validate(&self) -> Result<()> {
         if self.path.as_os_str().is_empty() {
             return Err(Error::InvalidArgument("database path must not be empty"));
         }
@@ -95,9 +103,8 @@ pub enum Credential {
 
 impl Credential {
     /// 以口令构造凭据。
-    pub fn password(value: impl Into<String>) -> Self {
-        let password: String = value.into();
-        Self::Password(SecretString::from(password))
+    pub fn password(value: impl Into<SecretString>) -> Self {
+        Self::Password(value.into())
     }
 }
 
@@ -116,26 +123,173 @@ pub struct Kernel {
 }
 
 /// 句柄共享的内核状态。
-///
-/// 存储层接线后填入 redb `Database` 与派生密钥；本轮保持空壳，因此不提供构造入口。
-#[allow(dead_code)]
-pub(crate) struct Inner {}
+pub(crate) struct Inner {
+    state: Mutex<State>,
+    idle: Notify,
+    read_only: bool,
+}
+
+struct State {
+    engine: Option<Arc<Engine>>,
+    in_flight: usize,
+}
+
+fn lock_error() -> Error {
+    Error::Internal("kernel state lock poisoned")
+}
+
+impl Inner {
+    fn new(engine: Engine, read_only: bool) -> Self {
+        Self {
+            state: Mutex::new(State {
+                engine: Some(Arc::new(engine)),
+                in_flight: 0,
+            }),
+            idle: Notify::new(),
+            read_only,
+        }
+    }
+
+    /// 取引擎但不登记在途操作（只用于 `stats` 这类瞬时调用）。
+    fn engine(&self) -> Result<Arc<Engine>> {
+        let state = self.state.lock().map_err(|_| lock_error())?;
+        state.engine.clone().ok_or(Error::Closed)
+    }
+
+    fn begin(&self) -> Result<Arc<Engine>> {
+        let mut state = self.state.lock().map_err(|_| lock_error())?;
+        let engine = state.engine.clone().ok_or(Error::Closed)?;
+        state.in_flight += 1;
+        Ok(engine)
+    }
+
+    fn begin_write(&self) -> Result<Arc<Engine>> {
+        if self.read_only {
+            return Err(Error::ReadOnly);
+        }
+        self.begin()
+    }
+
+    fn finish(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.in_flight = state.in_flight.saturating_sub(1);
+            if state.in_flight == 0 {
+                self.idle.notify_one();
+            }
+        }
+    }
+
+    async fn dispatch<T, F>(&self, engine: Result<Arc<Engine>>, op: F) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&Engine) -> Result<T> + Send + 'static,
+    {
+        let engine = engine?;
+        let joined = tokio::task::spawn_blocking(move || op(&engine)).await;
+        self.finish();
+        joined.map_err(|_| Error::Internal("blocking task panicked"))?
+    }
+
+    pub(crate) async fn run<T, F>(&self, op: F) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&Engine) -> Result<T> + Send + 'static,
+    {
+        self.dispatch(self.begin(), op).await
+    }
+
+    pub(crate) async fn run_write<T, F>(&self, op: F) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&Engine) -> Result<T> + Send + 'static,
+    {
+        self.dispatch(self.begin_write(), op).await
+    }
+
+    async fn close(&self) -> Result<()> {
+        loop {
+            let pending = {
+                let mut state = self.state.lock().map_err(|_| lock_error())?;
+                state.engine = None;
+                state.in_flight > 0
+            };
+
+            if !pending {
+                return Ok(());
+            }
+            self.idle.notified().await;
+        }
+    }
+}
+
+impl fmt::Debug for Kernel {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let closed = self.inner.engine().is_err();
+        f.debug_struct("Kernel")
+            .field("closed", &closed)
+            .finish_non_exhaustive()
+    }
+}
 
 impl Kernel {
+    /// 打开或创建数据库，并完成口令派生、DK 解包与校验。
+    pub async fn open(options: OpenOptions, credential: Credential) -> Result<Self> {
+        options.validate()?;
+        let read_only = options.read_only;
+
+        let mut engine_options = EngineOptions::new(options.path)
+            .create(options.create)
+            .max_value_size(options.max_value_size);
+        if let Some(bytes) = options.cache_size {
+            engine_options = engine_options.cache_size(bytes);
+        }
+
+        let password = match credential {
+            Credential::Password(secret) => {
+                Zeroizing::new(secret.expose_secret().as_bytes().to_vec())
+            }
+        };
+
+        let engine =
+            tokio::task::spawn_blocking(move || Engine::open(engine_options, password.as_slice()))
+                .await
+                .map_err(|_| Error::Internal("blocking task panicked"))??;
+
+        Ok(Self {
+            inner: Arc::new(Inner::new(engine, read_only)),
+        })
+    }
+
     /// 取命名空间句柄；名称在此完成校验，不访问磁盘。
-    pub fn namespace(&self, name: &str) -> Result<Namespace, Error> {
+    pub fn namespace(&self, name: &str) -> Result<Namespace> {
         validate_name(NameKind::Namespace, name)?;
         Ok(Namespace {
             inner: Arc::clone(&self.inner),
             name: name.to_owned(),
         })
     }
+
+    /// 持久化屏障；redb 每次提交即落盘。
+    pub async fn flush(&self) -> Result<()> {
+        self.inner.run(|engine| engine.flush()).await
+    }
+
+    /// 关闭句柄并等待进行中的操作结束。
+    ///
+    /// 重复调用返回 `Ok(())`；关闭后任何新操作返回 `Error::Closed`。
+    pub async fn close(&self) -> Result<()> {
+        self.inner.close().await
+    }
+
+    /// 当前库的统计信息；同步调用，不进入阻塞线程池。
+    pub fn stats(&self) -> Result<Stats> {
+        self.inner.engine()?.stats()
+    }
 }
 
 /// 命名空间句柄。
 #[derive(Clone)]
 pub struct Namespace {
-    #[allow(dead_code)]
     pub(crate) inner: Arc<Inner>,
     name: String,
 }
@@ -147,7 +301,7 @@ impl Namespace {
     }
 
     /// 取集合句柄；名称在此完成校验，不访问磁盘。
-    pub fn collection<T>(&self, name: &str) -> Result<Collection<T>, Error>
+    pub fn collection<T>(&self, name: &str) -> Result<Collection<T>>
     where
         T: serde::Serialize + serde::de::DeserializeOwned + Send + Sync + 'static,
     {
@@ -157,6 +311,14 @@ impl Namespace {
             self.name.clone(),
             name.to_owned(),
         ))
+    }
+
+    /// 列出本命名空间下已登记的集合名，按名称升序。
+    pub async fn collections(&self) -> Result<Vec<String>> {
+        let name = self.name.clone();
+        self.inner
+            .run(move |engine| engine.collections(&name))
+            .await
     }
 }
 

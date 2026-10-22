@@ -446,8 +446,11 @@ version = "0.1.0"
 dependencies = [
  "secrecy",
  "serde",
+ "serde_json",
  "shio-core",
+ "tempfile",
  "tokio",
+ "zeroize",
 ]
 
 [[package]]

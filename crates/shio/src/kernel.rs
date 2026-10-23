@@ -21,6 +21,7 @@ use tokio::sync::Notify;
 use zeroize::Zeroizing;
 
 use crate::collection::Collection;
+use crate::lock::DataFileLock;
 use crate::{Error, Result};
 
 /// 打开数据库的参数。
@@ -131,6 +132,7 @@ pub(crate) struct Inner {
     state: Mutex<State>,
     idle: Notify,
     read_only: bool,
+    data_lock: Mutex<Option<DataFileLock>>,
 }
 
 struct State {
@@ -143,7 +145,7 @@ fn lock_error() -> Error {
 }
 
 impl Inner {
-    fn new(engine: Engine, read_only: bool) -> Self {
+    fn new(engine: Engine, read_only: bool, data_lock: DataFileLock) -> Self {
         Self {
             state: Mutex::new(State {
                 engine: Some(Arc::new(engine)),
@@ -151,6 +153,7 @@ impl Inner {
             }),
             idle: Notify::new(),
             read_only,
+            data_lock: Mutex::new(Some(data_lock)),
         }
     }
 
@@ -219,6 +222,9 @@ impl Inner {
             };
 
             if !pending {
+                if let Ok(mut data_lock) = self.data_lock.lock() {
+                    data_lock.take();
+                }
                 return Ok(());
             }
             self.idle.notified().await;
@@ -257,6 +263,7 @@ impl Kernel {
     pub async fn open(options: OpenOptions, credential: Credential) -> Result<Self> {
         options.validate()?;
         let read_only = options.read_only;
+        let data_lock = DataFileLock::acquire(&options.path, read_only)?;
         let engine_options = engine_options(&options);
         let password = password_bytes(credential);
 
@@ -266,7 +273,7 @@ impl Kernel {
                 .map_err(|_| Error::Internal("blocking task panicked"))??;
 
         Ok(Self {
-            inner: Arc::new(Inner::new(engine, read_only)),
+            inner: Arc::new(Inner::new(engine, read_only, data_lock)),
         })
     }
 
@@ -347,6 +354,7 @@ pub async fn open_with_pairing(
     secret: Zeroizing<String>,
 ) -> Result<Kernel> {
     options.validate()?;
+    let data_lock = DataFileLock::acquire(&options.path, false)?;
     let engine_options = engine_options(&options);
     let password = password_bytes(credential);
     let offer = offer.clone();
@@ -359,7 +367,7 @@ pub async fn open_with_pairing(
     .map_err(|_| Error::Internal("blocking task panicked"))??;
 
     Ok(Kernel {
-        inner: Arc::new(Inner::new(engine, false)),
+        inner: Arc::new(Inner::new(engine, false, data_lock)),
     })
 }
 

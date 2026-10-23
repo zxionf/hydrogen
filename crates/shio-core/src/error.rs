@@ -74,8 +74,8 @@ pub enum Error {
     #[error("pairing offer is invalid")]
     PairingInvalid,
 
-    /// 文件锁被其他进程占用。
-    #[error("database is locked by another process")]
+    /// 文件锁被其他句柄或进程占用。
+    #[error("database is locked by another handle or process")]
     Locked,
 
     /// 记录体超过配置上限。

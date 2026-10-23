@@ -10,19 +10,19 @@
 - 异步：tokio 1.54（仅外层 facade；core 保持同步）
 - 加密：Argon2id（口令派生，argon2 0.6）、HKDF-SHA256（子密钥，hkdf 0.13 + sha2 0.11）、XChaCha20-Poly1305（AEAD，chacha20poly1305 0.11）
 - 错误：thiserror 2；标识：UUIDv7（uuid 1.28）；随机数：getrandom 0.4；密钥清零：zeroize 1.9；口令封装：secrecy 0.10
-- 稳定性：`shio-core`、`shio` 与 `shio-sync` 使用 `#![forbid(unsafe_code)]`；可恢复失败只返回错误，不以 panic 表达
+- 稳定性：`shio-core`、`shio` 与 `shio-sync` 使用 `#![forbid(unsafe_code)]`；`shio-ffi` 经用户批准，crate 级 `deny(unsafe_code)`，仅 `ffi` 边界模块局部允许；可恢复失败只返回错误，不以 panic 表达
 
 ## 目标
 - 可嵌入的加密持久化内核：命名空间 → 集合 → 记录，单文件 redb，记录级 AEAD。
 - 内核同步、facade async；两者禁止 unsafe，可恢复失败一律以 `Result` 返回。
-- 当前形态：core 与 facade 均已可用——Argon2id/HKDF/AEAD、redb 表、同步 CRUD、异步句柄、改口令、数据密钥轮换、真正的只读打开；多端同步（format 2、设备配对、变更日志、快照、轮换）已可用；FFI 仍是占位。
+- 当前形态：core 与 facade 均已可用——Argon2id/HKDF/AEAD、redb 表、同步 CRUD、异步句柄、改口令、数据密钥轮换、真正的只读打开；多端同步（format 2、设备配对、变更日志、快照、轮换）已可用；C ABI v1 已可用，覆盖 open/close、CRUD、batch、改口令、轮换、stats 与 flush。
 - 记录格式 `format=1` 从首个实现起保持向后兼容；同步库使用不可回退的 `format=2`；API 在 1.0 前允许调整。
 
 ## 约束
 - 稳定性优先：内核不得因未定义行为、越界、未处理错误或 panic 而崩溃；可恢复失败一律以 `Result` 返回。
 - 非测试代码禁用 `unwrap` / `expect` / `panic!`；所有落盘输入视为不可信，先校验后使用。
-- 静态护栏由 workspace lints 机械执行：`unsafe_code = "forbid"`，clippy 的 `unwrap_used` / `expect_used` / `panic` / 占位宏 / `dbg_macro` 均为 deny；测试代码局部放宽。
-- `shio-core` 与 `shio` 禁止 unsafe；FFI 若引入 unsafe，必须隔离、审计并证明无 UB，且需用户批准。
+- 静态护栏由 workspace lints 机械执行：`unsafe_code = "forbid"`（`shio-ffi` 为已批准的受控例外，见下），clippy 的 `unwrap_used` / `expect_used` / `panic` / 占位宏 / `dbg_macro` 均为 deny；测试代码局部放宽。
+- `shio-core`、`shio` 与 `shio-sync` 禁止 unsafe。`shio-ffi` 是唯一例外：经用户明确批准，crate 级改为 `deny(unsafe_code)`，只有 `ffi` 模块局部允许，范围限裸指针校验、句柄转换、缓冲区所有权和 `catch_unwind`。
 - 密钥、口令、明文不得出现在日志、错误信息或 panic 信息中。
 - 单写多读；每次公开写操作必须原子提交。
 - `format=1` 与 `format=2` 的记录布局与 AAD 都是兼容性契约；变更需提升版本并提供迁移。
@@ -52,7 +52,7 @@ shio/
 │   │   ├── src/{lib,kernel,collection}.rs
 │   │   ├── examples/{notes,sync}.rs
 │   │   └── tests/{facade,sync}.rs
-│   ├── shio-ffi/               # C ABI：文档占位，受 unsafe 约束未实现
+│   ├── shio-ffi/               # C ABI v1：include/shio.h，唯一受控 unsafe 边界
 │   └── shio-sync/              # SHY2 帧、配对文本与拥有型同步句柄
 │       ├── src/{lib,frame,base32}.rs
 │       └── tests/frames.rs
@@ -63,7 +63,7 @@ shio/
 
 - `shio-core`：无 async、无 tokio；持有 redb 与密钥材料，所有操作为同步函数。`model`/`error`/`codec`/`codec2` 完整可用；`crypto` 提供 KDF、子密钥派生与 AEAD；`store::Engine` 提供创建/打开、泛型读写、`*_raw`、同步日志/快照/轮换/配对接口。
 - `shio`：把 core 的阻塞调用经 `spawn_blocking` 暴露为 async；管理句柄生命周期、在途操作与关闭等待；写路径在调用线程序列化，读路径在阻塞线程反序列化；`examples/notes.rs` 与 `examples/sync.rs` 给出最小可运行用法；`sync` feature 暴露 `Kernel::sync()` 与配对。
-- `shio-ffi`：仅为 C++/Vulkan GUI 与 Android 提供 C ABI，不承载业务逻辑；未取得 unsafe 例外前不导出任何符号。
+- `shio-ffi`：仅为 C++/Vulkan GUI 与 Android 提供阻塞 C ABI，不承载业务逻辑；导出 `shio_open`/`shio_close`、CRUD、batch、改口令、轮换、stats、flush、ABI 版本与错误详情。每个句柄持有 tokio multi-thread runtime；`ffi` 模块是唯一 unsafe 边界。
 - `shio-sync`：只依赖 `shio-core`，不引入网络/TLS/后台线程；负责 `SHY2` 帧、Crockford Base32 配对 secret 与拥有型 `SyncHandle`。
 - `tests`：`autotests = false` 的成员包，通过显式 `[[test]]` 承载跨 crate 用例。
 
@@ -144,23 +144,23 @@ DK ──HKDF-SHA256(info 区分用途)──▶ 记录密钥 / 元数据密钥 
 - 落盘数据一律视为不可信：解析 header、键、长度、AAD、JSON 前先校验；损坏或恶意输入只返回 `Corrupted` / `Deserialize`，不得越界或崩溃。
 - 由于所有写操作都会读取并复用已有 header，写入路径同样执行完整解码与校验。
 - 长度与偏移计算使用 `checked_*`，防止整数溢出；不靠 unsafe 做性能捷径。
-- 内存分配失败、文件锁冲突、磁盘只读等环境错误都返回错误，不 abort；redb 的 `DatabaseAlreadyOpen` 映射为 `Locked`，其余存储错误归入 `Database`。
+- 内存分配失败、文件锁冲突、磁盘只读等环境错误都返回错误，不 abort；redb 的 `DatabaseAlreadyOpen` 映射为 `Locked`，Android 旁路 `.lock` 的冲突同样映射为 `Locked`，其余存储错误归入 `Database`。
 - DK 解包与 key check 失败映射为 `InvalidKey`；记录结构或认证失败映射为 `Corrupted`；库文件缺失映射为 `NotFound`；轮换/升级未完成导致的工作状态冲突映射为 `Busy`；只读句柄的写操作映射为 `ReadOnly`。
 - 同步错误：未启用同步返回 `SyncDisabled`，游标被压缩返回 `SyncResyncRequired`，缺记录 key 返回 `RotationRequired`，同步模式物理删除返回 `SyncEnabled`，配对过期/失败返回 `PairingExpired`/`PairingInvalid`。
 - 密钥轮换/升级的每个中断点都保持可读：新 key 行与升级状态先落盘，记录按自身 `key_id` 解密，meta 最后切换；重跑轮换/升级可复用已写入状态并从中断处继续。
 - facade 不把 panic 带过线程边界：`spawn_blocking` 的 `JoinError` 统一转为 `Internal`；句柄状态锁与密钥会话锁中毒同样返回 `Internal`。
 - 关闭语义：取引擎时登记在途计数，`close` 置空引擎并等待计数归零；已开始的操作持有 `Arc<Engine>` 完成，之后数据库才释放文件锁。
-- FFI 边界（未来）必须用 `catch_unwind` 把 panic 转为错误码，绝不让 panic 跨 C ABI 传播。
+- FFI 边界用 `catch_unwind` 把 panic 转为 `SHIO_INTERNAL`，绝不让 panic 跨 C ABI 传播；错误详情线程局部，返回缓冲区由 `shio_free` 释放并清零。
 - 测试覆盖截断值、随机字节、错误口令、并发关闭与磁盘只读；关键编解码做 fuzz/property 测试。当前已覆盖错误口令、截断/篡改的 blob 与记录、分页、批量回滚、句柄关闭、只读拒写、改口令、全量轮换与轮换中断后重跑，以及同步升级、双端 LWW/墓碑、快照/压缩、轮换/ack/退役、配对密钥链、帧截断/超限/`db_id` 不匹配。
 - 静态护栏：workspace lints 拒绝 `unsafe`、`unwrap` / `expect` / `panic!` 与未实现的占位宏，新增 crate 默认继承。
 - 编解码用例必须覆盖损坏输入：魔数不符、未知格式版本、`key_id` 越界、截断、`ct_len` 与总长不符、尾随字节。
 
 ## 平台与互操作
 - **Rust 应用**：直接依赖 `shio`。
-- **C++/Vulkan GUI 与 Android**：经 `shio-ffi` 的 C ABI 调用；句柄不透明，字节串带长度，错误用显式错误码 + 线程局部错误详情。
-- **Android**：数据库放应用私有目录；不依赖系统钥匙串，口令解锁因此在无头/服务环境同样可用。
+- **C++/Vulkan GUI 与 Android**：经 `shio-ffi` 的 C ABI 调用；句柄不透明，字节串带长度，错误用显式错误码 + 线程局部错误详情。JNI/Kotlin 包装层由 `shio-android` 维护，内核不绑定 Java 包名。
+- **Android**：数据库放应用私有目录；不依赖系统钥匙串，口令解锁因此在无头/服务环境同样可用。首版目标为 `aarch64-linux-android` 真机与 `x86_64-linux-android` 模拟器，minSdk 24，NDK r29；`libshio_ffi.so` 的 `LOAD` 对齐为 16 KB，`.note.android.ident` 为 API 24。x86_64 模拟器已通过 C ABI 冒烟：CRUD、batch、关闭/重开、改口令、轮换、只读、同进程与跨进程文件锁、杀进程后重开。redb 4.4 的字节范围锁在 Android 上返回 `Unsupported`，facade 因此在该平台使用旁路 `<db>.lock` 文件与 `rustix::fs::flock`：写句柄独占、只读句柄共享；冲突映射为 `Locked`。aarch64 真机加载、JNI 联调、轮换中断续跑与低端机 KDF 实测仍待补。
 - **服务端**：同一存储格式，仅改变打开路径、并发部署与备份策略，不引入第二套内核。
-- **稳定性与 unsafe**：内核的首要要求是不出现未定义行为、不因内部错误崩溃。`shio-core` / `shio` / `shio-sync` 保持 `forbid(unsafe_code)`；C ABI 若未来引入 unsafe，必须隔离在最小边界、逐条审计并证明无 UB，且经用户明确批准后才实施。FFI 当前仅停留在设计。
+- **稳定性与 unsafe**：内核的首要要求是不出现未定义行为、不因内部错误崩溃。`shio-core` / `shio` / `shio-sync` 保持 `forbid(unsafe_code)`；`shio-ffi` 的 unsafe 已经用户明确批准，仅限 C ABI 边界模块，逐条以 SAFETY 注释审计。C ABI v1 已实现并通过 host 冒烟、Android 两 target 编译。
 - 未来插件系统通过“每插件独立命名空间 + 能力白名单”接入，不改变存储格式；本次只预留命名空间隔离。
 
 ## 多端同步
@@ -182,7 +182,7 @@ DK ──HKDF-SHA256(info 区分用途)──▶ 记录密钥 / 元数据密钥 
 - 全文检索、二级索引、压缩
 - GUI/渲染、剪贴板监听、Markdown 渲染等应用功能
 - 多写进程
-- FFI 的实际实现（受 unsafe 约束，先决策后动工）
+- FFI 的 sync/pairing 面（v1 不包含，按 Android 首版需求另行设计）
 
 ## 影响与兼容性
 - format 1 的 AAD 与 blob 布局不变；不启用同步的已有数据库无需迁移。
@@ -198,9 +198,10 @@ DK ──HKDF-SHA256(info 区分用途)──▶ 记录密钥 / 元数据密钥 
 - 工具链由 `rust-toolchain.toml` 固定（1.95.0），MSRV 1.90（redb 4.4 的要求）；低于 MSRV 时 cargo 直接拒绝。
 - `cargo build --workspace` 构建全部 crate，产物落 `target/`（不入库）。
 - `cargo run -p shio --example notes` 与 `cargo run -p shio --features sync --example sync` 运行最小示例（临时库，结束即删除）。
-- `cargo test --workspace`：当前 97 个用例（core 库内 49、引擎端到端 21、core 同步 8、facade 库内 4、facade 端到端 5、`shio-sync` 库内 3、帧端到端 4、跨 crate 集成 3）。
+- `cargo test --workspace`：当前 101 个用例（core 库内 49、引擎端到端 21、core 同步 8、facade 库内 4、facade 端到端 5、`shio-ffi` 库内 1 + C ABI 端到端 3、`shio-sync` 库内 3、帧端到端 4、跨 crate 集成 3）。
 - `cargo test -p shio --features sync` 额外跑 facade 的配对/同步端到端用例。
 - 引擎端到端使用 `tempfile` 与 8 MiB 的 Argon2id 参数，含 300 条记录的跨批轮换与「篡改记录 → 轮换中断 → 还原 → 续跑」；facade 端到端用默认参数（64 MiB、t=3）。
 - 版本查询断言常量与 `CARGO_PKG_VERSION` 一致，且不依赖打开数据库。
+- Android 类型检查：`cargo check -p shio-core -p shio -p shio-ffi --target aarch64-linux-android` 与 `x86_64-linux-android`；链接 `.so` 时把 `CARGO_TARGET_<TARGET>_LINKER` 指向 NDK r29 的 `<triple>24-clang.cmd`，并设置 `RUSTFLAGS="-C link-arg=--target=<triple>24"`。
 - `cargo clippy --workspace --all-targets -- -D warnings`、`cargo clippy -p shio --features sync --all-targets -- -D warnings` 与 `cargo fmt --all -- --check` 是合并前的必过项。
 - 依赖版本由 `Cargo.lock` 锁定并随仓库提交；升级依赖需重新跑上述三项检查。

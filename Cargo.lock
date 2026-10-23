@@ -444,6 +444,7 @@ dependencies = [
 name = "shio"
 version = "0.1.0"
 dependencies = [
+ "rustix",
  "secrecy",
  "serde",
  "serde_json",
@@ -476,7 +477,12 @@ dependencies = [
 name = "shio-ffi"
 version = "0.1.0"
 dependencies = [
+ "serde",
+ "serde_json",
  "shio",
+ "tempfile",
+ "tokio",
+ "zeroize",
 ]
 
 [[package]]

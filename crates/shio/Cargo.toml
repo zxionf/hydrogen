@@ -20,6 +20,9 @@ shio-sync = { workspace = true, optional = true }
 tokio.workspace = true
 zeroize.workspace = true
 
+[target.'cfg(target_os = "android")'.dependencies]
+rustix.workspace = true
+
 [dev-dependencies]
 tempfile.workspace = true
 

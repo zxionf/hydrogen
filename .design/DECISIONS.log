@@ -169,3 +169,23 @@ Change: 20261022-sync-design
 Context: format=2 的 key_id 是 16 字节，而现有 Stats.key_id 与 crypto::KeyId 仍是 u16；若同步 API 直接暴露裸数组，调用方容易把 db_id、device_id、key_id 混用
 Decision: 在 model 引入 16 字节新类型 KeyId 与 DeviceId，core 根导出；crypto::KeyId 改名 LegacyKeyId，仅供 format=1 内部与统计映射；Stats.key_id 在 M0 改为 KeyId（format=1 用前 14 字节 0 + 大端 u16 映射）
 Consequences: 这是 1.0 前允许的破坏性调整；应用层统一 16 字节 ID 并获得类型隔离；format=1 的 u16 仍可无损还原；M0 需同步更新 api.md 与 data.md
+## [35] 2026-10-22 10:18:47 UTC
+Change: 20261022-android-kernel
+Context: 新 Android 仓库启动，内核需要提供可调用的移动端边界
+Decision: Android 支持按 P0 平台验证、P1 unsafe 例外与 C ABI 契约、P2 FFI/JNI、P3 加固、P4 按需同步推进；未批准 unsafe 例外前不导出 FFI 符号
+Consequences: 数据格式不变；shio-ffi 成为唯一受控 unsafe 边界；Android 首版是否包含同步面由产品需求决定
+## [36] 2026-10-22 10:50:24 UTC
+Change: 20261022-android-kernel
+Context: Android 首版需要锁定构建基线，并需要 shio-ffi 导出 C ABI；CONTRACT 默认禁止 unsafe
+Decision: 首版 minSdk 锁定 24；正式批准 shio-ffi 的 unsafe 例外，crate 级改 deny(unsafe_code)，仅 ffi 模块局部允许；v1 导出 open/close、CRUD、batch、改口令、轮换、stats、flush，sync/pairing 暂不进入
+Consequences: shio-core/shio/shio-sync 仍 forbid unsafe；shio-ffi 成为唯一受控边界；Android 仓库需锁定内核提交并检查 SHIO_ABI_VERSION=1；真机与 JNI 联调仍未完成
+## [37] 2026-10-22 11:10:00 UTC
+Change: 20261022-android-kernel
+Context: JNI 函数名、Java 包名、worker executor 与 UI 技术栈属于 shio-android；把它们放进内核会把 C ABI 绑死到应用结构
+Decision: 内核只提供并维护 shio-ffi C ABI；JNI/Kotlin 包装层由 shio-android 实现，负责库加载、线程、异常映射与生命周期
+Consequences: shio-ffi 不再引入 JNI 依赖；Android 首版只需锁定 SHIO_ABI_VERSION 和 .so；跨仓库 JNI 联调仍是待办
+## [38] 2026-10-23 03:03:01 UTC
+Change: 20261022-android-kernel
+Context: redb 4.4 的字节范围锁在 Android 上返回 Unsupported，跨进程冒烟中第二写者可以直接打开同一数据库；Android 不能依赖 redb 自带的单写保护
+Decision: Android 上由 facade 在数据库旁创建 `<db>.lock`，用 rustix::fs::flock 非阻塞加锁：写句柄独占、只读句柄共享；冲突映射为 Locked；锁持有到 close 且在途操作归零后释放，不主动删除锁文件
+Consequences: Android 同进程与跨进程第二写者都会被拒绝；多一个可重建的旁路文件，备份与清理需避免在持有期间删除；非 Android 平台继续使用 redb 文件锁

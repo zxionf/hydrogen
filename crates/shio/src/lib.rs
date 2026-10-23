@@ -14,6 +14,7 @@
 
 pub mod collection;
 pub mod kernel;
+mod lock;
 
 pub use collection::Collection;
 #[cfg(feature = "sync")]

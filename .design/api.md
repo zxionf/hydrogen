@@ -17,7 +17,7 @@
 |---|---|---|
 | `shio-core` | 模型、ID、加密、redb 存储、事务 | redb、serde、serde_json、argon2、chacha20poly1305、hkdf、zeroize、uuid、getrandom、thiserror |
 | `shio` | async facade、生命周期、句柄 | `shio-core`、tokio、secrecy、serde、serde_json、zeroize；可选 `shio-sync`（`sync` feature） |
-| `shio-ffi` | C ABI（后续） | `shio`、libc；唯一允许 unsafe 的 crate |
+| `shio-ffi` | C ABI v1 | `shio`、tokio、serde、serde_json、zeroize；唯一允许 unsafe 的 crate |
 | `shio-sync` | 多端同步（后续） | `shio-core` |
 
 `shio-core` 与 `shio` 均声明 `#![forbid(unsafe_code)]`。
@@ -39,7 +39,7 @@ kernel.close().await?;
 
 - `open`：打开或创建数据库，完成口令派生、DK 解包与校验。`create=false` 且文件不存在时返回 `Error::NotFound`。
 - `close`：标记关闭、等待进行中的操作结束、释放文件锁。之后任何操作返回 `Error::Closed`。
-- 同一进程内可克隆 `Kernel` 句柄共享；跨进程由 redb 文件锁保证单写，冲突时返回 `Error::Locked`。
+- 同一进程内可克隆 `Kernel` 句柄共享；跨进程由文件锁保证单写，冲突时返回 `Error::Locked`。非 Android 平台使用 redb 自带锁；Android 上 redb 4.4 的字节范围锁不可用，facade 改用数据库旁的 `<db>.lock` 文件加 `flock`：写句柄独占、只读句柄共享。`.lock` 文件在句柄关闭时释放，不要在持有期间删除。
 - `open` 是唯一需要口令的入口；解锁后的密钥材料只驻留内存。
 - `shio::version()` 返回编译期内核版本（与包版本一致），不需要打开数据库；库的格式版本用 `Kernel::stats().format_version` 查询。
 
@@ -296,7 +296,7 @@ impl NameKind {
 - core 的公开函数不以 panic 表达可恢复失败；内部不变式失败返回 `Error::Internal`。
 - 落盘数据（header、键、长度、AAD、JSON）一律视为不可信，先校验后使用；损坏输入返回 `Corrupted` / `Deserialize`。
 - 非测试代码不使用 `unwrap` / `expect` / `panic!`；CI 以 clippy 规则兜底。
-- FFI 边界（未来）必须 `catch_unwind`，把 panic 转为错误码，禁止 panic 跨 C ABI。
+- FFI 边界必须 `catch_unwind`，把 panic 转为错误码，禁止 panic 跨 C ABI。
 - 发布构建不得依赖 `panic=abort` 来“避免”崩溃；正确性来自错误处理，而不是终止进程。
 
 ## 7. 错误
@@ -332,35 +332,74 @@ pub enum NameKind { Namespace, Collection }
 - 可恢复错误不 panic；只有违反类型不变式（如内部状态机损坏）才允许 `debug_assert` 后返回 `Internal`。
 - 所有来自落盘字节的输入先做长度/边界校验；失败返回 `Corrupted` 或 `Deserialize`，绝不 panic、越界或 abort。
 
-## 8. C ABI 映射（设计，未实现）
+## 8. C ABI 映射（v1，已实现）
 
-C++ 与 Android 通过 `shio-ffi` 调用。原则：
+C++ 与 Android 通过 `shio-ffi` 调用；契约头文件为 `crates/shio-ffi/include/shio.h`。用户已批准 `shio-ffi` 的 unsafe 例外，允许范围只在本 crate 的 FFI 边界内；`shio-core` 与 `shio` 继续 `forbid(unsafe_code)`。JNI/Kotlin 包装层由 `shio-android` 实现，内核不绑定具体 Java 包名或 UI 技术栈。
+
+原则：
 
 - 句柄不透明：`typedef struct shio_kernel shio_kernel;`
-- 所有字节串显式带长度；字符串参数为 UTF-8、非 NUL 结尾。
-- 返回 `int32_t` 错误码；`0` 成功，负数对应稳定错误分类。
-- 错误详情经 `shio_last_error(handle, buf, len)` 取回，线程局部。
-- FFI 内部持有 tokio runtime，对外暴露**阻塞调用**；C++ 侧在 worker 线程调用，不阻塞 GUI 线程。
-- 回调/取消令牌在后续版本追加，v0.1 不设计异步回调。
+- 名称是 NUL 结尾的 UTF-8 字符串；载荷、口令和记录 ID 是显式长度的字节串，允许内嵌 NUL。口令字节必须是 UTF-8（facade 使用 `SecretString`）；载荷必须是合法 JSON。
+- 记录 ID 固定为 16 字节原始 UUID；记录载荷是 JSON，读写都经过 `serde_json::Value`。
+- 返回 `int32_t` 稳定错误码；`0` 成功，负数对应 `include/shio.h` 中的 `SHIO_*` 常量。未知错误映射为 `SHIO_INTERNAL`。
+- 错误详情经 `shio_last_error(handle, buf, len)` 取回，线程局部；返回包含 NUL 的所需字节数，缓冲区不足时截断并补 NUL。
+- FFI 内部为每个句柄持有 tokio multi-thread runtime，对外暴露**阻塞调用**；C++/Android 必须在 worker 线程调用，不阻塞 UI 线程。
+- 所有导出函数都经过 `catch_unwind`；panic 转为 `SHIO_INTERNAL`，不跨 C ABI。
+- 回调、取消令牌、异步 future 不在 v1；sync/pairing 也不在 v1，待 Android 首版需求确认后追加。
 
 ```c
-int32_t shio_open(const char *path, const uint8_t *password, size_t password_len,
-                  const char *options_json, shio_kernel **out);
-void    shio_close(shio_kernel *kernel);
+uint32_t shio_abi_version(void);
+size_t   shio_last_error(const shio_kernel *k, char *buf, size_t len);
 
+int32_t shio_open(const char *path, const uint8_t *password, size_t password_len,
+                  const uint8_t *options_json, size_t options_len,
+                  shio_kernel **out);
+int32_t shio_close(shio_kernel *kernel);
+void    shio_kernel_destroy(shio_kernel *kernel);
+
+int32_t shio_insert(shio_kernel *k, const char *ns, const char *coll,
+                    const uint8_t *json, size_t json_len, uint8_t out_id[16],
+                    uint8_t **out_meta, size_t *out_meta_len);
 int32_t shio_put(shio_kernel *k, const char *ns, const char *coll,
                  const uint8_t id[16], const uint8_t *json, size_t json_len,
-                 shio_meta *out);
+                 uint8_t **out_meta, size_t *out_meta_len);
 int32_t shio_get(shio_kernel *k, const char *ns, const char *coll,
-                 const uint8_t id[16], uint8_t **json, size_t *json_len);
+                 const uint8_t id[16], uint8_t **out_json, size_t *out_json_len);
 int32_t shio_delete(shio_kernel *k, const char *ns, const char *coll,
-                    const uint8_t id[16], int32_t *existed);
+                    const uint8_t id[16], int32_t *out_existed);
+int32_t shio_list(shio_kernel *k, const char *ns, const char *coll,
+                  const uint8_t *after, size_t limit, uint8_t include_deleted,
+                  uint8_t **out_json, size_t *out_json_len);
+int32_t shio_batch(shio_kernel *k, const char *ns, const char *coll,
+                   const uint8_t *ops_json, size_t ops_json_len,
+                   uint8_t **out_meta, size_t *out_meta_len);
 
-/* 释放由 shio_get / 列表接口返回的缓冲区 */
-void    shio_free(uint8_t *ptr, size_t len);
+int32_t shio_change_password(shio_kernel *k, const uint8_t *new_password,
+                             size_t new_password_len);
+int32_t shio_rotate_data_key(shio_kernel *k);
+int32_t shio_flush(shio_kernel *k);
+int32_t shio_stats(shio_kernel *k, uint8_t **out_json, size_t *out_json_len);
+
+/* 释放所有由 shio 分配的返回缓冲区；ptr/len 必须成对。 */
+void    shio_free(void *ptr, size_t len);
 ```
 
-> C ABI 需要 unsafe。当前 CONTRACT 禁止 unsafe，`shio-ffi` 的实施必须先取得显式例外；在此之前仅保留本节设计。
+JSON 形状：
+
+- `shio_open` 的 `options_json` 可为空；字段为 `create`、`read_only`、`max_value_size`、`cache_size`，未知字段拒绝。
+- `shio_get` 返回 `{"meta":{...},"value":...}`；墓碑视为 `SHIO_NOT_FOUND`。
+- `shio_insert` / `shio_put` / `shio_batch` 返回记录元信息，字段为 `id`、`rev`、`created_at`、`updated_at`、`data_version`、`deleted`、`ciphertext_len`。
+- `shio_list` 返回 `{"items":[...],"next":"uuid"|null}`；`after` 为 `NULL` 表示从头，`limit == 0` 使用默认值。
+- `shio_batch` 输入为 `[{"id":"uuid","value":...},{"id":"uuid","delete":true}]`，最多 1000 条，单次原子提交。
+- `shio_stats` 返回 `format_version`、`key_id`（32 位十六进制）和 `db_bytes`。
+
+所有权与生命周期：
+
+- 所有 `uint8_t **` 输出由调用方持有，必须用 `shio_free(ptr, len)` 释放；失败时输出为 `NULL`/`0`。
+- `shio_close` 关闭并等待在途操作，但不释放句柄；可重复调用，之后的操作返回 `SHIO_CLOSED`。
+- `shio_kernel_destroy` 释放句柄，调用前必须确保没有其它线程继续使用；不要重复 destroy。
+- 口令临时缓冲区在边界内用 `zeroize` 清零；返回的记录明文由调用方在释放前自行处理。
+- 内核单写多读：Android 多进程只能有一个可写 owner；跨进程只读受同一旁路 `.lock` 的共享锁约束。Android 的锁文件为 `<db>.lock`，由 facade 持有到 `close`。
 
 ## 9. 兼容性
 

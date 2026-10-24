@@ -8,11 +8,13 @@ use std::ffi::{c_char, CStr, CString};
 use std::path::PathBuf;
 use std::ptr;
 use std::sync::Mutex;
+use std::time::Duration;
 
 use serde::Deserialize;
 use serde_json::{json, Value};
 use shio::{
-    Credential, Kernel, ListOptions, OpenOptions, RecordId, RecordMeta, WriteOp, DEFAULT_LIST_LIMIT,
+    ApplyReport, Credential, DeviceId, Kernel, KeyId, ListOptions, OpenOptions, PairingOffer,
+    RecordId, RecordMeta, RotationInfo, SyncInfo, WriteOp, DEFAULT_LIST_LIMIT,
 };
 use tokio::runtime::{Builder, Runtime};
 use zeroize::{Zeroize, Zeroizing};
@@ -71,6 +73,8 @@ pub const SHIO_PAIRING_INVALID: i32 = -22;
 
 const MAX_INPUT_BYTES: usize = 64 * 1024 * 1024;
 const MAX_BATCH_OPS: usize = 1000;
+const DEFAULT_SYNC_PAGE_LIMIT: usize = 100;
+const DEFAULT_PAIRING_TTL_SECONDS: u64 = 600;
 
 thread_local! {
     static LAST_ERROR: RefCell<Option<CString>> = const { RefCell::new(None) };
@@ -281,6 +285,71 @@ fn input_id(pointer: *const u8) -> shio::Result<RecordId> {
     Ok(RecordId::from_bytes(bytes))
 }
 
+fn input_optional_device_id(pointer: *const u8) -> shio::Result<Option<DeviceId>> {
+    if pointer.is_null() {
+        return Ok(None);
+    }
+    let mut bytes = [0u8; 16];
+    // SAFETY: 由调用方契约保证 16 个字节可读。
+    unsafe { ptr::copy_nonoverlapping(pointer, bytes.as_mut_ptr(), bytes.len()) };
+    Ok(Some(DeviceId::from_bytes(bytes)))
+}
+
+fn input_key_id(pointer: *const u8) -> shio::Result<KeyId> {
+    if pointer.is_null() {
+        return Err(Error::InvalidArgument("key id pointer is null"));
+    }
+    let mut bytes = [0u8; 16];
+    // SAFETY: 由调用方契约保证 16 个字节可读。
+    unsafe { ptr::copy_nonoverlapping(pointer, bytes.as_mut_ptr(), bytes.len()) };
+    Ok(KeyId::from_bytes(bytes))
+}
+
+fn hex(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push_str(&format!("{byte:02x}"));
+    }
+    out
+}
+
+fn sync_info_value(info: &SyncInfo) -> Value {
+    json!({
+        "db_id": hex(&info.db_id),
+        "device_id": info.device_id.to_string(),
+        "current_key_id": info.current_key_id.to_string(),
+        "log_start": info.log_start,
+        "log_end": info.log_end,
+        "baseline_done": info.baseline_done,
+    })
+}
+
+fn rotation_info_value(info: &RotationInfo) -> Value {
+    let acked: Vec<String> = info.acked.iter().map(ToString::to_string).collect();
+    json!({
+        "from": info.from.to_string(),
+        "to": info.to.to_string(),
+        "created_at": info.created_at.as_millis(),
+        "acked": acked,
+    })
+}
+
+fn apply_report_value(report: &ApplyReport) -> Value {
+    json!({
+        "applied": report.applied,
+        "skipped": report.skipped,
+        "controls": report.controls,
+    })
+}
+
+fn sync_limit(limit: usize) -> usize {
+    if limit == 0 {
+        DEFAULT_SYNC_PAGE_LIMIT
+    } else {
+        limit
+    }
+}
+
 fn input_password(pointer: *const u8, len: usize) -> shio::Result<String> {
     // SAFETY: 由调用方契约保证指针和长度有效。
     let bytes = unsafe { input_bytes(pointer, len)? };
@@ -318,6 +387,13 @@ fn set_output(bytes: Vec<u8>, out: *mut *mut u8, out_len: *mut usize) -> shio::R
         *out_len = len;
     }
     Ok(())
+}
+
+fn set_optional_output(bytes: Vec<u8>, out: *mut *mut u8, out_len: *mut usize) -> shio::Result<()> {
+    if out.is_null() && out_len.is_null() {
+        return Ok(());
+    }
+    set_output(bytes, out, out_len)
 }
 
 /// 释放由 shio 返回的缓冲区，并在释放前清零；`ptr` 与 `len` 必须成对。
@@ -829,6 +905,534 @@ pub unsafe extern "C" fn shio_stats(
     })
 }
 
+/// 启用同步；`device_id` 为 NULL 时生成随机设备 ID。
+///
+/// # Safety
+///
+/// 句柄、可选设备 ID 与输出指针必须按 `include/shio.h` 的契约有效。
+#[no_mangle]
+pub unsafe extern "C" fn shio_sync_enable(
+    handle: *mut ShioKernel,
+    device_id: *const u8,
+    out_json: *mut *mut u8,
+    out_json_len: *mut usize,
+) -> i32 {
+    ffi_guard(|| {
+        reset_output(out_json, out_json_len)?;
+        let device = input_optional_device_id(device_id)?;
+        // SAFETY: 调用方保证句柄来自 `shio_open` 且未 destroy。
+        let handle =
+            unsafe { handle.as_ref() }.ok_or(Error::InvalidArgument("kernel handle is null"))?;
+        let info = handle.kernel()?.sync()?.enable_sync(device)?;
+        set_output(
+            value_to_bytes(&sync_info_value(&info))?,
+            out_json,
+            out_json_len,
+        )
+    })
+}
+
+/// 同步摘要。
+///
+/// # Safety
+///
+/// 句柄与输出指针必须按 `include/shio.h` 的契约有效。
+#[no_mangle]
+pub unsafe extern "C" fn shio_sync_info(
+    handle: *mut ShioKernel,
+    out_json: *mut *mut u8,
+    out_json_len: *mut usize,
+) -> i32 {
+    ffi_guard(|| {
+        reset_output(out_json, out_json_len)?;
+        // SAFETY: 调用方保证句柄来自 `shio_open` 且未 destroy。
+        let handle =
+            unsafe { handle.as_ref() }.ok_or(Error::InvalidArgument("kernel handle is null"))?;
+        let info = handle.kernel()?.sync_info()?;
+        set_output(
+            value_to_bytes(&sync_info_value(&info))?,
+            out_json,
+            out_json_len,
+        )
+    })
+}
+
+/// 读取变更页并编码为 SHY2 帧。
+///
+/// # Safety
+///
+/// 句柄、输出帧及可选游标指针必须按 `include/shio.h` 的契约有效。
+#[no_mangle]
+pub unsafe extern "C" fn shio_sync_changes(
+    handle: *mut ShioKernel,
+    after: u64,
+    limit: usize,
+    out_frame: *mut *mut u8,
+    out_frame_len: *mut usize,
+    out_next: *mut u64,
+    out_has_more: *mut u8,
+) -> i32 {
+    ffi_guard(|| {
+        reset_output(out_frame, out_frame_len)?;
+        if !out_next.is_null() {
+            // SAFETY: 调用方提供了可写指针。
+            unsafe { *out_next = 0 };
+        }
+        if !out_has_more.is_null() {
+            // SAFETY: 调用方提供了可写指针。
+            unsafe { *out_has_more = 0 };
+        }
+
+        // SAFETY: 调用方保证句柄来自 `shio_open` 且未 destroy。
+        let handle =
+            unsafe { handle.as_ref() }.ok_or(Error::InvalidArgument("kernel handle is null"))?;
+        let sync = handle.kernel()?.sync()?;
+        let page = sync.changes_since(after, sync_limit(limit))?;
+        let frame = sync.encode(&page)?;
+
+        if !out_next.is_null() {
+            // SAFETY: 调用方提供了可写指针。
+            unsafe { *out_next = page.next };
+        }
+        if !out_has_more.is_null() {
+            // SAFETY: 调用方提供了可写指针。
+            unsafe { *out_has_more = u8::from(page.has_more) };
+        }
+        set_output(frame, out_frame, out_frame_len)
+    })
+}
+
+/// 应用变更帧。
+///
+/// # Safety
+///
+/// 句柄、帧与输出指针必须按 `include/shio.h` 的契约有效。
+#[no_mangle]
+pub unsafe extern "C" fn shio_sync_apply(
+    handle: *mut ShioKernel,
+    frame: *const u8,
+    frame_len: usize,
+    out_report_json: *mut *mut u8,
+    out_report_len: *mut usize,
+) -> i32 {
+    ffi_guard(|| {
+        reset_output(out_report_json, out_report_len)?;
+        // SAFETY: 由调用方契约保证帧指针有效。
+        let frame = unsafe { input_bytes(frame, frame_len)? };
+        // SAFETY: 调用方保证句柄来自 `shio_open` 且未 destroy。
+        let handle =
+            unsafe { handle.as_ref() }.ok_or(Error::InvalidArgument("kernel handle is null"))?;
+        let report = handle.kernel()?.sync()?.apply(frame)?;
+        set_output(
+            value_to_bytes(&apply_report_value(&report))?,
+            out_report_json,
+            out_report_len,
+        )
+    })
+}
+
+/// 生成本机待发送的轮换 offer 帧。
+///
+/// # Safety
+///
+/// 句柄与输出指针必须按 `include/shio.h` 的契约有效。
+#[no_mangle]
+pub unsafe extern "C" fn shio_sync_offers(
+    handle: *mut ShioKernel,
+    out_frame: *mut *mut u8,
+    out_frame_len: *mut usize,
+) -> i32 {
+    ffi_guard(|| {
+        reset_output(out_frame, out_frame_len)?;
+        // SAFETY: 调用方保证句柄来自 `shio_open` 且未 destroy。
+        let handle =
+            unsafe { handle.as_ref() }.ok_or(Error::InvalidArgument("kernel handle is null"))?;
+        let sync = handle.kernel()?.sync()?;
+        let page = sync.offers()?;
+        let frame = sync.encode_offers(&page)?;
+        set_output(frame, out_frame, out_frame_len)
+    })
+}
+
+/// 应用对端的轮换 offer 帧。
+///
+/// # Safety
+///
+/// 句柄与帧必须按 `include/shio.h` 的契约有效。
+#[no_mangle]
+pub unsafe extern "C" fn shio_sync_apply_offers(
+    handle: *mut ShioKernel,
+    frame: *const u8,
+    frame_len: usize,
+) -> i32 {
+    ffi_guard(|| {
+        // SAFETY: 由调用方契约保证帧指针有效。
+        let frame = unsafe { input_bytes(frame, frame_len)? };
+        // SAFETY: 调用方保证句柄来自 `shio_open` 且未 destroy。
+        let handle =
+            unsafe { handle.as_ref() }.ok_or(Error::InvalidArgument("kernel handle is null"))?;
+        handle.kernel()?.sync()?.apply_offers(frame)
+    })
+}
+
+/// 快照起点。
+///
+/// # Safety
+///
+/// 句柄与输出指针必须按 `include/shio.h` 的契约有效。
+#[no_mangle]
+pub unsafe extern "C" fn shio_sync_snapshot_start(
+    handle: *mut ShioKernel,
+    out_at_seq: *mut u64,
+) -> i32 {
+    ffi_guard(|| {
+        if out_at_seq.is_null() {
+            return Err(Error::InvalidArgument("snapshot sequence output is null"));
+        }
+        // SAFETY: 调用方提供了可写指针。
+        unsafe { *out_at_seq = 0 };
+        // SAFETY: 调用方保证句柄来自 `shio_open` 且未 destroy。
+        let handle =
+            unsafe { handle.as_ref() }.ok_or(Error::InvalidArgument("kernel handle is null"))?;
+        let at_seq = handle.kernel()?.sync()?.snapshot_start()?;
+        // SAFETY: 调用方提供了可写指针。
+        unsafe { *out_at_seq = at_seq };
+        Ok(())
+    })
+}
+
+/// 读取一页快照并编码为 SHY2 帧。
+///
+/// # Safety
+///
+/// 句柄、可选 after、输出帧、可选游标与 done 指针必须按 `include/shio.h` 有效。
+#[no_mangle]
+pub unsafe extern "C" fn shio_sync_snapshot_page(
+    handle: *mut ShioKernel,
+    after: *const u8,
+    after_len: usize,
+    limit: usize,
+    out_frame: *mut *mut u8,
+    out_frame_len: *mut usize,
+    out_next: *mut *mut u8,
+    out_next_len: *mut usize,
+    out_done: *mut u8,
+) -> i32 {
+    ffi_guard(|| {
+        reset_output(out_frame, out_frame_len)?;
+        set_optional_output(Vec::new(), out_next, out_next_len)?;
+        if !out_done.is_null() {
+            // SAFETY: 调用方提供了可写指针。
+            unsafe { *out_done = 0 };
+        }
+
+        // SAFETY: 由调用方契约保证可选 after 指针有效。
+        let after = if after_len == 0 {
+            None
+        } else {
+            Some(unsafe { input_bytes(after, after_len)? })
+        };
+        // SAFETY: 调用方保证句柄来自 `shio_open` 且未 destroy。
+        let handle =
+            unsafe { handle.as_ref() }.ok_or(Error::InvalidArgument("kernel handle is null"))?;
+        let sync = handle.kernel()?.sync()?;
+        let page = sync.snapshot_page(after, sync_limit(limit))?;
+        let done = page.next_key.is_none();
+        let frame = sync.encode_snapshot(&page)?;
+        let next = page.next_key.unwrap_or_default();
+
+        if !out_done.is_null() {
+            // SAFETY: 调用方提供了可写指针。
+            unsafe { *out_done = u8::from(done) };
+        }
+        set_optional_output(next, out_next, out_next_len)?;
+        set_output(frame, out_frame, out_frame_len)
+    })
+}
+
+/// 应用快照帧。
+///
+/// # Safety
+///
+/// 句柄、帧与输出指针必须按 `include/shio.h` 的契约有效。
+#[no_mangle]
+pub unsafe extern "C" fn shio_sync_apply_snapshot(
+    handle: *mut ShioKernel,
+    frame: *const u8,
+    frame_len: usize,
+    out_report_json: *mut *mut u8,
+    out_report_len: *mut usize,
+) -> i32 {
+    ffi_guard(|| {
+        reset_output(out_report_json, out_report_len)?;
+        // SAFETY: 由调用方契约保证帧指针有效。
+        let frame = unsafe { input_bytes(frame, frame_len)? };
+        // SAFETY: 调用方保证句柄来自 `shio_open` 且未 destroy。
+        let handle =
+            unsafe { handle.as_ref() }.ok_or(Error::InvalidArgument("kernel handle is null"))?;
+        let report = handle.kernel()?.sync()?.apply_snapshot_frame(frame)?;
+        set_output(
+            value_to_bytes(&apply_report_value(&report))?,
+            out_report_json,
+            out_report_len,
+        )
+    })
+}
+
+/// 发起轮换。
+///
+/// # Safety
+///
+/// 句柄与输出指针必须按 `include/shio.h` 的契约有效。
+#[no_mangle]
+pub unsafe extern "C" fn shio_sync_begin_rotation(
+    handle: *mut ShioKernel,
+    out_json: *mut *mut u8,
+    out_json_len: *mut usize,
+) -> i32 {
+    ffi_guard(|| {
+        reset_output(out_json, out_json_len)?;
+        // SAFETY: 调用方保证句柄来自 `shio_open` 且未 destroy。
+        let handle =
+            unsafe { handle.as_ref() }.ok_or(Error::InvalidArgument("kernel handle is null"))?;
+        let info = handle.kernel()?.sync()?.begin_rotation()?;
+        set_output(
+            value_to_bytes(&rotation_info_value(&info))?,
+            out_json,
+            out_json_len,
+        )
+    })
+}
+
+/// 当前轮换状态；没有时返回 JSON null。
+///
+/// # Safety
+///
+/// 句柄与输出指针必须按 `include/shio.h` 的契约有效。
+#[no_mangle]
+pub unsafe extern "C" fn shio_sync_rotation_state(
+    handle: *mut ShioKernel,
+    out_json: *mut *mut u8,
+    out_json_len: *mut usize,
+) -> i32 {
+    ffi_guard(|| {
+        reset_output(out_json, out_json_len)?;
+        // SAFETY: 调用方保证句柄来自 `shio_open` 且未 destroy。
+        let handle =
+            unsafe { handle.as_ref() }.ok_or(Error::InvalidArgument("kernel handle is null"))?;
+        let state = handle.kernel()?.sync()?.rotation_state()?;
+        let value = match state {
+            Some(info) => rotation_info_value(&info),
+            None => Value::Null,
+        };
+        set_output(value_to_bytes(&value)?, out_json, out_json_len)
+    })
+}
+
+/// 显式 ack 轮换目标 key。
+///
+/// # Safety
+///
+/// 句柄与 16 字节 key ID 必须按 `include/shio.h` 的契约有效。
+#[no_mangle]
+pub unsafe extern "C" fn shio_sync_ack_rotation(handle: *mut ShioKernel, to: *const u8) -> i32 {
+    ffi_guard(|| {
+        let to = input_key_id(to)?;
+        // SAFETY: 调用方保证句柄来自 `shio_open` 且未 destroy。
+        let handle =
+            unsafe { handle.as_ref() }.ok_or(Error::InvalidArgument("kernel handle is null"))?;
+        handle.kernel()?.sync()?.acknowledge_rotation(to)
+    })
+}
+
+/// 把全部记录迁移到目标 key。
+///
+/// # Safety
+///
+/// 句柄、16 字节 key ID 与可选输出指针必须按 `include/shio.h` 的契约有效。
+#[no_mangle]
+pub unsafe extern "C" fn shio_sync_migrate_all(
+    handle: *mut ShioKernel,
+    to: *const u8,
+    out_count: *mut u64,
+) -> i32 {
+    ffi_guard(|| {
+        let to = input_key_id(to)?;
+        if !out_count.is_null() {
+            // SAFETY: 调用方提供了可写指针。
+            unsafe { *out_count = 0 };
+        }
+        // SAFETY: 调用方保证句柄来自 `shio_open` 且未 destroy。
+        let handle =
+            unsafe { handle.as_ref() }.ok_or(Error::InvalidArgument("kernel handle is null"))?;
+        let count = handle.kernel()?.sync()?.migrate_all(to)?;
+        if !out_count.is_null() {
+            // SAFETY: 调用方提供了可写指针。
+            unsafe { *out_count = count };
+        }
+        Ok(())
+    })
+}
+
+/// 退役旧 key。
+///
+/// # Safety
+///
+/// 句柄与 16 字节 key ID 必须按 `include/shio.h` 的契约有效。
+#[no_mangle]
+pub unsafe extern "C" fn shio_sync_retire(handle: *mut ShioKernel, from: *const u8) -> i32 {
+    ffi_guard(|| {
+        let from = input_key_id(from)?;
+        // SAFETY: 调用方保证句柄来自 `shio_open` 且未 destroy。
+        let handle =
+            unsafe { handle.as_ref() }.ok_or(Error::InvalidArgument("kernel handle is null"))?;
+        handle.kernel()?.sync()?.retire(from)
+    })
+}
+
+/// 清理目标 key 的过期 offer。
+///
+/// # Safety
+///
+/// 句柄与 16 字节 key ID 必须按 `include/shio.h` 的契约有效。
+#[no_mangle]
+pub unsafe extern "C" fn shio_sync_prune_offers(handle: *mut ShioKernel, to: *const u8) -> i32 {
+    ffi_guard(|| {
+        let to = input_key_id(to)?;
+        // SAFETY: 调用方保证句柄来自 `shio_open` 且未 destroy。
+        let handle =
+            unsafe { handle.as_ref() }.ok_or(Error::InvalidArgument("kernel handle is null"))?;
+        handle.kernel()?.sync()?.prune_offers(to)
+    })
+}
+
+/// 压缩变更日志。
+///
+/// # Safety
+///
+/// 句柄与可选输出指针必须按 `include/shio.h` 的契约有效。
+#[no_mangle]
+pub unsafe extern "C" fn shio_sync_compact(
+    handle: *mut ShioKernel,
+    before: u64,
+    out_count: *mut u64,
+) -> i32 {
+    ffi_guard(|| {
+        if !out_count.is_null() {
+            // SAFETY: 调用方提供了可写指针。
+            unsafe { *out_count = 0 };
+        }
+        // SAFETY: 调用方保证句柄来自 `shio_open` 且未 destroy。
+        let handle =
+            unsafe { handle.as_ref() }.ok_or(Error::InvalidArgument("kernel handle is null"))?;
+        let count = handle.kernel()?.sync()?.compact(before)?;
+        if !out_count.is_null() {
+            // SAFETY: 调用方提供了可写指针。
+            unsafe { *out_count = count };
+        }
+        Ok(())
+    })
+}
+
+/// 生成配对包。
+///
+/// # Safety
+///
+/// 句柄与输出指针必须按 `include/shio.h` 的契约有效。
+#[no_mangle]
+pub unsafe extern "C" fn shio_sync_create_pairing(
+    handle: *mut ShioKernel,
+    ttl_seconds: u64,
+    out_frame: *mut *mut u8,
+    out_frame_len: *mut usize,
+    out_json: *mut *mut u8,
+    out_json_len: *mut usize,
+) -> i32 {
+    ffi_guard(|| {
+        reset_output(out_frame, out_frame_len)?;
+        reset_output(out_json, out_json_len)?;
+        let ttl = if ttl_seconds == 0 {
+            DEFAULT_PAIRING_TTL_SECONDS
+        } else {
+            ttl_seconds
+        };
+        // SAFETY: 调用方保证句柄来自 `shio_open` 且未 destroy。
+        let handle =
+            unsafe { handle.as_ref() }.ok_or(Error::InvalidArgument("kernel handle is null"))?;
+        let kernel = handle.kernel()?;
+        let offer = handle.block_on(kernel.create_pairing_offer(Duration::from_secs(ttl)))?;
+        let PairingOffer {
+            frame,
+            mut secret,
+            fingerprint,
+        } = offer;
+        // secret 只含 Crockford Base32 字符，直接拼接 JSON 可避免在 Value 中留下副本。
+        let metadata = Zeroizing::new(format!(
+            "{{\"secret\":\"{secret}\",\"fingerprint\":\"{fingerprint}\"}}"
+        ));
+        secret.zeroize();
+        set_output(frame, out_frame, out_frame_len)?;
+        set_output(metadata.as_bytes().to_vec(), out_json, out_json_len)
+    })
+}
+
+/// 用配对包创建新库。
+///
+/// # Safety
+///
+/// 字符串、口令、options、帧、secret 与输出句柄必须按 `include/shio.h` 有效。
+#[no_mangle]
+pub unsafe extern "C" fn shio_open_with_pairing(
+    path: *const c_char,
+    password: *const u8,
+    password_len: usize,
+    options_json: *const u8,
+    options_len: usize,
+    frame: *const u8,
+    frame_len: usize,
+    secret: *const u8,
+    secret_len: usize,
+    out_handle: *mut *mut ShioKernel,
+) -> i32 {
+    ffi_guard(|| {
+        if out_handle.is_null() {
+            return Err(Error::InvalidArgument("output handle is null"));
+        }
+        // SAFETY: 调用方提供了非空输出指针。
+        unsafe { *out_handle = ptr::null_mut() };
+
+        // SAFETY: 由调用方契约保证输入有效。
+        let path = unsafe { input_str(path)? };
+        let password = input_password(password, password_len)?;
+        // SAFETY: 由调用方契约保证 options 指针有效。
+        let options_bytes = unsafe { input_bytes(options_json, options_len)? };
+        let options = parse_open_options(path, options_bytes)?;
+        // SAFETY: 由调用方契约保证帧与 secret 指针有效。
+        let frame = unsafe { input_bytes(frame, frame_len)? };
+        let secret = Zeroizing::new(input_password(secret, secret_len)?);
+        let offer = PairingOffer {
+            frame: frame.to_vec(),
+            secret: String::new(),
+            fingerprint: shio::pairing_fingerprint(frame),
+        };
+
+        let runtime = new_runtime()?;
+        let kernel = runtime.block_on(shio::open_with_pairing(
+            options,
+            Credential::password(password),
+            &offer,
+            secret,
+        ))?;
+        let boxed = Box::new(ShioKernel {
+            runtime,
+            kernel: Mutex::new(Some(kernel)),
+        });
+        // SAFETY: 调用方提供了非空输出指针。
+        unsafe { *out_handle = Box::into_raw(boxed) };
+        Ok(())
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -836,5 +1440,19 @@ mod tests {
     #[test]
     fn abi_version_is_positive() {
         assert!(shio_abi_version() > 0);
+    }
+
+    #[test]
+    fn sync_json_helpers_are_stable() {
+        assert_eq!(hex(&[0xab, 0xcd]), "abcd");
+        let report = ApplyReport {
+            applied: 1,
+            skipped: 2,
+            controls: 3,
+        };
+        let value = apply_report_value(&report);
+        assert_eq!(value["applied"], 1);
+        assert_eq!(value["skipped"], 2);
+        assert_eq!(value["controls"], 3);
     }
 }

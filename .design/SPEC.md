@@ -15,7 +15,7 @@
 ## 目标
 - 可嵌入的加密持久化内核：命名空间 → 集合 → 记录，单文件 redb，记录级 AEAD。
 - 内核同步、facade async；两者禁止 unsafe，可恢复失败一律以 `Result` 返回。
-- 当前形态：core 与 facade 均已可用——Argon2id/HKDF/AEAD、redb 表、同步 CRUD、异步句柄、改口令、数据密钥轮换、真正的只读打开；多端同步（format 2、设备配对、变更日志、快照、轮换）已可用；C ABI v1 已可用，覆盖 open/close、CRUD、batch、改口令、轮换、stats 与 flush。
+- 当前形态：core 与 facade 均已可用——Argon2id/HKDF/AEAD、redb 表、同步 CRUD、异步句柄、改口令、数据密钥轮换、真正的只读打开；多端同步（format 2、设备配对、变更日志、快照、轮换）已可用；C ABI v1 已可用，覆盖 open/close、CRUD、batch、改口令、轮换、stats、flush 与 P4 同步/配对面。
 - 记录格式 `format=1` 从首个实现起保持向后兼容；同步库使用不可回退的 `format=2`；API 在 1.0 前允许调整。
 
 ## 约束
@@ -151,14 +151,14 @@ DK ──HKDF-SHA256(info 区分用途)──▶ 记录密钥 / 元数据密钥 
 - facade 不把 panic 带过线程边界：`spawn_blocking` 的 `JoinError` 统一转为 `Internal`；句柄状态锁与密钥会话锁中毒同样返回 `Internal`。
 - 关闭语义：取引擎时登记在途计数，`close` 置空引擎并等待计数归零；已开始的操作持有 `Arc<Engine>` 完成，之后数据库才释放文件锁。
 - FFI 边界用 `catch_unwind` 把 panic 转为 `SHIO_INTERNAL`，绝不让 panic 跨 C ABI 传播；错误详情线程局部，返回缓冲区由 `shio_free` 释放并清零。
-- 测试覆盖截断值、随机字节、错误口令、并发关闭与磁盘只读；关键编解码做 fuzz/property 测试。当前已覆盖错误口令、截断/篡改的 blob 与记录、分页、批量回滚、句柄关闭、只读拒写、改口令、全量轮换与轮换中断后重跑，以及同步升级、双端 LWW/墓碑、快照/压缩、轮换/ack/退役、配对密钥链、帧截断/超限/`db_id` 不匹配。
+- 测试覆盖截断值、随机字节、错误口令、并发关闭与磁盘只读；关键编解码做 fuzz/property 测试。当前已覆盖错误口令、截断/篡改的 blob 与记录、分页、批量回滚、句柄关闭、只读拒写、改口令、全量轮换与轮换中断后重跑，以及同步升级、双端 LWW/墓碑、快照/压缩、轮换/ack/退役、配对密钥链、帧截断/超限/`db_id` 不匹配；Android x86_64 C ABI 覆盖双库同步、只读并发锁与轮换中断续跑。
 - 静态护栏：workspace lints 拒绝 `unsafe`、`unwrap` / `expect` / `panic!` 与未实现的占位宏，新增 crate 默认继承。
 - 编解码用例必须覆盖损坏输入：魔数不符、未知格式版本、`key_id` 越界、截断、`ct_len` 与总长不符、尾随字节。
 
 ## 平台与互操作
 - **Rust 应用**：直接依赖 `shio`。
 - **C++/Vulkan GUI 与 Android**：经 `shio-ffi` 的 C ABI 调用；句柄不透明，字节串带长度，错误用显式错误码 + 线程局部错误详情。JNI/Kotlin 包装层由 `shio-android` 维护，内核不绑定 Java 包名。
-- **Android**：数据库放应用私有目录；不依赖系统钥匙串，口令解锁因此在无头/服务环境同样可用。首版目标为 `aarch64-linux-android` 真机与 `x86_64-linux-android` 模拟器，minSdk 24，NDK r29；`libshio_ffi.so` 的 `LOAD` 对齐为 16 KB，`.note.android.ident` 为 API 24。x86_64 模拟器已通过 C ABI 冒烟：CRUD、batch、关闭/重开、改口令、轮换、只读、同进程与跨进程文件锁、杀进程后重开。redb 4.4 的字节范围锁在 Android 上返回 `Unsupported`，facade 因此在该平台使用旁路 `<db>.lock` 文件与 `rustix::fs::flock`：写句柄独占、只读句柄共享；冲突映射为 `Locked`。aarch64 真机加载、JNI 联调、轮换中断续跑与低端机 KDF 实测仍待补。
+- **Android**：数据库放应用私有目录；不依赖系统钥匙串，口令解锁因此在无头/服务环境同样可用。应用 minSdk 为 29；首版目标为 `aarch64-linux-android` 真机与 `x86_64-linux-android` 模拟器，NDK r29。内核 `libshio_ffi.so` 仍按 API 24 构建基线链接，`.note.android.ident` 为 API 24，可在 minSdk 29 上加载；`LOAD` 对齐为 16 KB。x86_64 模拟器已通过 C ABI 冒烟：CRUD、batch、关闭/重开、改口令、轮换、只读、同进程与跨进程文件锁、杀进程后重开、双库同步/配对/快照、轮换中断续跑与独立进程只读；`oxygen` 已在 vivo V2359A（arm64 / Android 16）完成 JNI、APK 打包与杀进程重开验收。redb 4.4 的字节范围锁在 Android 上返回 `Unsupported`，facade 因此在该平台使用旁路 `<db>.lock` 文件与 `rustix::fs::flock`：写句柄独占、只读句柄共享；冲突映射为 `Locked`。默认 KDF 保持 `64 MiB、t=3`，低端机不纳入首版验证（决策 #41）。
 - **服务端**：同一存储格式，仅改变打开路径、并发部署与备份策略，不引入第二套内核。
 - **稳定性与 unsafe**：内核的首要要求是不出现未定义行为、不因内部错误崩溃。`shio-core` / `shio` / `shio-sync` 保持 `forbid(unsafe_code)`；`shio-ffi` 的 unsafe 已经用户明确批准，仅限 C ABI 边界模块，逐条以 SAFETY 注释审计。C ABI v1 已实现并通过 host 冒烟、Android 两 target 编译。
 - 未来插件系统通过“每插件独立命名空间 + 能力白名单”接入，不改变存储格式；本次只预留命名空间隔离。
@@ -182,7 +182,6 @@ DK ──HKDF-SHA256(info 区分用途)──▶ 记录密钥 / 元数据密钥 
 - 全文检索、二级索引、压缩
 - GUI/渲染、剪贴板监听、Markdown 渲染等应用功能
 - 多写进程
-- FFI 的 sync/pairing 面（v1 不包含，按 Android 首版需求另行设计）
 
 ## 影响与兼容性
 - format 1 的 AAD 与 blob 布局不变；不启用同步的已有数据库无需迁移。
@@ -202,6 +201,6 @@ DK ──HKDF-SHA256(info 区分用途)──▶ 记录密钥 / 元数据密钥 
 - `cargo test -p shio --features sync` 额外跑 facade 的配对/同步端到端用例。
 - 引擎端到端使用 `tempfile` 与 8 MiB 的 Argon2id 参数，含 300 条记录的跨批轮换与「篡改记录 → 轮换中断 → 还原 → 续跑」；facade 端到端用默认参数（64 MiB、t=3）。
 - 版本查询断言常量与 `CARGO_PKG_VERSION` 一致，且不依赖打开数据库。
-- Android 类型检查：`cargo check -p shio-core -p shio -p shio-ffi --target aarch64-linux-android` 与 `x86_64-linux-android`；链接 `.so` 时把 `CARGO_TARGET_<TARGET>_LINKER` 指向 NDK r29 的 `<triple>24-clang.cmd`，并设置 `RUSTFLAGS="-C link-arg=--target=<triple>24"`。
+- Android 类型检查：`cargo check -p shio-core -p shio -p shio-ffi --target aarch64-linux-android` 与 `x86_64-linux-android`；链接 `.so` 时把 `CARGO_TARGET_<TARGET>_LINKER` 指向 NDK r29 的 `<triple>24-clang.cmd`，并设置 `RUSTFLAGS="-C link-arg=--target=<triple>24"`（内核 `.so` 的 API 24 构建基线；应用 minSdk 为 29）。
 - `cargo clippy --workspace --all-targets -- -D warnings`、`cargo clippy -p shio --features sync --all-targets -- -D warnings` 与 `cargo fmt --all -- --check` 是合并前的必过项。
 - 依赖版本由 `Cargo.lock` 锁定并随仓库提交；升级依赖需重新跑上述三项检查。

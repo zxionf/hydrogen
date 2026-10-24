@@ -28,6 +28,8 @@ pub use shio_core::model::{
 };
 pub use shio_core::store::Stats;
 #[cfg(feature = "sync")]
+pub use shio_core::sync::pairing_fingerprint;
+#[cfg(feature = "sync")]
 pub use shio_core::{DeviceId, KeyId};
 #[cfg(feature = "sync")]
 pub use shio_sync::{

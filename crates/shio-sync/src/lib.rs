@@ -113,6 +113,16 @@ impl<'a> Sync<'a> {
         Ok(SnapshotIter::borrowed(self.engine, at_seq))
     }
 
+    /// 快照起点；用于无状态分页。
+    pub fn snapshot_start(&self) -> Result<u64> {
+        self.engine.snapshot_start()
+    }
+
+    /// 无状态读取一页快照；`after` 为上一页返回的不透明游标。
+    pub fn snapshot_page(&self, after: Option<&[u8]>, limit: usize) -> Result<SnapshotPage> {
+        self.engine.snapshot_page(after, limit)
+    }
+
     pub fn encode_snapshot(&self, page: &SnapshotPage) -> Result<Vec<u8>> {
         let info = self.info()?;
         frame::encode_snapshot(info.db_id, page)
@@ -138,6 +148,16 @@ impl<'a> Sync<'a> {
 
     pub fn rotation_offers(&self) -> Result<Vec<RotationOffer>> {
         self.engine.rotation_offers()
+    }
+
+    /// 当前轮换状态；没有进行中的轮换时返回 `None`。
+    pub fn rotation_state(&self) -> Result<Option<RotationInfo>> {
+        self.engine.rotation_state()
+    }
+
+    /// 显式确认某个轮换目标 key；安装 offer 时通常已自动 ack。
+    pub fn acknowledge_rotation(&self, to: KeyId) -> Result<()> {
+        self.engine.acknowledge_rotation(to)
     }
 
     pub fn migrate_all(&self, to: KeyId) -> Result<u64> {
@@ -310,6 +330,16 @@ impl SyncHandle {
         Ok(SnapshotIter::owned(self.engine.clone(), at_seq))
     }
 
+    /// 快照起点；用于无状态分页。
+    pub fn snapshot_start(&self) -> Result<u64> {
+        self.engine.snapshot_start()
+    }
+
+    /// 无状态读取一页快照；`after` 为上一页返回的不透明游标。
+    pub fn snapshot_page(&self, after: Option<&[u8]>, limit: usize) -> Result<SnapshotPage> {
+        self.engine.snapshot_page(after, limit)
+    }
+
     pub fn encode_snapshot(&self, page: &SnapshotPage) -> Result<Vec<u8>> {
         self.sync().encode_snapshot(page)
     }
@@ -328,6 +358,16 @@ impl SyncHandle {
 
     pub fn begin_rotation(&self) -> Result<RotationInfo> {
         self.sync().begin_rotation()
+    }
+
+    /// 当前轮换状态；没有进行中的轮换时返回 `None`。
+    pub fn rotation_state(&self) -> Result<Option<RotationInfo>> {
+        self.engine.rotation_state()
+    }
+
+    /// 显式确认某个轮换目标 key；安装 offer 时通常已自动 ack。
+    pub fn acknowledge_rotation(&self, to: KeyId) -> Result<()> {
+        self.engine.acknowledge_rotation(to)
     }
 
     pub fn rotation_offers(&self) -> Result<Vec<RotationOffer>> {

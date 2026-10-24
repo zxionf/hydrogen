@@ -1259,33 +1259,33 @@ impl Engine {
             return Err(Error::RotationRequired { key_id: to });
         }
         let txn = self.handle.begin_write()?;
-        {
-            let table = txn.open_table(sync_state::TABLE)?;
-            if table.get(sync_state::rotation(to).as_slice())?.is_none() {
-                return Err(Error::NotFound);
-            }
-        }
         let ack_key = sync_state::ack(to, state.device);
-        let already = {
+        let (already_acked, offered) = {
             let table = txn.open_table(sync_state::TABLE)?;
-            let value = table.get(ack_key.as_slice())?.is_some();
-            value
+            let already_acked = table.get(ack_key.as_slice())?.is_some();
+            let offered = table.get(sync_state::rotation(to).as_slice())?.is_some();
+            (already_acked, offered)
         };
-        if !already {
-            {
-                let mut table = txn.open_table(sync_state::TABLE)?;
-                table.insert(ack_key.as_slice(), [1u8].as_slice())?;
-            }
-            append_change(
-                &txn,
-                state.device,
-                &ChangeEntry::RotationAck {
-                    to,
-                    device: state.device,
-                    at: Timestamp::now(),
-                },
-            )?;
+        // 接收方安装 offer 时已经自动 ack，此时没有本地 rotation 行；重复调用应幂等。
+        if already_acked {
+            return Ok(());
         }
+        if !offered {
+            return Err(Error::NotFound);
+        }
+        {
+            let mut table = txn.open_table(sync_state::TABLE)?;
+            table.insert(ack_key.as_slice(), [1u8].as_slice())?;
+        }
+        append_change(
+            &txn,
+            state.device,
+            &ChangeEntry::RotationAck {
+                to,
+                device: state.device,
+                at: Timestamp::now(),
+            },
+        )?;
         txn.commit()?;
         Ok(())
     }

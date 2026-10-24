@@ -182,6 +182,133 @@ int32_t shio_stats(shio_kernel *handle,
                    uint8_t **out_json,
                    size_t *out_json_len);
 
+/* ---- P4 同步扩展；以下函数均为阻塞调用 ---- */
+
+/*
+ * 启用同步；device_id 为 NULL 时生成随机设备 ID。
+ * 返回 sync_info JSON；首次真实建库应紧接着调用并检查结果。
+ */
+int32_t shio_sync_enable(shio_kernel *handle,
+                         const uint8_t *device_id,
+                         uint8_t **out_json,
+                         size_t *out_json_len);
+
+/* 同步摘要 JSON；未启用同步返回 SHIO_SYNC_DISABLED。 */
+int32_t shio_sync_info(shio_kernel *handle,
+                       uint8_t **out_json,
+                       size_t *out_json_len);
+
+/*
+ * 读取 after 之后的变更页，返回 SHY2 帧。
+ * after=0 表示从头；limit=0 使用默认 100，最大 1000。
+ * out_next 为下一页游标，out_has_more 表示是否还有更多；两者可为 NULL。
+ */
+int32_t shio_sync_changes(shio_kernel *handle,
+                          uint64_t after,
+                          size_t limit,
+                          uint8_t **out_frame,
+                          size_t *out_frame_len,
+                          uint64_t *out_next,
+                          uint8_t *out_has_more);
+
+/* 应用变更帧；返回 {"applied":N,"skipped":N,"controls":N}。 */
+int32_t shio_sync_apply(shio_kernel *handle,
+                        const uint8_t *frame,
+                        size_t frame_len,
+                        uint8_t **out_report_json,
+                        size_t *out_report_len);
+
+/* 本机待发送的轮换 offer 帧。 */
+int32_t shio_sync_offers(shio_kernel *handle,
+                         uint8_t **out_frame,
+                         size_t *out_frame_len);
+
+/* 应用对端的 offer 帧；成功后本机安装新 key 并自动 ack。 */
+int32_t shio_sync_apply_offers(shio_kernel *handle,
+                               const uint8_t *frame,
+                               size_t frame_len);
+
+/* 快照起点；用于日志已压缩时的重同步。 */
+int32_t shio_sync_snapshot_start(shio_kernel *handle, uint64_t *out_at_seq);
+
+/*
+ * 读取一页快照并编码为 SHY2 帧。
+ * after=NULL/0 表示第一页；out_next 是下一页的不透明游标；out_done=1 表示结束。
+ * limit=0 使用默认 100，最大 1000。
+ */
+int32_t shio_sync_snapshot_page(shio_kernel *handle,
+                                const uint8_t *after,
+                                size_t after_len,
+                                size_t limit,
+                                uint8_t **out_frame,
+                                size_t *out_frame_len,
+                                uint8_t **out_next,
+                                size_t *out_next_len,
+                                uint8_t *out_done);
+
+/* 应用快照帧；返回 {"applied":N,"skipped":N,"controls":N}。 */
+int32_t shio_sync_apply_snapshot(shio_kernel *handle,
+                                 const uint8_t *frame,
+                                 size_t frame_len,
+                                 uint8_t **out_report_json,
+                                 size_t *out_report_len);
+
+/* 本机发起轮换；返回 rotation_info JSON。 */
+int32_t shio_sync_begin_rotation(shio_kernel *handle,
+                                 uint8_t **out_json,
+                                 size_t *out_json_len);
+
+/* 当前轮换状态；没有进行中的轮换时返回 JSON null。 */
+int32_t shio_sync_rotation_state(shio_kernel *handle,
+                                 uint8_t **out_json,
+                                 size_t *out_json_len);
+
+/* 显式 ack 某个轮换目标 key。 */
+int32_t shio_sync_ack_rotation(shio_kernel *handle, const uint8_t *to);
+
+/* 把全部记录迁移到 to key；out_count 可为 NULL。 */
+int32_t shio_sync_migrate_all(shio_kernel *handle,
+                              const uint8_t *to,
+                              uint64_t *out_count);
+
+/* 退役 from key。 */
+int32_t shio_sync_retire(shio_kernel *handle, const uint8_t *from);
+
+/* 清理 to key 的过期 offer。 */
+int32_t shio_sync_prune_offers(shio_kernel *handle, const uint8_t *to);
+
+/* 压缩 before 之前的变更日志；out_count 可为 NULL。 */
+int32_t shio_sync_compact(shio_kernel *handle,
+                          uint64_t before,
+                          uint64_t *out_count);
+
+/*
+ * 生成配对包；ttl_seconds 仅用于调用方展示/过期控制，0 使用 600 秒；
+ * 接收端固定按 10 分钟窗口校验 created_at。
+ * out_frame 为 SHW2 外层帧，out_json 为 {"secret":"...","fingerprint":"..."}。
+ */
+int32_t shio_sync_create_pairing(shio_kernel *handle,
+                                 uint64_t ttl_seconds,
+                                 uint8_t **out_frame,
+                                 size_t *out_frame_len,
+                                 uint8_t **out_json,
+                                 size_t *out_json_len);
+
+/*
+ * 用配对包创建新库；目标必须不存在或为空。
+ * options_json 与 shio_open 相同；secret 为 Base32 文本字节。
+ */
+int32_t shio_open_with_pairing(const char *path,
+                               const uint8_t *password,
+                               size_t password_len,
+                               const uint8_t *options_json,
+                               size_t options_len,
+                               const uint8_t *frame,
+                               size_t frame_len,
+                               const uint8_t *secret,
+                               size_t secret_len,
+                               shio_kernel **out_handle);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif

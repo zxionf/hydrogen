@@ -189,3 +189,23 @@ Change: 20261022-android-kernel
 Context: redb 4.4 的字节范围锁在 Android 上返回 Unsupported，跨进程冒烟中第二写者可以直接打开同一数据库；Android 不能依赖 redb 自带的单写保护
 Decision: Android 上由 facade 在数据库旁创建 `<db>.lock`，用 rustix::fs::flock 非阻塞加锁：写句柄独占、只读句柄共享；冲突映射为 Locked；锁持有到 close 且在途操作归零后释放，不主动删除锁文件
 Consequences: Android 同进程与跨进程第二写者都会被拒绝；多一个可重建的旁路文件，备份与清理需避免在持有期间删除；非 Android 平台继续使用 redb 文件锁
+## [39] 2026-10-24 12:19:29 UTC
+Change: 20261022-android-kernel
+Context: oxygen 已按固定提交 50e073b 完成 JNI 薄层、APK 打包、arm64 真机与 x86_64 模拟器验收；应用侧 minSdk 已确定为 29，而 hydrogen 的文档、任务与旧决策仍写 24。内核 .so 继续按 API 24 链接，产物元数据与应用 minSdk 不一致但可在 Android 29+ 正常加载。
+Decision: 应用 minSdk 锁定 29；hydrogen 的文档与任务统一按 29 回填，内核 .so 保留 API 24 构建基线，除非后续需要 API 29 特性再重建。oxygen 的真机/JNI/打包验收结果可作为 hydrogen P0、P2、P3 对应项的回填依据。
+Consequences: 跨仓库的 minSdk 约束一致；.note.android.ident 为 API 24 只表示内核构建基线，不表示应用最低版本；低端机 KDF、轮换中断续跑与独立进程只读仍需在 hydrogen 侧补验。
+## [40] 2026-10-24 12:36:56 UTC
+Change: 20261022-android-kernel
+Context: Android 首版需要多端同步；同步库使用 format=2 且升级不可回退；oxygen 目前仍是 FakeVaultStore，没有真实 vault.db，首次建库前必须确定格式。
+Decision: Android 首版启用多端同步。首次真实 vault.db 必须先调用 sync_enable 完成 format=2 初始化，再写入业务记录；不采用先建 format=1、之后按需升级的默认路径。
+Consequences: oxygen 的 M12 首次建库必须在创建后立即 enable_sync 并校验 sync_info；旧二进制会拒绝打开该库；备份、迁移和验收都按 format=2 处理。
+## [41] 2026-10-24 12:37:01 UTC
+Change: 20261022-android-kernel
+Context: 默认 Argon2id 参数为 64 MiB、t=3；用户在目标手机上确认可接受，低端机不再作为首版验证目标。
+Decision: 保持默认 KDF 参数不变；取消低端机 KDF 实测与参数优化，P3 不再以低端机性能作为阻塞项。
+Consequences: 内核不新增 KDF 选项或迁移路径；oxygen 建库直接使用默认参数；后续若出现性能问题再单独开变更。
+## [42] 2026-10-24 12:37:08 UTC
+Change: 20261022-android-kernel
+Context: P4 需要把已有 shio-sync 的变更页、offer、快照和配对能力暴露给 Android；Kotlin 不应解析 Rust 内部结构，同步帧已经是自校验的 SHY2 字节。
+Decision: C ABI v1 增量追加同步面：sync_enable/info/changes/apply、offers/apply_offers、snapshot_start/page/apply_snapshot、rotation/ack/migrate/retire/prune/compact、pairing_create/open_with_pairing。业务帧用不透明二进制，状态与报告用 JSON。只新增符号，不改变现有签名或语义，因此 ABI 版本保持 1；未来破坏性变更再升 2。
+Consequences: shio.h 与 shio-ffi 同步扩展；Kotlin 只处理帧字节和 JSON 控制面；网络/TLS、二维码、重试与后台调度仍归 oxygen，不进入内核。

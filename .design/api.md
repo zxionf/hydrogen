@@ -65,7 +65,7 @@ impl OpenOptions {
 }
 ```
 
-`read_only=true` 时所有写操作返回 `Error::ReadOnly`，且仍需口令解密；同时指定 `create=true` 返回 `Error::InvalidArgument`。
+`read_only=true` 时所有写操作返回 `Error::ReadOnly`，且仍需口令解密；同时指定 `create=true` 返回 `Error::InvalidArgument`。若上次进程异常退出、redb 要求修复，只读打开会返回 `Database` 错误；应先以写句柄打开一次完成修复，再使用只读句柄。
 
 ### 4.2 `Credential`
 
@@ -107,14 +107,14 @@ impl Kernel {
 
 pub struct Stats {
     pub format_version: u16,
-    pub key_id: u16,
+    pub key_id: KeyId,
     pub db_bytes: u64,
 }
 ```
 
 `Kernel` 为 `Clone + Send + Sync + 'static`。`flush` 在默认持久化模式下是屏障语义；redb 每次提交即持久化，不依赖进程退出。
 
-`Stats.key_id` 当前是 `format=1` 的 u16。同步库进入 `format=2` 后，计划改为 16 字节 `KeyId`（见第 12 节），这是 1.0 前允许的破坏性调整。
+`Stats.key_id` 在 `format=1` 下是 `KeyId::from_u16` 的映射，在 `format=2` 下是 16 字节随机值（见第 12 节）。
 
 ### 4.4 `Namespace`
 
@@ -332,7 +332,7 @@ pub enum NameKind { Namespace, Collection }
 - 可恢复错误不 panic；只有违反类型不变式（如内部状态机损坏）才允许 `debug_assert` 后返回 `Internal`。
 - 所有来自落盘字节的输入先做长度/边界校验；失败返回 `Corrupted` 或 `Deserialize`，绝不 panic、越界或 abort。
 
-## 8. C ABI 映射（v1，已实现）
+## 8. C ABI 映射（v1 + P4 同步扩展）
 
 C++ 与 Android 通过 `shio-ffi` 调用；契约头文件为 `crates/shio-ffi/include/shio.h`。用户已批准 `shio-ffi` 的 unsafe 例外，允许范围只在本 crate 的 FFI 边界内；`shio-core` 与 `shio` 继续 `forbid(unsafe_code)`。JNI/Kotlin 包装层由 `shio-android` 实现，内核不绑定具体 Java 包名或 UI 技术栈。
 
@@ -345,7 +345,8 @@ C++ 与 Android 通过 `shio-ffi` 调用；契约头文件为 `crates/shio-ffi/i
 - 错误详情经 `shio_last_error(handle, buf, len)` 取回，线程局部；返回包含 NUL 的所需字节数，缓冲区不足时截断并补 NUL。
 - FFI 内部为每个句柄持有 tokio multi-thread runtime，对外暴露**阻塞调用**；C++/Android 必须在 worker 线程调用，不阻塞 UI 线程。
 - 所有导出函数都经过 `catch_unwind`；panic 转为 `SHIO_INTERNAL`，不跨 C ABI。
-- 回调、取消令牌、异步 future 不在 v1；sync/pairing 也不在 v1，待 Android 首版需求确认后追加。
+- 回调、取消令牌、异步 future 不在 v1。P4 以**增量符号**追加 sync/pairing；不改变现有函数签名或语义，因此 `SHIO_ABI_VERSION` 仍为 1，破坏性变更才升 2。
+- 同步业务数据只以不透明的 `SHY2` 帧进出；Kotlin/Java 不解析帧内部结构。同步状态、轮换信息和应用报告是小体积 JSON。
 
 ```c
 uint32_t shio_abi_version(void);
@@ -382,16 +383,102 @@ int32_t shio_stats(shio_kernel *k, uint8_t **out_json, size_t *out_json_len);
 
 /* 释放所有由 shio 分配的返回缓冲区；ptr/len 必须成对。 */
 void    shio_free(void *ptr, size_t len);
+
+/* ---- P4 同步扩展；以下函数均为阻塞调用 ---- */
+
+/* 启用同步；device_id 为 NULL 时生成随机设备 ID。返回 sync_info JSON。 */
+int32_t shio_sync_enable(shio_kernel *k, const uint8_t *device_id,
+                         uint8_t **out_json, size_t *out_json_len);
+int32_t shio_sync_info(shio_kernel *k,
+                       uint8_t **out_json, size_t *out_json_len);
+
+/*
+ * 读取 after 之后的变更页，返回 SHY2 帧。
+ * after=0 表示从头；limit=0 使用默认 100，最大 1000。
+ * out_next 为下一页游标，out_has_more 表示是否还有更多；两者可为 NULL。
+ */
+int32_t shio_sync_changes(shio_kernel *k, uint64_t after, size_t limit,
+                          uint8_t **out_frame, size_t *out_frame_len,
+                          uint64_t *out_next, uint8_t *out_has_more);
+
+/* 应用变更帧；返回 {"applied":N,"skipped":N,"controls":N}。 */
+int32_t shio_sync_apply(shio_kernel *k, const uint8_t *frame, size_t frame_len,
+                        uint8_t **out_report_json, size_t *out_report_len);
+
+/* 本机待发送的轮换 offer 帧。 */
+int32_t shio_sync_offers(shio_kernel *k,
+                         uint8_t **out_frame, size_t *out_frame_len);
+/* 应用对端的 offer 帧；成功后本机安装新 key 并自动 ack。 */
+int32_t shio_sync_apply_offers(shio_kernel *k,
+                               const uint8_t *frame, size_t frame_len);
+
+/* 快照起点；用于日志已压缩时的重同步。 */
+int32_t shio_sync_snapshot_start(shio_kernel *k, uint64_t *out_at_seq);
+
+/*
+ * 读取一页快照并编码为 SHY2 帧。
+ * after=NULL/0 表示第一页；out_next 是下一页的不透明游标；out_done=1 表示结束。
+ * limit=0 使用默认 100，最大 1000。
+ */
+int32_t shio_sync_snapshot_page(shio_kernel *k,
+                                const uint8_t *after, size_t after_len,
+                                size_t limit,
+                                uint8_t **out_frame, size_t *out_frame_len,
+                                uint8_t **out_next, size_t *out_next_len,
+                                uint8_t *out_done);
+int32_t shio_sync_apply_snapshot(shio_kernel *k,
+                                 const uint8_t *frame, size_t frame_len,
+                                 uint8_t **out_report_json, size_t *out_report_len);
+
+/* 本机发起轮换；返回 rotation_info JSON。 */
+int32_t shio_sync_begin_rotation(shio_kernel *k,
+                                 uint8_t **out_json, size_t *out_json_len);
+/* 当前轮换状态；没有进行中的轮换时返回 JSON null。 */
+int32_t shio_sync_rotation_state(shio_kernel *k,
+                                 uint8_t **out_json, size_t *out_json_len);
+int32_t shio_sync_ack_rotation(shio_kernel *k, const uint8_t *to);
+int32_t shio_sync_migrate_all(shio_kernel *k, const uint8_t *to,
+                              uint64_t *out_count);
+int32_t shio_sync_retire(shio_kernel *k, const uint8_t *from);
+int32_t shio_sync_prune_offers(shio_kernel *k, const uint8_t *to);
+int32_t shio_sync_compact(shio_kernel *k, uint64_t before,
+                          uint64_t *out_count);
+
+/*
+ * 生成配对包；ttl_seconds 仅用于调用方展示/过期控制，0 使用 600 秒；
+ * 接收端固定按 10 分钟窗口校验 created_at。
+ * out_frame 为 SHW2 外层帧，out_json 为 {"secret":"...","fingerprint":"..."}。
+ */
+int32_t shio_sync_create_pairing(shio_kernel *k, uint64_t ttl_seconds,
+                                 uint8_t **out_frame, size_t *out_frame_len,
+                                 uint8_t **out_json, size_t *out_json_len);
+
+/*
+ * 用配对包创建新库；目标必须不存在或为空。
+ * options_json 与 shio_open 相同；secret 为 Base32 文本字节。
+ */
+int32_t shio_open_with_pairing(const char *path,
+                               const uint8_t *password, size_t password_len,
+                               const uint8_t *options_json, size_t options_len,
+                               const uint8_t *frame, size_t frame_len,
+                               const uint8_t *secret, size_t secret_len,
+                               shio_kernel **out_handle);
 ```
 
 JSON 形状：
 
-- `shio_open` 的 `options_json` 可为空；字段为 `create`、`read_only`、`max_value_size`、`cache_size`，未知字段拒绝。
+- `shio_open` 的 `options_json` 可为空；字段为 `create`、`read_only`、`max_value_size`、`cache_size`，未知字段拒绝。上次异常退出后若 redb 要求修复，`read_only` 打开会失败；先用写句柄打开一次修复。
 - `shio_get` 返回 `{"meta":{...},"value":...}`；墓碑视为 `SHIO_NOT_FOUND`。
 - `shio_insert` / `shio_put` / `shio_batch` 返回记录元信息，字段为 `id`、`rev`、`created_at`、`updated_at`、`data_version`、`deleted`、`ciphertext_len`。
 - `shio_list` 返回 `{"items":[...],"next":"uuid"|null}`；`after` 为 `NULL` 表示从头，`limit == 0` 使用默认值。
 - `shio_batch` 输入为 `[{"id":"uuid","value":...},{"id":"uuid","delete":true}]`，最多 1000 条，单次原子提交。
 - `shio_stats` 返回 `format_version`、`key_id`（32 位十六进制）和 `db_bytes`。
+- `shio_sync_info` / `shio_sync_enable` 返回 `{"db_id":"32hex","device_id":"32hex","current_key_id":"32hex","log_start":N,"log_end":N,"baseline_done":bool}`。
+- `shio_sync_begin_rotation` / `shio_sync_rotation_state` 返回 `{"from":"32hex","to":"32hex","created_at":millis,"acked":["32hex",...]}`；没有进行中的轮换时 `rotation_state` 返回 `null`。
+- `shio_sync_apply` / `shio_sync_apply_snapshot` 返回 `{"applied":N,"skipped":N,"controls":N}`。
+- `shio_sync_create_pairing` 返回 `{"secret":"<Base32>","fingerprint":"<6 位十六进制>"}`；`secret` 只用于配对展示，不得写日志。
+- `shio_sync_changes`、`shio_sync_offers`、`shio_sync_snapshot_page` 的 `out_frame` 是 `SHY2` 帧；调用方不得解析或改写，只负责传输与 `shio_free`。
+- `shio_sync_snapshot_page` 的 `out_next` 是不透明游标，必须与 `shio_free` 成对释放；`out_done=1` 时 `out_next` 为 `NULL`/`0`。
 
 所有权与生命周期：
 
@@ -400,6 +487,9 @@ JSON 形状：
 - `shio_kernel_destroy` 释放句柄，调用前必须确保没有其它线程继续使用；不要重复 destroy。
 - 口令临时缓冲区在边界内用 `zeroize` 清零；返回的记录明文由调用方在释放前自行处理。
 - 内核单写多读：Android 多进程只能有一个可写 owner；跨进程只读受同一旁路 `.lock` 的共享锁约束。Android 的锁文件为 `<db>.lock`，由 facade 持有到 `close`。
+- P4 首次建库：新库先 `shio_open`，随后立即 `shio_sync_enable`；只有拿到成功返回的 `sync_info` 后才写入业务记录。若启用失败，调用方应关闭并删除这个尚未使用的库，不要留下 `format=1` 的半成品。
+- 同步帧、配对 secret、口令和明文都不得写入日志。`shio_sync_create_pairing` 返回的 `secret` 使用后应尽快覆盖或释放；`shio_free` 会在释放前清零输出缓冲区。
+- 网络/TLS、二维码、重试、后台调度和冲突提示属于 `shio-android`；内核只提供帧、配对文本和状态查询。
 
 ## 9. 兼容性
 
@@ -469,7 +559,7 @@ pub const FORMAT: u16 = 1; // 位于 shio_core::store::FORMAT，根未重导出
 
 pub struct Stats {
     pub format_version: u16,
-    pub key_id: u16,
+    pub key_id: KeyId,
     pub db_bytes: u64,
 }
 ```
@@ -601,7 +691,7 @@ impl DeviceId {
 }
 ```
 
-M0 会把 `shio_core::crypto::KeyId`（u16）改名为 `LegacyKeyId`，并在 `model` 导出 16 字节的 `KeyId`；`Stats.key_id` 随之改为 `KeyId`。`KeyId` 与 `DeviceId` 的 `Debug` / `Display` 输出小写 hex，不包含秘密。
+`shio_core::crypto::KeyId`（u16）保留为 `LegacyKeyId`；`model` 导出 16 字节的 `KeyId`，`Stats.key_id` 为 `KeyId`。`KeyId` 与 `DeviceId` 的 `Debug` / `Display` 输出小写 hex，不包含秘密。
 
 ### 12.3 数据类型
 
@@ -765,6 +855,12 @@ impl<'a> Sync<'a> {
     pub fn apply_offers(&self, frame: &[u8]) -> Result<()>;
 
     pub fn snapshot(&self) -> Result<SnapshotIter<'a>>;
+    pub fn snapshot_start(&self) -> Result<u64>;
+    pub fn snapshot_page(
+        &self,
+        after: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<SnapshotPage>;
     pub fn encode_snapshot(&self, page: &SnapshotPage) -> Result<Vec<u8>>;
     pub fn decode_snapshot(&self, frame: &[u8]) -> Result<SnapshotPage>;
     pub fn apply_snapshot(&self, page: &SnapshotPage) -> Result<ApplyReport>;
@@ -772,6 +868,8 @@ impl<'a> Sync<'a> {
 
     pub fn begin_rotation(&self) -> Result<RotationInfo>;
     pub fn rotation_offers(&self) -> Result<Vec<RotationOffer>>;
+    pub fn rotation_state(&self) -> Result<Option<RotationInfo>>;
+    pub fn acknowledge_rotation(&self, to: KeyId) -> Result<()>;
     pub fn migrate_all(&self, to: KeyId) -> Result<u64>;
     pub fn retire(&self, from: KeyId) -> Result<()>;
     pub fn prune_offers(&self, to: KeyId) -> Result<()>;

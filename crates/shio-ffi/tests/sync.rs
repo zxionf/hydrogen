@@ -7,6 +7,7 @@
 use std::ffi::{c_char, CStr, CString};
 use std::path::Path;
 use std::ptr;
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
 use shio_ffi::*;
@@ -65,6 +66,20 @@ fn sync_info(handle: *mut ShioKernel) -> Value {
     // SAFETY: 句柄与输出指针有效。
     let status = unsafe { shio_sync_info(handle, &mut pointer, &mut len) };
     assert_eq!(status, SHIO_OK, "sync_info failed: {}", last_error());
+    parse(take_buffer(pointer, len))
+}
+
+fn migration_progress(handle: *mut ShioKernel) -> Value {
+    let mut pointer = ptr::null_mut();
+    let mut len = 0;
+    // SAFETY: 句柄与输出指针有效。
+    let status = unsafe { shio_sync_migration_progress(handle, &mut pointer, &mut len) };
+    assert_eq!(
+        status,
+        SHIO_OK,
+        "migration_progress failed: {}",
+        last_error()
+    );
     parse(take_buffer(pointer, len))
 }
 
@@ -400,11 +415,31 @@ fn sync_pair_changes_snapshot_and_rotation() {
     let rotation = parse(take_buffer(rotation_pointer, rotation_len));
     let to = rotation["to"].as_str().unwrap().to_owned();
 
-    let mut migrated = 0;
+    let initial_progress = migration_progress(a);
+    assert_eq!(initial_progress["active"], false);
+    assert_eq!(initial_progress["done"], false);
+    assert_eq!(initial_progress["migrated"], 0);
+    // 没有迁移时取消是安全的；随后的迁移会清除取消标志。
+    // SAFETY: 句柄有效。
+    let status = unsafe { shio_sync_cancel_migration(a) };
+    assert_eq!(status, SHIO_OK, "cancel_migration failed: {}", last_error());
+
+    let to_bytes = hex_bytes(&to);
+    // SAFETY: 句柄与 key ID 有效。
+    let status = unsafe { shio_sync_migrate_all_ex(a, to_bytes.as_ptr(), 1, 0) };
+    assert_eq!(status, SHIO_OK, "migrate_all_ex failed: {}", last_error());
+    let progress = migration_progress(a);
+    assert_eq!(progress["active"], false);
+    assert_eq!(progress["done"], true);
+    assert!(progress["migrated"].as_u64().unwrap() >= 1);
+    assert!(progress["scanned"].as_u64().unwrap() >= progress["migrated"].as_u64().unwrap());
+
+    // 旧入口保持可用；已迁移的记录返回 0。
+    let mut migrated = 1;
     // SAFETY: 句柄、key ID 与输出指针有效。
-    let status = unsafe { shio_sync_migrate_all(a, hex_bytes(&to).as_ptr(), &mut migrated) };
+    let status = unsafe { shio_sync_migrate_all(a, to_bytes.as_ptr(), &mut migrated) };
     assert_eq!(status, SHIO_OK, "migrate_all failed: {}", last_error());
-    assert!(migrated >= 1);
+    assert_eq!(migrated, 0);
 
     // B 还没安装新 key；直接应用迁移后的快照必须映射为 ROTATION_REQUIRED。
     let (locked_snapshot, _, _) = snapshot_page(a, None);
@@ -473,6 +508,175 @@ fn sync_pair_changes_snapshot_and_rotation() {
     unsafe { shio_kernel_destroy(a) };
     // SAFETY: 关闭后 destroy，且没有其它线程继续使用。
     unsafe { shio_kernel_destroy(b) };
+}
+
+#[test]
+fn sync_migration_progress_cancel_and_resume() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("a.db");
+    let create = br#"{"create":true}"#;
+    let a = open(&path, b"device-a-password", create);
+    enable_sync(a);
+    let namespace = CString::new("vault").unwrap();
+    let collection = CString::new("entries").unwrap();
+    for index in 0..40 {
+        let value = format!(r#"{{"index":{index}}}"#);
+        insert(a, &namespace, &collection, value.as_bytes());
+    }
+
+    let mut rotation_pointer = ptr::null_mut();
+    let mut rotation_len = 0;
+    // SAFETY: 句柄与输出指针有效。
+    let status = unsafe { shio_sync_begin_rotation(a, &mut rotation_pointer, &mut rotation_len) };
+    assert_eq!(status, SHIO_OK, "begin_rotation failed: {}", last_error());
+    let rotation = parse(take_buffer(rotation_pointer, rotation_len));
+    let to = hex_bytes(rotation["to"].as_str().unwrap());
+
+    let handle_address = a as usize;
+    let worker_to = to;
+    let worker = std::thread::spawn(move || {
+        // SAFETY: 主线程在 join 之前保持句柄有效；只并发调用线程安全入口。
+        unsafe {
+            shio_sync_migrate_all_ex(handle_address as *mut ShioKernel, worker_to.as_ptr(), 1, 20)
+        }
+    });
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let progress = migration_progress(a);
+        if progress["active"].as_bool().unwrap() && progress["migrated"].as_u64().unwrap() >= 1 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "migration did not make progress: {progress}"
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    }
+
+    // SAFETY: 句柄有效。
+    let status = unsafe { shio_sync_cancel_migration(a) };
+    assert_eq!(status, SHIO_OK, "cancel_migration failed: {}", last_error());
+    assert_eq!(worker.join().unwrap(), SHIO_CANCELLED);
+    let progress = migration_progress(a);
+    assert_eq!(progress["active"], false);
+    assert_eq!(progress["done"], false);
+    assert!(progress["migrated"].as_u64().unwrap() >= 1);
+
+    // SAFETY: 句柄与 key ID 有效。
+    let status = unsafe { shio_sync_migrate_all_ex(a, to.as_ptr(), 0, 0) };
+    assert_eq!(status, SHIO_OK, "resume failed: {}", last_error());
+    let progress = migration_progress(a);
+    assert_eq!(progress["active"], false);
+    assert_eq!(progress["done"], true);
+    assert!(progress["migrated"].as_u64().unwrap() >= 1);
+    assert!(progress["scanned"].as_u64().unwrap() >= progress["migrated"].as_u64().unwrap());
+
+    // 非法参数在启动迁移前被拒绝。
+    // SAFETY: 句柄与 key ID 有效。
+    let status = unsafe { shio_sync_migrate_all_ex(a, to.as_ptr(), 0, 60_001) };
+    assert_eq!(status, SHIO_INVALID_ARGUMENT);
+
+    // SAFETY: 句柄有效。
+    unsafe { shio_close(a) };
+    // SAFETY: 关闭后 destroy，且没有其它线程继续使用。
+    unsafe { shio_kernel_destroy(a) };
+}
+
+#[test]
+fn backup_and_restore_roundtrip() {
+    let directory = tempfile::tempdir().unwrap();
+    let source_path = directory.path().join("source.db");
+    let backup_path = directory.path().join("backup.db");
+    let target_path = directory.path().join("target.db");
+    let wrong_target_path = directory.path().join("wrong-target.db");
+    let create = br#"{"create":true}"#;
+
+    let source = open(&source_path, b"backup-password", create);
+    enable_sync(source);
+    let namespace = CString::new("vault").unwrap();
+    let collection = CString::new("entries").unwrap();
+    let id = insert(source, &namespace, &collection, br#"{"name":"backup"}"#);
+    let id_text = id["id"].as_str().unwrap().to_owned();
+    let before = sync_info(source);
+
+    let backup_c = CString::new(backup_path.to_str().unwrap()).unwrap();
+    let mut json_pointer = ptr::null_mut();
+    let mut json_len = 0;
+    // SAFETY: 句柄、路径与输出指针有效。
+    let status =
+        unsafe { shio_backup(source, backup_c.as_ptr(), &mut json_pointer, &mut json_len) };
+    assert_eq!(status, SHIO_OK, "backup failed: {}", last_error());
+    let summary = parse(take_buffer(json_pointer, json_len));
+    assert_eq!(summary["format_version"], 2);
+    assert!(summary["row_count"].as_u64().unwrap() >= 1);
+
+    // 目标已存在时拒绝覆盖。
+    let mut ignored_pointer = ptr::null_mut();
+    let mut ignored_len = 0;
+    // SAFETY: 句柄、路径与输出指针有效。
+    let status = unsafe {
+        shio_backup(
+            source,
+            backup_c.as_ptr(),
+            &mut ignored_pointer,
+            &mut ignored_len,
+        )
+    };
+    assert_eq!(status, SHIO_INVALID_ARGUMENT);
+    assert!(ignored_pointer.is_null());
+
+    let target_c = CString::new(target_path.to_str().unwrap()).unwrap();
+    let mut restored = ptr::null_mut();
+    // SAFETY: 路径、口令、options 与输出指针有效。
+    let status = unsafe {
+        shio_restore(
+            backup_c.as_ptr(),
+            target_c.as_ptr(),
+            b"backup-password".as_ptr(),
+            b"backup-password".len(),
+            ptr::null(),
+            0,
+            &mut restored,
+        )
+    };
+    assert_eq!(status, SHIO_OK, "restore failed: {}", last_error());
+    assert!(!restored.is_null());
+
+    let after = sync_info(restored);
+    assert_eq!(after["db_id"], before["db_id"]);
+    assert_eq!(after["device_id"], before["device_id"]);
+    assert_eq!(after["current_key_id"], before["current_key_id"]);
+    let value = get(restored, &namespace, &collection, &id_text);
+    assert_eq!(value["value"]["name"], "backup");
+
+    // 错误口令不得发布目标。
+    let wrong_target_c = CString::new(wrong_target_path.to_str().unwrap()).unwrap();
+    let mut wrong_handle = ptr::null_mut();
+    // SAFETY: 路径、口令、options 与输出指针有效。
+    let status = unsafe {
+        shio_restore(
+            backup_c.as_ptr(),
+            wrong_target_c.as_ptr(),
+            b"wrong-password".as_ptr(),
+            b"wrong-password".len(),
+            ptr::null(),
+            0,
+            &mut wrong_handle,
+        )
+    };
+    assert_eq!(status, SHIO_INVALID_KEY);
+    assert!(wrong_handle.is_null());
+    assert!(!wrong_target_path.exists());
+
+    // SAFETY: 句柄有效。
+    unsafe { shio_close(source) };
+    // SAFETY: 句柄有效。
+    unsafe { shio_close(restored) };
+    // SAFETY: 关闭后 destroy，且没有其它线程继续使用。
+    unsafe { shio_kernel_destroy(source) };
+    // SAFETY: 关闭后 destroy，且没有其它线程继续使用。
+    unsafe { shio_kernel_destroy(restored) };
 }
 
 #[test]

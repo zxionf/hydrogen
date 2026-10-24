@@ -15,8 +15,8 @@ use crate::error::{Error, Result};
 use crate::model::{DeviceId, KeyId, Timestamp};
 use crate::store::{catalog, changes, keys, keys2, meta2, records, sync_state, FORMAT, FORMAT_V2};
 use crate::sync::{
-    ApplyReport, ChangeEntry, ChangePage, RecordChange, RotationInfo, RotationOffer, SnapshotPage,
-    SnapshotRecord, SyncInfo, MAX_KEY_COUNT, MAX_PAGE_ENTRIES,
+    ApplyReport, ChangeEntry, ChangePage, MigrationOptions, RecordChange, RotationInfo,
+    RotationOffer, SnapshotPage, SnapshotRecord, SyncInfo, MAX_KEY_COUNT, MAX_PAGE_ENTRIES,
 };
 
 /// 已读取的同步状态。
@@ -1292,6 +1292,15 @@ impl Engine {
 
     /// 把全部记录重新加密到 `to`，并为不再被引用的 key 公告迁移完成。
     pub fn migrate_all(&self, to: KeyId) -> Result<u64> {
+        self.migrate_all_with_options(to, MigrationOptions::default())
+    }
+
+    /// 按给定批次大小与批次间暂停迁移全部记录。
+    ///
+    /// 迁移持有会话写锁；进度通过 [`Self::migration_progress`] 旁路读取。
+    /// 取消在批次边界生效，已提交的记录保留，未完成的轮换可由调用方重试。
+    pub fn migrate_all_with_options(&self, to: KeyId, options: MigrationOptions) -> Result<u64> {
+        options.validate()?;
         self.require_writable()?;
         let session = self.write_session()?;
         let state = self.read_sync_state()?.ok_or(Error::SyncDisabled)?;
@@ -1299,10 +1308,35 @@ impl Engine {
             return Err(Error::InvalidArgument("target data key is not installed"));
         }
 
+        self.migration.begin();
+        let outcome = self.migrate_all_locked(&session, state, to, options);
+        match outcome {
+            Ok(count) => {
+                self.migration.finish(true);
+                Ok(count)
+            }
+            Err(error) => {
+                self.migration.finish(false);
+                Err(error)
+            }
+        }
+    }
+
+    fn migrate_all_locked(
+        &self,
+        session: &Session,
+        state: SyncState,
+        to: KeyId,
+        options: MigrationOptions,
+    ) -> Result<u64> {
         let mut migrated = 0u64;
         let mut after: Option<Vec<u8>> = None;
         loop {
-            let mut batch: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(ROTATE_BATCH);
+            if self.migration.is_cancelled() {
+                return Err(Error::Cancelled);
+            }
+
+            let mut batch: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(options.batch_size);
             {
                 let txn = self.handle.begin_read()?;
                 let table = txn.open_table(records::TABLE)?;
@@ -1313,7 +1347,7 @@ impl Engine {
                 for item in table.range::<&[u8]>(range)? {
                     let (key, value) = item?;
                     batch.push((key.value().to_vec(), value.value().to_vec()));
-                    if batch.len() >= ROTATE_BATCH {
+                    if batch.len() >= options.batch_size {
                         break;
                     }
                 }
@@ -1322,7 +1356,10 @@ impl Engine {
                 break;
             };
             let last_key = last.0.clone();
+            let full_batch = batch.len() >= options.batch_size;
+            self.migration.add_scanned(batch.len() as u64);
 
+            let mut batch_migrated = 0u64;
             let txn = self.handle.begin_write()?;
             {
                 let mut table = txn.open_table(records::TABLE)?;
@@ -1337,7 +1374,7 @@ impl Engine {
                         collection: &collection,
                         id,
                     };
-                    let plaintext = self.decrypt(&session, path, &blob)?;
+                    let plaintext = self.decrypt(session, path, &blob)?;
                     let entry = session
                         .keys
                         .get(&to)
@@ -1357,11 +1394,21 @@ impl Engine {
                     .with_deleted(blob.is_deleted());
                     let out = self.build_record_v2(&entry.subkeys, path, &plaintext, header)?;
                     table.insert(key.as_slice(), out.as_slice())?;
-                    migrated += 1;
+                    batch_migrated += 1;
                 }
             }
             txn.commit()?;
+            migrated += batch_migrated;
+            self.migration.add_migrated(batch_migrated);
             after = Some(last_key);
+
+            if full_batch {
+                self.pause_between_batches(options.pause)?;
+            }
+        }
+
+        if self.migration.is_cancelled() {
+            return Err(Error::Cancelled);
         }
 
         let mut referenced: BTreeSet<KeyId> = BTreeSet::new();
@@ -1402,6 +1449,20 @@ impl Engine {
         }
 
         Ok(migrated)
+    }
+
+    fn pause_between_batches(&self, pause: std::time::Duration) -> Result<()> {
+        const SLICE: std::time::Duration = std::time::Duration::from_millis(50);
+        let mut remaining = pause;
+        while !remaining.is_zero() {
+            if self.migration.is_cancelled() {
+                return Err(Error::Cancelled);
+            }
+            let step = remaining.min(SLICE);
+            std::thread::sleep(step);
+            remaining = remaining.saturating_sub(step);
+        }
+        Ok(())
     }
 
     /// 退役一个不再被任何记录引用的 key。

@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use secrecy::{ExposeSecret, SecretString};
 use shio_core::model::{validate_name, NameKind, DEFAULT_MAX_VALUE_SIZE};
-use shio_core::store::{Engine, EngineOptions, Stats};
+use shio_core::store::{BackupInfo, Engine, EngineOptions, Stats};
 #[cfg(feature = "sync")]
 use shio_sync::{PairingOffer, Sync as SyncApi, SyncHandle, SyncInfo};
 use tokio::sync::Notify;
@@ -271,6 +271,37 @@ impl Kernel {
             tokio::task::spawn_blocking(move || Engine::open(engine_options, password.as_slice()))
                 .await
                 .map_err(|_| Error::Internal("blocking task panicked"))??;
+
+        Ok(Self {
+            inner: Arc::new(Inner::new(engine, read_only, data_lock)),
+        })
+    }
+
+    /// 在线备份到 `target`；目标必须不存在。
+    pub async fn backup(&self, target: PathBuf) -> Result<BackupInfo> {
+        self.inner.run(move |engine| engine.backup(&target)).await
+    }
+
+    /// 从 `backup` 恢复到 `options.path`，并返回已打开的目标句柄。
+    pub async fn restore(
+        options: OpenOptions,
+        credential: Credential,
+        backup: PathBuf,
+    ) -> Result<Self> {
+        let mut options = options;
+        options.create = false;
+        options.validate()?;
+        let read_only = options.read_only;
+        // 恢复会写入目标文件，始终按独占方式持有旁路锁。
+        let data_lock = DataFileLock::acquire(&options.path, false)?;
+        let engine_options = engine_options(&options);
+        let password = password_bytes(credential);
+
+        let engine = tokio::task::spawn_blocking(move || {
+            Engine::restore(&backup, engine_options, password.as_slice())
+        })
+        .await
+        .map_err(|_| Error::Internal("blocking task panicked"))??;
 
         Ok(Self {
             inner: Arc::new(Inner::new(engine, read_only, data_lock)),

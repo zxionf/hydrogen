@@ -44,6 +44,10 @@ pub enum Error {
     #[error("key rotation in progress")]
     Busy,
 
+    /// 操作在批次边界被调用方取消。
+    #[error("operation cancelled")]
+    Cancelled,
+
     /// 未启用多端同步。
     #[error("sync is not enabled")]
     SyncDisabled,

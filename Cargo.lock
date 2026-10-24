@@ -442,7 +442,7 @@ dependencies = [
 
 [[package]]
 name = "shio"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "rustix",
  "secrecy",
@@ -457,7 +457,7 @@ dependencies = [
 
 [[package]]
 name = "shio-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "argon2",
  "chacha20poly1305",
@@ -475,7 +475,7 @@ dependencies = [
 
 [[package]]
 name = "shio-ffi"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -487,7 +487,7 @@ dependencies = [
 
 [[package]]
 name = "shio-sync"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "shio-core",
  "tempfile",
@@ -495,7 +495,7 @@ dependencies = [
 
 [[package]]
 name = "shio-tests"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "shio",
  "shio-core",

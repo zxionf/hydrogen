@@ -11,6 +11,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::ops::Bound;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use redb::{
@@ -34,8 +35,9 @@ use crate::model::{
 use crate::store::{
     catalog, changes, keys, keys2, meta, meta2, records, sync_state, FORMAT, FORMAT_V2, META_KEY,
 };
-use crate::sync::{ChangeEntry, RecordChange};
+use crate::sync::{ChangeEntry, MigrationProgress, RecordChange};
 
+mod engine_backup;
 mod engine_sync;
 mod pairing;
 
@@ -123,6 +125,19 @@ pub struct Stats {
     pub db_bytes: u64,
 }
 
+/// 在线备份摘要；不包含明文或密钥材料。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BackupInfo {
+    /// 源库格式版本。
+    pub format_version: u16,
+    /// 备份文件字节数。
+    pub db_bytes: u64,
+    /// 复制出的表数量。
+    pub table_count: u64,
+    /// 复制出的键值行总数。
+    pub row_count: u64,
+}
+
 /// 批量写操作，载荷为已序列化的明文。
 #[derive(Debug, Clone, Copy)]
 pub enum RawWriteOp<'a> {
@@ -156,6 +171,57 @@ pub struct Engine {
     path: PathBuf,
     max_value_size: usize,
     session: RwLock<Session>,
+    migration: MigrationState,
+}
+
+/// 迁移的旁路状态：查询进度与请求取消不获取会话锁。
+#[derive(Default)]
+struct MigrationState {
+    active: AtomicBool,
+    cancel: AtomicBool,
+    scanned: AtomicU64,
+    migrated: AtomicU64,
+    done: AtomicBool,
+}
+
+impl MigrationState {
+    fn begin(&self) {
+        self.cancel.store(false, Ordering::SeqCst);
+        self.scanned.store(0, Ordering::SeqCst);
+        self.migrated.store(0, Ordering::SeqCst);
+        self.done.store(false, Ordering::SeqCst);
+        self.active.store(true, Ordering::SeqCst);
+    }
+
+    fn finish(&self, done: bool) {
+        self.active.store(false, Ordering::SeqCst);
+        self.done.store(done, Ordering::SeqCst);
+    }
+
+    fn request_cancel(&self) {
+        self.cancel.store(true, Ordering::SeqCst);
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.cancel.load(Ordering::SeqCst)
+    }
+
+    fn add_scanned(&self, count: u64) {
+        self.scanned.fetch_add(count, Ordering::SeqCst);
+    }
+
+    fn add_migrated(&self, count: u64) {
+        self.migrated.fetch_add(count, Ordering::SeqCst);
+    }
+
+    fn snapshot(&self) -> MigrationProgress {
+        MigrationProgress {
+            active: self.active.load(Ordering::SeqCst),
+            scanned: self.scanned.load(Ordering::SeqCst),
+            migrated: self.migrated.load(Ordering::SeqCst),
+            done: self.done.load(Ordering::SeqCst),
+        }
+    }
 }
 
 /// 数据库句柄：只读与读写共用读事务。
@@ -352,27 +418,7 @@ impl fmt::Debug for Engine {
 impl Engine {
     /// 打开或创建数据库，并完成口令派生、DK 解包与 key check。
     pub fn open(options: EngineOptions, password: &[u8]) -> Result<Self> {
-        if options.max_value_size == 0 {
-            return Err(Error::InvalidArgument("max_value_size must be positive"));
-        }
-        if options
-            .max_value_size
-            .checked_add(codec::TAG_LEN)
-            .and_then(|size| u32::try_from(size).ok())
-            .is_none()
-        {
-            return Err(Error::InvalidArgument(
-                "max_value_size is too large for the record format",
-            ));
-        }
-        if options.cache_size == Some(0) {
-            return Err(Error::InvalidArgument("cache_size must be positive"));
-        }
-        if options.read_only && options.create {
-            return Err(Error::InvalidArgument(
-                "read_only cannot be combined with create",
-            ));
-        }
+        validate_open_options(&options)?;
 
         if !options.create && !options.path.exists() {
             return Err(Error::NotFound);
@@ -416,6 +462,7 @@ impl Engine {
             path: options.path,
             max_value_size: options.max_value_size,
             session: RwLock::new(session),
+            migration: MigrationState::default(),
         })
     }
 
@@ -763,6 +810,18 @@ impl Engine {
             key_id: session.current,
             db_bytes,
         })
+    }
+
+    /// 读取迁移进度；不会获取会话锁，可在迁移线程之外调用。
+    pub fn migration_progress(&self) -> MigrationProgress {
+        self.migration.snapshot()
+    }
+
+    /// 请求取消正在执行的迁移；在下一次批次边界生效。
+    ///
+    /// 没有迁移在执行时调用也是安全的，下一次迁移开始时会清除取消标志。
+    pub fn cancel_migration(&self) {
+        self.migration.request_cancel();
     }
 
     /// 持久化屏障。
@@ -1423,6 +1482,31 @@ impl Engine {
         }
         Ok(())
     }
+}
+
+fn validate_open_options(options: &EngineOptions) -> Result<()> {
+    if options.max_value_size == 0 {
+        return Err(Error::InvalidArgument("max_value_size must be positive"));
+    }
+    if options
+        .max_value_size
+        .checked_add(codec::TAG_LEN)
+        .and_then(|size| u32::try_from(size).ok())
+        .is_none()
+    {
+        return Err(Error::InvalidArgument(
+            "max_value_size is too large for the record format",
+        ));
+    }
+    if options.cache_size == Some(0) {
+        return Err(Error::InvalidArgument("cache_size must be positive"));
+    }
+    if options.read_only && options.create {
+        return Err(Error::InvalidArgument(
+            "read_only cannot be combined with create",
+        ));
+    }
+    Ok(())
 }
 
 fn initialize(db: &Database, password: &[u8], options: &EngineOptions) -> Result<()> {

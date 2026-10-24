@@ -6,6 +6,7 @@
 use std::fmt;
 use std::time::Duration;
 
+use crate::error::{Error, Result};
 use crate::model::{DeviceId, KeyId, RecordId, Timestamp};
 
 /// 单帧默认上限：4 MiB。
@@ -22,6 +23,59 @@ pub const DEFAULT_PAIRING_TTL: Duration = Duration::from_secs(10 * 60);
 
 /// 单库 key 行上限。
 pub const MAX_KEY_COUNT: usize = 32;
+
+/// 迁移每批默认记录数。
+pub const DEFAULT_MIGRATION_BATCH_SIZE: usize = 256;
+
+/// 迁移每批允许的最大记录数。
+pub const MAX_MIGRATION_BATCH_SIZE: usize = 1024;
+
+/// 批次间暂停允许的最大毫秒数。
+pub const MAX_MIGRATION_PAUSE_MS: u64 = 60_000;
+
+/// `format=2` 数据密钥迁移参数。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MigrationOptions {
+    /// 每个写事务迁移的记录数。
+    pub batch_size: usize,
+    /// 每个批次提交后的暂停时间；`Duration::ZERO` 表示不暂停。
+    pub pause: Duration,
+}
+
+impl Default for MigrationOptions {
+    fn default() -> Self {
+        Self {
+            batch_size: DEFAULT_MIGRATION_BATCH_SIZE,
+            pause: Duration::ZERO,
+        }
+    }
+}
+
+impl MigrationOptions {
+    /// 校验参数范围；非法值返回 [`Error::InvalidArgument`]。
+    pub fn validate(&self) -> Result<()> {
+        if self.batch_size == 0 || self.batch_size > MAX_MIGRATION_BATCH_SIZE {
+            return Err(Error::InvalidArgument("batch_size must be within 1..=1024"));
+        }
+        if self.pause.as_millis() > u128::from(MAX_MIGRATION_PAUSE_MS) {
+            return Err(Error::InvalidArgument("pause_ms must be within 0..=60000"));
+        }
+        Ok(())
+    }
+}
+
+/// 迁移进度快照；查询时不获取会话锁。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MigrationProgress {
+    /// 是否有迁移正在执行。
+    pub active: bool,
+    /// 已扫描的记录数，包含无需迁移的记录。
+    pub scanned: u64,
+    /// 本次已实际重新加密并提交的记录数。
+    pub migrated: u64,
+    /// 最近一次迁移是否完整成功。
+    pub done: bool,
+}
 
 /// 同步库摘要。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

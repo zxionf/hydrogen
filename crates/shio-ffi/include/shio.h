@@ -72,6 +72,8 @@ extern "C" {
 #define SHIO_PAIRING_EXPIRED (-21)
 /* 配对包无效。 */
 #define SHIO_PAIRING_INVALID (-22)
+/* 操作在批次边界被取消。 */
+#define SHIO_CANCELLED (-23)
 
 typedef struct shio_kernel shio_kernel;
 
@@ -95,6 +97,27 @@ int32_t shio_open(const char *path,
                   const uint8_t *options_json,
                   size_t options_len,
                   shio_kernel **out_handle);
+
+/*
+ * 在线备份；目标必须不存在。
+ * 返回摘要 JSON：{"format_version":N,"db_bytes":N,"table_count":N,"row_count":N}。
+ */
+int32_t shio_backup(shio_kernel *handle,
+                    const char *out_path,
+                    uint8_t **out_json,
+                    size_t *out_json_len);
+
+/*
+ * 从备份恢复到 target_path；目标必须不存在或为空。
+ * options_json 同 shio_open；restore 会忽略 create。成功返回已打开的目标句柄。
+ */
+int32_t shio_restore(const char *backup_path,
+                     const char *target_path,
+                     const uint8_t *password,
+                     size_t password_len,
+                     const uint8_t *options_json,
+                     size_t options_len,
+                     shio_kernel **out_handle);
 
 /* 关闭并等待在途操作；不释放句柄，可重复调用。 */
 int32_t shio_close(shio_kernel *handle);
@@ -270,6 +293,23 @@ int32_t shio_sync_ack_rotation(shio_kernel *handle, const uint8_t *to);
 int32_t shio_sync_migrate_all(shio_kernel *handle,
                               const uint8_t *to,
                               uint64_t *out_count);
+
+/*
+ * 带限速参数的迁移；batch_size=0 使用默认 256，pause_ms=0 表示不暂停。
+ * batch_size 上限 1024，pause_ms 上限 60000；取消在批次边界生效。
+ */
+int32_t shio_sync_migrate_all_ex(shio_kernel *handle,
+                                 const uint8_t *to,
+                                 uint32_t batch_size,
+                                 uint32_t pause_ms);
+
+/* 迁移进度 JSON：{"active":bool,"scanned":N,"migrated":N,"done":bool}。 */
+int32_t shio_sync_migration_progress(shio_kernel *handle,
+                                     uint8_t **out_json,
+                                     size_t *out_json_len);
+
+/* 请求取消迁移；在下一次批次边界生效。 */
+int32_t shio_sync_cancel_migration(shio_kernel *handle);
 
 /* 退役 from key。 */
 int32_t shio_sync_retire(shio_kernel *handle, const uint8_t *from);

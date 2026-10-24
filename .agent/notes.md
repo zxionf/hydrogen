@@ -48,6 +48,13 @@ sele CLI用于管理 `.design/` 与 `.agent/` 目录的 C++20 命令行工具，
 - `std::sync::MutexGuard` 跨 await 会被 clippy 的 `await_holding_lock` 拒绝（即使手动 `drop`）：把「判断/计数」放进独立块，块结束再 await。
 - 轮换中断后重跑：先检查 `key_id + 1` 的行是否已存在，存在就复用；否则会与上次写入的新行冲突。
 - 轮换持有会话写锁期间，内部迁移只能接收 `&Session`，不能再去拿读锁（会自锁）。
+- `format=2` 迁移的进度与取消状态放在 `Engine` 的原子字段里，查询进度和请求取消不获取 session 锁；取消标志在新迁移开始时清除，取消只在批次提交后的边界生效。
+- `MigrationOptions` 默认 256 条/批、无暂停；`batch_size` 上限 1024，`pause_ms` 上限 60000。暂停按 50ms 切片，便于取消尽快返回。
+- 恢复中断轮换的入口是 `rotation_state()` 取 `to` 后调用 `migrate_all(to)`/`migrate_all_with_options`；`rotate_data_key()` 只用于发起新轮换，不再承担恢复。
+- S2 备份在一个 redb 读事务里按已知表定义逐表复制原始键值，不解密、不重加密；表名与键类型不一致会编译失败，新增表必须同步更新 `engine_backup.rs` 的复制清单。
+- 备份先写目标同目录的随机临时文件，复制后只读打开校验每张表的行数与 `meta` 原始字节，再 `rename` 发布；目标已存在直接返回 `InvalidArgument`。临时文件由 `Drop` 清理，不引入 `tempfile` 运行时依赖。
+- 恢复只接受不存在或 0 字节目标；先 `fs::copy` 到临时文件，用原口令只读打开完成 key check/结构校验，再移除空目标并 `rename`，最后按调用方选项重新打开。最终打开失败会删除目标；错误口令/损坏备份不会发布目标。
+- facade 的 `Kernel::restore` 强制 `create=false`，并在 Android 上先取得目标 `.lock` 独占锁；恢复后的库保留源 `db_id`/`device_id`/key 链/同步游标，禁止同一备份恢复到两台设备后同时同步。
 - `change_password` 的 `Busy` 判定要放在派生新 KEK 之前，避免白跑一次 Argon2id。
 - redb 的 `range` 传 `(Bound, Bound)` 元组时推不出 `KR`，要写 `table.range::<&[u8]>(range)`。
 - 私有 helper 参数超过 7 个会触发 `clippy::too_many_arguments`；把 `(namespace, collection, id)` 收进 `RecordPath`。
@@ -67,21 +74,23 @@ sele CLI用于管理 `.design/` 与 `.agent/` 目录的 C++20 命令行工具，
 ## Android 设备冒烟
 
 - AVD：`shio_x86_64`，系统镜像 `system-images;android-35;google_apis;x86_64`；Emulator 37.2.12。
-- Harness：`crates/shio-ffi/examples/android_smoke.c`，模式 `smoke`、`sync`、`hold`、`probe`、`check`、`read-hold`、`read-probe`、`read-locked`、`rotate-many`、`resume-rotation`。用 NDK 的 `x86_64-linux-android24-clang` 编译，与 `libshio_ffi.so` 一起 push 到 `/data/local/tmp/shio-smoke`，运行时设 `LD_LIBRARY_PATH=.`。
+- Harness：`crates/shio-ffi/examples/android_smoke.c`，模式 `smoke`、`sync`、`hold`、`probe`、`check`、`read-hold`、`read-probe`、`read-locked`、`rotate-many`、`resume-rotation`、`migration-progress`、`backup-restore`。用 NDK 的 `x86_64-linux-android24-clang` 编译，与 `libshio_ffi.so` 一起 push 到 `/data/local/tmp/shio-smoke`，运行时设 `LD_LIBRARY_PATH=.`。
 - 结果：`smoke` 输出 `ANDROID_SMOKE_OK`，覆盖 create/open、stats、insert/get/put/list/batch/delete、close/重开、改口令、轮换、只读拒写；同进程第二写者返回 `SHIO_LOCKED`。
 - 跨进程锁：`hold` 模式持锁 20 秒，另一进程 `probe` 输出 `PROBE_LOCKED`；`kill -9 $(pidof android_smoke)` 后 `check` 输出 `CHECK_OK`，确认锁随进程退出释放且库可重开。
 - 只读并发：写者持锁时 `read-locked` 输出 `READ_LOCKED`；`read-hold` 持共享锁时 `probe` 输出 `PROBE_LOCKED`、`read-probe` 输出 `READ_PROBE_OK`。若写者被 `kill -9`，redb 可能先要求写句柄修复，直接只读打开会返回 `Database repair aborted`；先跑一次 `check`（写打开）再只读即可。
-- 同步 C ABI：`sync` 模式创建 A 库并 `sync_enable`，生成配对包后创建 B 库，双向变更、快照、轮换、ack 与压缩后重同步全部通过，输出 `ANDROID_SYNC_OK`；变更/快照使用 `limit=2`，确认多页路径。
-- 轮换中断：`rotate-many` 建 60000 条记录后打印 `ROTATE_START` 再执行 `shio_rotate_data_key`；外部在启动后 `kill -9`，随后 `resume-rotation` 重跑轮换并读首尾记录、写入新记录，输出 `ROTATE_RESUME_OK`。
+- 同步 C ABI：`sync` 模式创建 A 库并 `sync_enable`，生成配对包后创建 B 库，双向变更、快照、轮换、ack 与压缩后重同步全部通过，输出 `ANDROID_SYNC_OK`；变更/快照使用 `limit=2`，确认多页路径。轮换现在通过 `shio_sync_migrate_all_ex` 执行，并检查进度 JSON。
+- 迁移取消：`migration-progress` 模式插入 40 条记录后启动 `batch_size=1,pause_ms=20` 的后台迁移，主线程轮询到 `active=true`/`migrated>=1` 后调用 `shio_sync_cancel_migration`；worker 返回 `SHIO_CANCELLED`，随后再次调用 `shio_sync_migrate_all_ex` 续跑并检查 `done=true`。x86_64 模拟器输出 `MIGRATION_PROGRESS_OK`。
+- 轮换中断：`rotate-many` 建 60000 条记录后打印 `ROTATE_START` 再执行 `shio_rotate_data_key`；外部在启动后 `kill -9`，随后 `resume-rotation` 读取 `shio_sync_rotation_state` 的 `to`，用 `shio_sync_migrate_all_ex` 续跑并读首尾记录、写入新记录，输出 `ROTATE_RESUME_OK`。
+- 备份恢复：`backup-restore` 模式在 `format=2` 源库写入记录并 `sync_enable`，调用 `shio_backup` 检查摘要，拒绝已存在备份目标和非空恢复目标，错误口令返回 `SHIO_INVALID_KEY` 且不建目标；随后 `shio_restore` 打开目标、读取原记录并比较 `db_id`/`device_id`。x86_64 模拟器输出 `BACKUP_RESTORE_OK`。
 - redb 4.4 在 Android 上没有可用的文件锁：字节范围锁返回 `Unsupported`，跨进程第二写者原本可以直接打开。现在由 `crates/shio/src/lock.rs` 在数据库旁创建 `<db>.lock`，用 `rustix::fs::flock` 非阻塞加锁：写句柄独占、只读共享；冲突映射为 `Error::Locked`，`close` 后在途操作归零再释放。
-- `.lock` 文件不要在手柄打开期间删除；它可以在下次打开时重建。备份应排除数据库与 `.lock`，或成对处理。
+- `.lock` 文件不要在手柄打开期间删除；它可以在下次打开时重建。S2 的 `shio_backup` 只写调用方指定的独立路径，不复制源库的 `.lock`；应用层自行做整目录文件备份时仍应排除数据库与 `.lock`，或成对处理。
 - 模拟器子进程会随调用的 shell 结束被回收；启动模拟器、等待 boot、push、运行测试必须放在同一次 shell 调用里。若 AVD 被清理，用 `avdmanager create avd -n shio_x86_64 -k 'system-images;android-35;google_apis;x86_64' --device pixel_2` 重建。
 
 ## C ABI v1
 
 - `shio-ffi` 已从占位改为可链接的 `rlib + cdylib`，契约头文件：`crates/shio-ffi/include/shio.h`。
 - 导出：`shio_abi_version`、`shio_last_error`、`shio_open`、`shio_close`、`shio_kernel_destroy`、`shio_free`、`shio_insert`、`shio_put`、`shio_get`、`shio_delete`、`shio_list`、`shio_batch`、`shio_change_password`、`shio_rotate_data_key`、`shio_flush`、`shio_stats`。
-- P4 追加 18 个同步/配对符号：`shio_sync_enable/info/changes/apply/offers/apply_offers/snapshot_start/snapshot_page/apply_snapshot/begin_rotation/rotation_state/ack_rotation/migrate_all/retire/prune_offers/compact/create_pairing` 与 `shio_open_with_pairing`；完整签名见 `include/shio.h` 与 `.design/api.md` §8。ABI 版本仍为 1（只增符号）。
+- P4 追加 18 个同步/配对符号：`shio_sync_enable/info/changes/apply/offers/apply_offers/snapshot_start/snapshot_page/apply_snapshot/begin_rotation/rotation_state/ack_rotation/migrate_all/retire/prune_offers/compact/create_pairing` 与 `shio_open_with_pairing`；S1 再追加 `shio_sync_migrate_all_ex`、`shio_sync_migration_progress`、`shio_sync_cancel_migration` 与错误码 `SHIO_CANCELLED(-23)`；S2 追加 `shio_backup`、`shio_restore`；完整签名见 `include/shio.h` 与 `.design/api.md` §8。ABI 版本仍为 1（只增符号）。
 - `shio_open` 的 options JSON：`create`、`read_only`、`max_value_size`、`cache_size`；未知字段拒绝。字符串为 NUL 结尾 UTF-8，载荷/口令/ID 显式带长度。
 - 同步业务帧是 `SHY2` 不透明字节，调用方不要把帧内容塞进 JSON 或自行改写；状态、轮换信息和应用报告才是 JSON。首版建库先 `shio_open`，紧接着 `shio_sync_enable`，成功后才写业务记录；失败就关闭并删除尚未使用的库。
 - `shio_sync_changes` 的 `after` 是上一页 `out_next`；日志被压缩后返回 `SHIO_SYNC_RESYNC_REQUIRED`，改用 `snapshot_start/page`。`shio_sync_snapshot_page` 的 `out_next` 是另一条不透明游标，`out_done=1` 时为空。

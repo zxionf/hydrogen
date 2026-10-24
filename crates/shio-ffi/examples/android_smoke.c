@@ -8,6 +8,7 @@
 
 #include "shio.h"
 
+#include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -163,6 +164,15 @@ static char *sync_info_text(shio_kernel *kernel, const char *what)
     size_t len = 0;
 
     expect(shio_sync_info(kernel, &buf, &len), what);
+    return take_text(buf, len, what);
+}
+
+static char *migration_progress_text(shio_kernel *kernel, const char *what)
+{
+    uint8_t *buf = NULL;
+    size_t len = 0;
+
+    expect(shio_sync_migration_progress(kernel, &buf, &len), what);
     return take_text(buf, len, what);
 }
 
@@ -365,11 +375,30 @@ static int resume_rotation(const char *path)
     uint8_t *buf = NULL;
     size_t len = 0;
     uint8_t id[16];
+    uint8_t to[16];
+    uint8_t *json = NULL;
+    size_t json_len = 0;
+    char *text = NULL;
+    char *to_text = NULL;
 
     expect(shio_open(path, (const uint8_t *)PASSWORD, strlen(PASSWORD),
                      NULL, 0, &kernel),
            "resume open");
-    expect(shio_rotate_data_key(kernel), "resume rotate_data_key");
+    expect(shio_sync_rotation_state(kernel, &json, &json_len),
+           "resume rotation_state");
+    text = take_text(json, json_len, "resume rotation_state");
+    if (strcmp(text, "null") == 0) {
+        fprintf(stderr, "resume rotation_state returned null\n");
+        return 1;
+    }
+    to_text = json_string(text, "to", "resume rotation_state");
+    hex_decode_16(to_text, to);
+    free(to_text);
+    free(text);
+    expect(shio_sync_migrate_all_ex(kernel, to, 0, 0), "resume migrate_all_ex");
+    text = migration_progress_text(kernel, "resume migration_progress");
+    contains(text, "\"done\":true", "resume migration_progress");
+    free(text);
 
     record_id(0, id);
     expect(shio_get(kernel, "rotate", "items", id, &buf, &len),
@@ -389,6 +418,256 @@ static int resume_rotation(const char *path)
     expect(shio_close(kernel), "resume close");
     shio_kernel_destroy(kernel);
     printf("ROTATE_RESUME_OK\n");
+    return 0;
+}
+
+typedef struct {
+    shio_kernel *kernel;
+    uint8_t to[16];
+    int32_t status;
+} migration_job;
+
+static void *migration_worker(void *arg)
+{
+    migration_job *job = (migration_job *)arg;
+    job->status = shio_sync_migrate_all_ex(job->kernel, job->to, 1, 20);
+    return NULL;
+}
+
+static int migration_progress_mode(const char *path)
+{
+    shio_kernel *kernel = NULL;
+    uint8_t *buf = NULL;
+    size_t len = 0;
+    uint8_t id[16];
+    uint8_t to[16];
+    uint8_t *json = NULL;
+    size_t json_len = 0;
+    char *text = NULL;
+    char *to_text = NULL;
+    migration_job job;
+    pthread_t thread;
+    int waited = 0;
+    int saw_progress = 0;
+
+    remove(path);
+    expect(shio_open(path, (const uint8_t *)PASSWORD, strlen(PASSWORD),
+                     (const uint8_t *)"{\"create\":true}",
+                     strlen("{\"create\":true}"), &kernel),
+           "migration open");
+    expect(shio_sync_enable(kernel, NULL, &buf, &len), "migration enable");
+    shio_free(buf, len);
+    buf = NULL;
+    len = 0;
+
+    for (waited = 0; waited < 40; waited++) {
+        char payload[64];
+        snprintf(payload, sizeof(payload), "{\"n\":%d}", waited);
+        expect(shio_insert(kernel, "migration", "items",
+                           (const uint8_t *)payload, strlen(payload),
+                           id, &buf, &len),
+               "migration insert");
+        shio_free(buf, len);
+        buf = NULL;
+        len = 0;
+    }
+
+    expect(shio_sync_begin_rotation(kernel, &json, &json_len),
+           "migration begin_rotation");
+    text = take_text(json, json_len, "migration begin_rotation");
+    to_text = json_string(text, "to", "migration begin_rotation");
+    hex_decode_16(to_text, to);
+    free(to_text);
+    free(text);
+
+    job.kernel = kernel;
+    memcpy(job.to, to, sizeof(to));
+    job.status = SHIO_OK;
+    if (pthread_create(&thread, NULL, migration_worker, &job) != 0) {
+        fprintf(stderr, "pthread_create failed\n");
+        return 1;
+    }
+
+    for (waited = 0; waited < 5000; waited++) {
+        uint64_t migrated;
+        text = migration_progress_text(kernel, "migration progress");
+        migrated = json_u64(text, "migrated", "migration progress");
+        if (strstr(text, "\"active\":true") != NULL && migrated >= 1) {
+            saw_progress = 1;
+            free(text);
+            break;
+        }
+        free(text);
+        usleep(2000);
+    }
+    if (!saw_progress) {
+        fprintf(stderr, "migration did not report active progress\n");
+        return 1;
+    }
+
+    expect(shio_sync_cancel_migration(kernel), "migration cancel");
+    pthread_join(thread, NULL);
+    if (job.status != SHIO_CANCELLED) {
+        fail(job.status, "migration worker");
+    }
+
+    text = migration_progress_text(kernel, "migration progress(cancelled)");
+    contains(text, "\"active\":false", "migration progress(cancelled)");
+    contains(text, "\"done\":false", "migration progress(cancelled)");
+    free(text);
+
+    expect(shio_sync_migrate_all_ex(kernel, to, 0, 0), "migration resume");
+    text = migration_progress_text(kernel, "migration progress(done)");
+    contains(text, "\"active\":false", "migration progress(done)");
+    contains(text, "\"done\":true", "migration progress(done)");
+    free(text);
+
+    expect(shio_close(kernel), "migration close");
+    shio_kernel_destroy(kernel);
+    remove(path);
+    printf("MIGRATION_PROGRESS_OK\n");
+    return 0;
+}
+
+static int backup_restore_mode(const char *path)
+{
+    shio_kernel *source = NULL;
+    shio_kernel *restored = NULL;
+    uint8_t *buf = NULL;
+    size_t len = 0;
+    uint8_t id[16];
+    char backup_path[1024];
+    char target_path[1024];
+    char wrong_path[1024];
+    char *text = NULL;
+    char *source_db = NULL;
+    char *source_device = NULL;
+    char *restored_db = NULL;
+    char *restored_device = NULL;
+    int32_t status;
+
+    if (snprintf(backup_path, sizeof(backup_path), "%s.backup", path) >=
+            (int)sizeof(backup_path) ||
+        snprintf(target_path, sizeof(target_path), "%s.restored", path) >=
+            (int)sizeof(target_path) ||
+        snprintf(wrong_path, sizeof(wrong_path), "%s.wrong", path) >=
+            (int)sizeof(wrong_path)) {
+        fprintf(stderr, "backup paths are too long\n");
+        return 1;
+    }
+    remove(path);
+    remove(backup_path);
+    remove(target_path);
+    remove(wrong_path);
+
+    expect(shio_open(path, (const uint8_t *)PASSWORD, strlen(PASSWORD),
+                     (const uint8_t *)"{\"create\":true}",
+                     strlen("{\"create\":true}"), &source),
+           "backup open");
+    expect(shio_sync_enable(source, NULL, &buf, &len), "backup enable_sync");
+    shio_free(buf, len);
+    buf = NULL;
+    len = 0;
+    expect(shio_insert(source, "backup", "items",
+                       (const uint8_t *)"{\"name\":\"backup\"}",
+                       strlen("{\"name\":\"backup\"}"), id, &buf, &len),
+           "backup insert");
+    shio_free(buf, len);
+    buf = NULL;
+    len = 0;
+
+    text = sync_info_text(source, "backup sync_info(source)");
+    source_db = json_string(text, "db_id", "backup sync_info(source)");
+    source_device = json_string(text, "device_id", "backup sync_info(source)");
+    free(text);
+
+    expect(shio_backup(source, backup_path, &buf, &len), "shio_backup");
+    text = take_text(buf, len, "shio_backup");
+    printf("backup: %s\n", text);
+    if (json_u64(text, "row_count", "shio_backup") < 1 ||
+        json_u64(text, "format_version", "shio_backup") != 2) {
+        fprintf(stderr, "unexpected backup summary: %s\n", text);
+        return 1;
+    }
+    free(text);
+    buf = NULL;
+    len = 0;
+
+    /* 目标已存在时拒绝覆盖。 */
+    status = shio_backup(source, backup_path, &buf, &len);
+    if (status != SHIO_INVALID_ARGUMENT) {
+        fail(status, "shio_backup(existing)");
+    }
+    if (buf != NULL || len != 0) {
+        fprintf(stderr, "backup(existing) returned a buffer\n");
+        return 1;
+    }
+
+    /* 非空目标不得被恢复覆盖。 */
+    {
+        FILE *target_file = fopen(target_path, "wb");
+        if (target_file == NULL) {
+            fprintf(stderr, "cannot create restore target\n");
+            return 1;
+        }
+        fputs("keep", target_file);
+        fclose(target_file);
+    }
+    status = shio_restore(backup_path, target_path,
+                          (const uint8_t *)PASSWORD, strlen(PASSWORD),
+                          NULL, 0, &restored);
+    if (status != SHIO_INVALID_ARGUMENT || restored != NULL) {
+        fail(status, "shio_restore(nonempty)");
+    }
+    remove(target_path);
+
+    /* 错误口令不得发布目标。 */
+    status = shio_restore(backup_path, wrong_path,
+                          (const uint8_t *)"wrong-password",
+                          strlen("wrong-password"), NULL, 0, &restored);
+    if (status != SHIO_INVALID_KEY || restored != NULL) {
+        fail(status, "shio_restore(wrong password)");
+    }
+    if (access(wrong_path, F_OK) == 0) {
+        fprintf(stderr, "wrong-password restore left a target file\n");
+        return 1;
+    }
+
+    expect(shio_restore(backup_path, target_path,
+                        (const uint8_t *)PASSWORD, strlen(PASSWORD),
+                        NULL, 0, &restored),
+           "shio_restore");
+    expect(shio_get(restored, "backup", "items", id, &buf, &len),
+           "restored get");
+    text = take_text(buf, len, "restored get");
+    contains(text, "\"backup\"", "restored get");
+    free(text);
+    buf = NULL;
+    len = 0;
+
+    text = sync_info_text(restored, "backup sync_info(restored)");
+    restored_db = json_string(text, "db_id", "backup sync_info(restored)");
+    restored_device =
+        json_string(text, "device_id", "backup sync_info(restored)");
+    free(text);
+    if (strcmp(source_db, restored_db) != 0 ||
+        strcmp(source_device, restored_device) != 0) {
+        fprintf(stderr, "restored sync identity mismatch\n");
+        return 1;
+    }
+    free(source_db);
+    free(source_device);
+    free(restored_db);
+    free(restored_device);
+
+    expect(shio_close(source), "backup close(source)");
+    expect(shio_close(restored), "backup close(restored)");
+    shio_kernel_destroy(source);
+    shio_kernel_destroy(restored);
+    remove(path);
+    remove(backup_path);
+    remove(target_path);
+    printf("BACKUP_RESTORE_OK\n");
     return 0;
 }
 
@@ -502,6 +781,12 @@ static int sync_mode(const char *path)
     free(to_text);
     free(text);
 
+    text = migration_progress_text(a, "migration_progress(before)");
+    contains(text, "\"active\":false", "migration_progress(before)");
+    contains(text, "\"done\":false", "migration_progress(before)");
+    free(text);
+    expect(shio_sync_cancel_migration(a), "cancel_migration(idle)");
+
     expect(shio_sync_offers(a, &frame, &frame_len), "sync_offers(a)");
     if (frame == NULL || frame_len == 0) {
         fprintf(stderr, "sync_offers(a) returned an empty frame\n");
@@ -511,7 +796,11 @@ static int sync_mode(const char *path)
     shio_free(frame, frame_len);
     frame = NULL;
 
-    expect(shio_sync_migrate_all(a, to, NULL), "migrate_all(a)");
+    expect(shio_sync_migrate_all_ex(a, to, 1, 0), "migrate_all_ex(a)");
+    text = migration_progress_text(a, "migration_progress(after)");
+    contains(text, "\"active\":false", "migration_progress(after)");
+    contains(text, "\"done\":true", "migration_progress(after)");
+    free(text);
     pull_changes(a, b, "changes(after rotation)");
     expect(shio_get(b, "vault", "entries", id, &buf, &len),
            "sync get(b after rotation)");
@@ -574,7 +863,7 @@ int main(int argc, char **argv)
         fprintf(stderr,
                 "usage: %s <database-path> "
                 "[smoke|sync|hold|probe|check|read-hold|read-probe|read-locked|"
-                "rotate-many|resume-rotation]\n",
+                "rotate-many|resume-rotation|migration-progress|backup-restore]\n",
                 argv[0]);
         return 2;
     }
@@ -635,6 +924,14 @@ int main(int argc, char **argv)
 
     if (strcmp(mode, "sync") == 0) {
         return sync_mode(path);
+    }
+
+    if (strcmp(mode, "migration-progress") == 0) {
+        return migration_progress_mode(path);
+    }
+
+    if (strcmp(mode, "backup-restore") == 0) {
+        return backup_restore_mode(path);
     }
 
     if (strcmp(mode, "rotate-many") == 0) {

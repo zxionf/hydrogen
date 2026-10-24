@@ -209,3 +209,33 @@ Change: 20261022-android-kernel
 Context: P4 需要把已有 shio-sync 的变更页、offer、快照和配对能力暴露给 Android；Kotlin 不应解析 Rust 内部结构，同步帧已经是自校验的 SHY2 字节。
 Decision: C ABI v1 增量追加同步面：sync_enable/info/changes/apply、offers/apply_offers、snapshot_start/page/apply_snapshot、rotation/ack/migrate/retire/prune/compact、pairing_create/open_with_pairing。业务帧用不透明二进制，状态与报告用 JSON。只新增符号，不改变现有签名或语义，因此 ABI 版本保持 1；未来破坏性变更再升 2。
 Consequences: shio.h 与 shio-ffi 同步扩展；Kotlin 只处理帧字节和 JSON 控制面；网络/TLS、二维码、重试与后台调度仍归 oxygen，不进入内核。
+## [43] 2026-10-24 14:38:32 UTC
+Change: 20261024-storage-maintenance
+Context: 存储维护需要按风险和依赖排序，避免把轮换可用性、备份恢复、导入导出混成一个变更
+Decision: 先做 S1 轮换进度与限速，再做 S2 同设备备份与恢复；分步迁移、导入导出、多设备备份、物理压缩进入后续计划
+Consequences: S1/S2 可分别验收；导入导出与多设备克隆不会提前污染备份语义
+## [44] 2026-10-24 14:38:32 UTC
+Change: 20261024-storage-maintenance
+Context: format=2 大库迁移会长时间持有 session 写锁，当前 C ABI 只能阻塞等待，没有进度、取消和限速
+Decision: S1 采用方案 A：后台阻塞迁移，内核提供 batch_size 与 pause_ms，另提供不取 session 锁的进度查询与批次边界取消；仅覆盖 format=2；分步 API 方案 B 后置
+Consequences: 调用方需在后台线程执行迁移；迁移期间普通读写仍等待；取消后保留已迁移记录与旧 key，可重新扫描续跑
+## [45] 2026-10-24 14:38:33 UTC
+Change: 20261024-storage-maintenance
+Context: 备份、导出与多设备克隆的同步身份语义不同；同一份带 device_id 的备份同时运行会造成重复身份同步
+Decision: S2 只做同设备在线快照克隆备份与恢复，保留 db_id/device_id/peer 游标；多设备克隆后置，必须生成新 device_id 并清理 peer；原始数据导出导入格式以后约定并标为危险操作
+Consequences: 备份恢复可用于同安装灾难恢复；新设备仍走配对；导入导出不得以默认备份名义提供
+## [46] 2026-10-24 14:38:33 UTC
+Change: 20261024-storage-maintenance
+Context: 轮换进度 API 需要调整现有阻塞入口，旧客户端无法使用新语义；旧 format=1 轮换仍存在
+Decision: 轮换相关 API 不承诺与旧版客户端兼容，允许替换旧入口；S1 只给 format=2 增加进度/限速/取消，format=1 保留既有路径；非轮换 C ABI 仍增量演进
+Consequences: 实现时可调整轮换 C ABI；旧库仍可打开并完成既有轮换；轮换兼容性例外需在发布说明中标注
+## [47] 2026-10-24 15:07:17 UTC
+Change: 20261024-storage-maintenance
+Context: S1 增加迁移进度/取消入口、进度 JSON 与 Cancelled 错误分类，需要随包版本发布；C ABI 只追加符号与错误码
+Decision: workspace 包版本提升到 0.2.0；SHIO_ABI_VERSION 保持 1；新轮换入口按兼容性例外处理，其他 C ABI 仍增量演进
+Consequences: 内核版本可区分 S1 能力；旧非轮换客户端不受影响；轮换客户端需按新入口与进度语义适配
+## [48] 2026-10-24 15:31:57 UTC
+Change: 20261024-storage-maintenance
+Context: S2 设计中的 `shio_backup(handle, out_path)` 没有输出参数，却要求返回备份摘要 JSON；实现无法同时满足状态码与摘要输出
+Decision: `shio_backup` 增加显式 `out_json/out_json_len`，返回 `{"format_version","db_bytes","table_count","row_count"}`；目标已存在/恢复目标非空映射为 `InvalidArgument`，恢复忽略 `options.create`，不新增专用错误码
+Consequences: 头文件与 API 文档已同步；`shio_backup`/`shio_restore` 为新增非轮换符号，ABI 版本仍为 1；备份保留同设备身份，跨设备克隆仍后置

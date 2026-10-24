@@ -13,8 +13,9 @@ use std::time::Duration;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use shio::{
-    ApplyReport, Credential, DeviceId, Kernel, KeyId, ListOptions, OpenOptions, PairingOffer,
-    RecordId, RecordMeta, RotationInfo, SyncInfo, WriteOp, DEFAULT_LIST_LIMIT,
+    ApplyReport, Credential, DeviceId, Kernel, KeyId, ListOptions, MigrationOptions, OpenOptions,
+    PairingOffer, RecordId, RecordMeta, RotationInfo, SyncInfo, WriteOp, DEFAULT_LIST_LIMIT,
+    DEFAULT_MIGRATION_BATCH_SIZE,
 };
 use tokio::runtime::{Builder, Runtime};
 use zeroize::{Zeroize, Zeroizing};
@@ -70,6 +71,8 @@ pub const SHIO_ROTATION_REQUIRED: i32 = -20;
 pub const SHIO_PAIRING_EXPIRED: i32 = -21;
 /// 配对包无效。
 pub const SHIO_PAIRING_INVALID: i32 = -22;
+/// 操作在批次边界被取消。
+pub const SHIO_CANCELLED: i32 = -23;
 
 const MAX_INPUT_BYTES: usize = 64 * 1024 * 1024;
 const MAX_BATCH_OPS: usize = 1000;
@@ -194,6 +197,7 @@ fn status_for(error: &Error) -> i32 {
         Error::Closed => SHIO_CLOSED,
         Error::ReadOnly => SHIO_READ_ONLY,
         Error::Busy => SHIO_BUSY,
+        Error::Cancelled => SHIO_CANCELLED,
         Error::Locked => SHIO_LOCKED,
         Error::ValueTooLarge { .. } => SHIO_VALUE_TOO_LARGE,
         Error::Corrupted(_) => SHIO_CORRUPTED,
@@ -467,6 +471,90 @@ pub unsafe extern "C" fn shio_open(
 
         let runtime = new_runtime()?;
         let kernel = runtime.block_on(Kernel::open(options, Credential::password(password)))?;
+        let boxed = Box::new(ShioKernel {
+            runtime,
+            kernel: Mutex::new(Some(kernel)),
+        });
+        // SAFETY: 调用方提供了非空输出指针。
+        unsafe {
+            *out_handle = Box::into_raw(boxed);
+        }
+        Ok(())
+    })
+}
+
+/// 在线备份到 `out_path`，返回摘要 JSON；目标必须不存在。
+///
+/// # Safety
+///
+/// 句柄、NUL 结尾路径与输出指针必须按 `include/shio.h` 的契约有效。
+#[no_mangle]
+pub unsafe extern "C" fn shio_backup(
+    handle: *mut ShioKernel,
+    out_path: *const c_char,
+    out_json: *mut *mut u8,
+    out_json_len: *mut usize,
+) -> i32 {
+    ffi_guard(|| {
+        reset_output(out_json, out_json_len)?;
+        // SAFETY: 由调用方契约保证路径指针有效。
+        let path = unsafe { input_str(out_path)? };
+        // SAFETY: 调用方保证句柄来自 `shio_open` 且未 destroy。
+        let handle =
+            unsafe { handle.as_ref() }.ok_or(Error::InvalidArgument("kernel handle is null"))?;
+        let kernel = handle.kernel()?;
+        let info = handle.block_on(kernel.backup(PathBuf::from(path)))?;
+        let value = json!({
+            "format_version": info.format_version,
+            "db_bytes": info.db_bytes,
+            "table_count": info.table_count,
+            "row_count": info.row_count,
+        });
+        set_output(value_to_bytes(&value)?, out_json, out_json_len)
+    })
+}
+
+/// 从备份恢复到目标路径，并返回已打开的目标句柄。
+///
+/// 目标必须不存在或为空；恢复后保持源库的 `db_id` 与 `device_id`。
+///
+/// # Safety
+///
+/// 路径、口令、可选的 options JSON 与输出指针必须按 `include/shio.h` 的契约有效。
+#[no_mangle]
+pub unsafe extern "C" fn shio_restore(
+    backup_path: *const c_char,
+    target_path: *const c_char,
+    password: *const u8,
+    password_len: usize,
+    options_json: *const u8,
+    options_len: usize,
+    out_handle: *mut *mut ShioKernel,
+) -> i32 {
+    ffi_guard(|| {
+        if out_handle.is_null() {
+            return Err(Error::InvalidArgument("output handle is null"));
+        }
+        // SAFETY: 调用方提供了非空输出指针。
+        unsafe {
+            *out_handle = ptr::null_mut();
+        }
+
+        // SAFETY: 由调用方契约保证路径指针有效。
+        let backup_path = unsafe { input_str(backup_path)? };
+        // SAFETY: 由调用方契约保证路径指针有效。
+        let target_path = unsafe { input_str(target_path)? };
+        let password = input_password(password, password_len)?;
+        // SAFETY: 由调用方契约保证 options 指针有效。
+        let options_bytes = unsafe { input_bytes(options_json, options_len)? };
+        let options = parse_open_options(target_path, options_bytes)?;
+
+        let runtime = new_runtime()?;
+        let kernel = runtime.block_on(Kernel::restore(
+            options,
+            Credential::password(password),
+            PathBuf::from(backup_path),
+        ))?;
         let boxed = Box::new(ShioKernel {
             runtime,
             kernel: Mutex::new(Some(kernel)),
@@ -1270,6 +1358,85 @@ pub unsafe extern "C" fn shio_sync_migrate_all(
             // SAFETY: 调用方提供了可写指针。
             unsafe { *out_count = count };
         }
+        Ok(())
+    })
+}
+
+/// 按批次大小与批次间暂停迁移全部记录。
+///
+/// `batch_size` 为 0 时使用默认值；`pause_ms` 为 0 表示不暂停。
+///
+/// # Safety
+///
+/// 句柄与 16 字节 key ID 必须按 `include/shio.h` 的契约有效。
+#[no_mangle]
+pub unsafe extern "C" fn shio_sync_migrate_all_ex(
+    handle: *mut ShioKernel,
+    to: *const u8,
+    batch_size: u32,
+    pause_ms: u32,
+) -> i32 {
+    ffi_guard(|| {
+        let to = input_key_id(to)?;
+        // SAFETY: 调用方保证句柄来自 `shio_open` 且未 destroy。
+        let handle =
+            unsafe { handle.as_ref() }.ok_or(Error::InvalidArgument("kernel handle is null"))?;
+        let batch_size = if batch_size == 0 {
+            DEFAULT_MIGRATION_BATCH_SIZE
+        } else {
+            batch_size as usize
+        };
+        let options = MigrationOptions {
+            batch_size,
+            pause: Duration::from_millis(u64::from(pause_ms)),
+        };
+        let _ = handle
+            .kernel()?
+            .sync()?
+            .migrate_all_with_options(to, options)?;
+        Ok(())
+    })
+}
+
+/// 读取迁移进度 JSON；不获取迁移持有的会话锁。
+///
+/// # Safety
+///
+/// 句柄与输出指针必须按 `include/shio.h` 的契约有效。
+#[no_mangle]
+pub unsafe extern "C" fn shio_sync_migration_progress(
+    handle: *mut ShioKernel,
+    out_json: *mut *mut u8,
+    out_json_len: *mut usize,
+) -> i32 {
+    ffi_guard(|| {
+        reset_output(out_json, out_json_len)?;
+        // SAFETY: 调用方保证句柄来自 `shio_open` 且未 destroy。
+        let handle =
+            unsafe { handle.as_ref() }.ok_or(Error::InvalidArgument("kernel handle is null"))?;
+        let progress = handle.kernel()?.sync()?.migration_progress();
+        let value = json!({
+            "active": progress.active,
+            "scanned": progress.scanned,
+            "migrated": progress.migrated,
+            "done": progress.done,
+        });
+        set_output(value_to_bytes(&value)?, out_json, out_json_len)
+    })
+}
+
+/// 请求取消迁移；在下一次批次边界生效。
+///
+/// # Safety
+///
+/// 句柄必须按 `include/shio.h` 的契约有效。
+#[no_mangle]
+pub unsafe extern "C" fn shio_sync_cancel_migration(handle: *mut ShioKernel) -> i32 {
+    ffi_guard(|| {
+        // SAFETY: 调用方保证句柄来自 `shio_open` 且未 destroy。
+        let handle =
+            unsafe { handle.as_ref() }.ok_or(Error::InvalidArgument("kernel handle is null"))?;
+        handle.kernel()?.sync()?.cancel_migration();
         Ok(())
     })
 }

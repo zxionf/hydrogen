@@ -15,7 +15,7 @@
 ## 目标
 - 可嵌入的加密持久化内核：命名空间 → 集合 → 记录，单文件 redb，记录级 AEAD。
 - 内核同步、facade async；两者禁止 unsafe，可恢复失败一律以 `Result` 返回。
-- 当前形态：core 与 facade 均已可用——Argon2id/HKDF/AEAD、redb 表、同步 CRUD、异步句柄、改口令、数据密钥轮换、真正的只读打开；多端同步（format 2、设备配对、变更日志、快照、轮换）已可用；C ABI v1 已可用，覆盖 open/close、CRUD、batch、改口令、轮换、stats、flush 与 P4 同步/配对面。
+- 当前形态：core 与 facade 均已可用——Argon2id/HKDF/AEAD、redb 表、同步 CRUD、异步句柄、改口令、数据密钥轮换、真正的只读打开；多端同步（format 2、设备配对、变更日志、快照、轮换）已可用；`format=2` 迁移支持批次大小、批次间暂停、旁路进度与批次边界取消；C ABI v1 已可用，覆盖 open/close、CRUD、batch、改口令、轮换、迁移进度/取消、stats、flush 与 P4 同步/配对面。包版本为 `0.2.0`。
 - 记录格式 `format=1` 从首个实现起保持向后兼容；同步库使用不可回退的 `format=2`；API 在 1.0 前允许调整。
 
 ## 约束
@@ -63,7 +63,7 @@ shio/
 
 - `shio-core`：无 async、无 tokio；持有 redb 与密钥材料，所有操作为同步函数。`model`/`error`/`codec`/`codec2` 完整可用；`crypto` 提供 KDF、子密钥派生与 AEAD；`store::Engine` 提供创建/打开、泛型读写、`*_raw`、同步日志/快照/轮换/配对接口。
 - `shio`：把 core 的阻塞调用经 `spawn_blocking` 暴露为 async；管理句柄生命周期、在途操作与关闭等待；写路径在调用线程序列化，读路径在阻塞线程反序列化；`examples/notes.rs` 与 `examples/sync.rs` 给出最小可运行用法；`sync` feature 暴露 `Kernel::sync()` 与配对。
-- `shio-ffi`：仅为 C++/Vulkan GUI 与 Android 提供阻塞 C ABI，不承载业务逻辑；导出 `shio_open`/`shio_close`、CRUD、batch、改口令、轮换、stats、flush、ABI 版本与错误详情。每个句柄持有 tokio multi-thread runtime；`ffi` 模块是唯一 unsafe 边界。
+- `shio-ffi`：仅为 C++/Vulkan GUI 与 Android 提供阻塞 C ABI，不承载业务逻辑；导出 `shio_open`/`shio_close`、CRUD、batch、改口令、轮换、迁移进度/取消、stats、flush、ABI 版本与错误详情。每个句柄持有 tokio multi-thread runtime；`ffi` 模块是唯一 unsafe 边界。
 - `shio-sync`：只依赖 `shio-core`，不引入网络/TLS/后台线程；负责 `SHY2` 帧、Crockford Base32 配对 secret 与拥有型 `SyncHandle`。
 - `tests`：`autotests = false` 的成员包，通过显式 `[[test]]` 承载跨 crate 用例。
 
@@ -102,7 +102,7 @@ DK ──HKDF-SHA256(info 区分用途)──▶ 记录密钥 / 元数据密钥 
 - **format 2**：`key_id` 为 16 字节随机值；记录 header 与 AAD 使用 v2 布局，`shio.keys2` 每行独立 nonce。format 1 的 u16 `key_id` 只在升级期与旧库中保留。
 - **改口令**只重新包裹 DK：生成新盐与新 KEK，用新 nonce 重写密钥行；format 2 在同一事务内重包裹所有 `keys2` 行，format 1 仍要求单行。存在升级/轮换工作状态时返回 `Busy`。
 - **format 1 轮换**：`key_id` 递增（超上限拒绝），先写新 key 行，再按 256 条一批重加密记录，最后更新 meta 并删除旧行。
-- **format 2 轮换**：任意设备可 `begin_rotation`，生成随机 `to` 并发布 `kind=1` offer 与 `kind=3` 公告；其他设备安装 offer 后回 ack。写 key 按 `(created_at, key_id)` 收敛，并发轮换形成 key DAG。`migrate_all(to)` 分批重加密，`retire(from)` 需所有已知设备公告迁移完成。
+- **format 2 轮换**：任意设备可 `begin_rotation`，生成随机 `to` 并发布 `kind=1` offer 与 `kind=3` 公告；其他设备安装 offer 后回 ack。写 key 按 `(created_at, key_id)` 收敛，并发轮换形成 key DAG。`migrate_all(to)` 分批重加密，`migrate_all_with_options` 额外支持 `batch_size`、批次间暂停、旁路进度与批次边界取消；迁移期间仍持有 session 写锁，`retire(from)` 需所有已知设备公告迁移完成。
 - **设备配对**：`SHB2` 明文携带整条密钥链（≤32），用 32 字节 pairing secret 经 Argon2id 派生的密钥加密为 `SHW2`；secret 以 Crockford Base32 文本进入二维码，指纹为外层 SHA-256 前 3 字节。目标设备得到同一组 DK 与新 device id，直接是 format 2。
 - 会话保留 KEK 与 DK 供改口令/轮换/配对使用；所有密钥材料用 `zeroize` 在离开作用域时清零；错误信息、日志、panic 信息不得包含密钥或明文。
 - Argon2id 默认参数：`m=65536 KiB, t=3, p=1`，盐 16 字节；参数随库存储，允许未来升级与按设备下调（包括测试用的小参数）。
@@ -124,9 +124,9 @@ DK ──HKDF-SHA256(info 区分用途)──▶ 记录密钥 / 元数据密钥 
 ## API 风格
 - 对外 async（tokio），内核同步；阻塞调用统一走 `spawn_blocking`，不占用 executor 线程。
 - core 的同步入口是 `store::Engine`：`Engine::open(EngineOptions, password)`，选项含路径、是否创建、是否只读、明文上限、`app_id`、建库 KDF 参数与 redb 页缓存。
-- `Engine` 提供 `insert`/`put`/`get`/`delete`/`purge`/`list`/`batch`/`collections`/`stats`/`flush`、密钥生命周期的 `change_password`/`rotate_data_key`，以及收发已序列化明文的 `insert_raw`/`put_raw`/`get_raw`/`batch_raw`；同步面提供 `enable_sync`/`sync_info`/`changes_since`/`apply_page`/快照/轮换/配对；`Send + Sync`。
+- `Engine` 提供 `insert`/`put`/`get`/`delete`/`purge`/`list`/`batch`/`collections`/`stats`/`flush`、密钥生命周期的 `change_password`/`rotate_data_key`，以及收发已序列化明文的 `insert_raw`/`put_raw`/`get_raw`/`batch_raw`；同步面提供 `enable_sync`/`sync_info`/`changes_since`/`apply_page`/快照/轮换/配对，以及 `migrate_all_with_options`/`migration_progress`/`cancel_migration`；存储维护 S2 提供 `backup`/`restore`；`Send + Sync`。
 - facade 的 `Kernel::open(OpenOptions, Credential)` 完成参数校验、口令派生与解锁；`Credential::password` 接收 `Into<SecretString>`，`Debug` 输出脱敏。
-- `Kernel` 是廉价可克隆句柄（内部 `Arc`），`Send + Sync`；提供 `namespace`、`flush`、`close`、`stats`、`change_password`、`rotate_data_key`；`sync` feature 下提供 `sync_info`、`sync()` 与 `create_pairing_offer`。`close` 标记关闭并等待在途操作结束，之后新操作返回 `Closed`，重复调用返回 `Ok(())`。
+- `Kernel` 是廉价可克隆句柄（内部 `Arc`），`Send + Sync`；提供 `namespace`、`flush`、`close`、`stats`、`change_password`、`rotate_data_key`、`backup`/`restore`；`sync` feature 下提供 `sync_info`、`sync()` 与 `create_pairing_offer`。`close` 标记关闭并等待在途操作结束，之后新操作返回 `Closed`，重复调用返回 `Ok(())`。
 - `shio-sync` 的 `Sync<'a>` 借用 `Engine`，`SyncHandle` 持有 `Arc<Engine>`；二者负责 `SHY2` 编解码、快照迭代与配对文本，不自带传输层。`shio::open_with_pairing` 只创建新库，secret 用 `Zeroizing<String>` 搬运。
 - `shio::version()` 返回编译期内核版本（与包版本一致），不需要打开数据库；库的数据格式版本从 `Kernel::stats().format_version` 读取。
 - `Namespace` 与 `Collection<T>` 是从 `Kernel` 派生的轻量句柄，不复制连接；名称在构造时校验，不访问磁盘。`Namespace` 提供 `collections`，`Collection<T>` 提供 `insert/put/get/delete/purge/list/batch`。
@@ -134,6 +134,7 @@ DK ──HKDF-SHA256(info 区分用途)──▶ 记录密钥 / 元数据密钥 
 - `read_only=true` 时 core 的写入口直接返回 `ReadOnly`，底层以 redb 只读库打开、不持有写锁；facade 保留进入阻塞线程前的快速闸门，`create` 与 `read_only` 组合非法。
 - `change_password` 与 `rotate_data_key` 都是写操作，经 `spawn_blocking` 执行；只读句柄返回 `ReadOnly`。
 - 事务边界：v0.1 以 `batch` 作为唯一原子业务写单元，不暴露长生命周期事务对象；密钥轮换按批提交，但通过多密钥会话保证任意中断点都可读。
+- 备份边界：在线备份在一个 redb 读事务中复制全部已知表，不解密、不重加密；目标必须不存在，先在目标同目录写临时文件，校验表行数与 `meta` 原始字节后原子改名。恢复目标必须不存在或为 0 字节；先复制到临时文件，用原口令完成 key check/结构校验，再替换空目标。失败清理临时文件，不留下半成品。
 - 可恢复错误一律返回 `Result`，不以 panic 表达业务失败；公开签名与错误枚举见 `.design/api.md`。
 
 ## 稳定性与错误处理
@@ -145,20 +146,20 @@ DK ──HKDF-SHA256(info 区分用途)──▶ 记录密钥 / 元数据密钥 
 - 由于所有写操作都会读取并复用已有 header，写入路径同样执行完整解码与校验。
 - 长度与偏移计算使用 `checked_*`，防止整数溢出；不靠 unsafe 做性能捷径。
 - 内存分配失败、文件锁冲突、磁盘只读等环境错误都返回错误，不 abort；redb 的 `DatabaseAlreadyOpen` 映射为 `Locked`，Android 旁路 `.lock` 的冲突同样映射为 `Locked`，其余存储错误归入 `Database`。
-- DK 解包与 key check 失败映射为 `InvalidKey`；记录结构或认证失败映射为 `Corrupted`；库文件缺失映射为 `NotFound`；轮换/升级未完成导致的工作状态冲突映射为 `Busy`；只读句柄的写操作映射为 `ReadOnly`。
+- DK 解包与 key check 失败映射为 `InvalidKey`；记录结构或认证失败映射为 `Corrupted`；库文件缺失映射为 `NotFound`；轮换/升级未完成导致的工作状态冲突映射为 `Busy`；只读句柄的写操作映射为 `ReadOnly`；迁移在批次边界取消映射为 `Cancelled`（C ABI 为 `SHIO_CANCELLED`）。备份/恢复的目标已存在或非空映射为 `InvalidArgument`，错误口令仍映射为 `InvalidKey`。
 - 同步错误：未启用同步返回 `SyncDisabled`，游标被压缩返回 `SyncResyncRequired`，缺记录 key 返回 `RotationRequired`，同步模式物理删除返回 `SyncEnabled`，配对过期/失败返回 `PairingExpired`/`PairingInvalid`。
 - 密钥轮换/升级的每个中断点都保持可读：新 key 行与升级状态先落盘，记录按自身 `key_id` 解密，meta 最后切换；重跑轮换/升级可复用已写入状态并从中断处继续。
 - facade 不把 panic 带过线程边界：`spawn_blocking` 的 `JoinError` 统一转为 `Internal`；句柄状态锁与密钥会话锁中毒同样返回 `Internal`。
 - 关闭语义：取引擎时登记在途计数，`close` 置空引擎并等待计数归零；已开始的操作持有 `Arc<Engine>` 完成，之后数据库才释放文件锁。
 - FFI 边界用 `catch_unwind` 把 panic 转为 `SHIO_INTERNAL`，绝不让 panic 跨 C ABI 传播；错误详情线程局部，返回缓冲区由 `shio_free` 释放并清零。
-- 测试覆盖截断值、随机字节、错误口令、并发关闭与磁盘只读；关键编解码做 fuzz/property 测试。当前已覆盖错误口令、截断/篡改的 blob 与记录、分页、批量回滚、句柄关闭、只读拒写、改口令、全量轮换与轮换中断后重跑，以及同步升级、双端 LWW/墓碑、快照/压缩、轮换/ack/退役、配对密钥链、帧截断/超限/`db_id` 不匹配；Android x86_64 C ABI 覆盖双库同步、只读并发锁与轮换中断续跑。
+- 测试覆盖截断值、随机字节、错误口令、并发关闭与磁盘只读；关键编解码做 fuzz/property 测试。当前已覆盖错误口令、截断/篡改的 blob 与记录、分页、批量回滚、句柄关闭、只读拒写、改口令、全量轮换与轮换中断后重跑，以及同步升级、双端 LWW/墓碑、快照/压缩、轮换/ack/退役、配对密钥链、帧截断/超限/`db_id` 不匹配、迁移进度/取消/续跑、格式 1/2 在线备份与恢复、在线写入期间备份、错误口令/损坏备份/目标已存在/非空目标与同步身份保持；Android x86_64 C ABI 覆盖双库同步、只读并发锁、轮换中断续跑、迁移取消/续跑与备份恢复。
 - 静态护栏：workspace lints 拒绝 `unsafe`、`unwrap` / `expect` / `panic!` 与未实现的占位宏，新增 crate 默认继承。
 - 编解码用例必须覆盖损坏输入：魔数不符、未知格式版本、`key_id` 越界、截断、`ct_len` 与总长不符、尾随字节。
 
 ## 平台与互操作
 - **Rust 应用**：直接依赖 `shio`。
 - **C++/Vulkan GUI 与 Android**：经 `shio-ffi` 的 C ABI 调用；句柄不透明，字节串带长度，错误用显式错误码 + 线程局部错误详情。JNI/Kotlin 包装层由 `shio-android` 维护，内核不绑定 Java 包名。
-- **Android**：数据库放应用私有目录；不依赖系统钥匙串，口令解锁因此在无头/服务环境同样可用。应用 minSdk 为 29；首版目标为 `aarch64-linux-android` 真机与 `x86_64-linux-android` 模拟器，NDK r29。内核 `libshio_ffi.so` 仍按 API 24 构建基线链接，`.note.android.ident` 为 API 24，可在 minSdk 29 上加载；`LOAD` 对齐为 16 KB。x86_64 模拟器已通过 C ABI 冒烟：CRUD、batch、关闭/重开、改口令、轮换、只读、同进程与跨进程文件锁、杀进程后重开、双库同步/配对/快照、轮换中断续跑与独立进程只读；`oxygen` 已在 vivo V2359A（arm64 / Android 16）完成 JNI、APK 打包与杀进程重开验收。redb 4.4 的字节范围锁在 Android 上返回 `Unsupported`，facade 因此在该平台使用旁路 `<db>.lock` 文件与 `rustix::fs::flock`：写句柄独占、只读句柄共享；冲突映射为 `Locked`。默认 KDF 保持 `64 MiB、t=3`，低端机不纳入首版验证（决策 #41）。
+- **Android**：数据库放应用私有目录；不依赖系统钥匙串，口令解锁因此在无头/服务环境同样可用。应用 minSdk 为 29；首版目标为 `aarch64-linux-android` 真机与 `x86_64-linux-android` 模拟器，NDK r29。内核 `libshio_ffi.so` 仍按 API 24 构建基线链接，`.note.android.ident` 为 API 24，可在 minSdk 29 上加载；`LOAD` 对齐为 16 KB。x86_64 模拟器已通过 C ABI 冒烟：CRUD、batch、关闭/重开、改口令、轮换、只读、同进程与跨进程文件锁、杀进程后重开、双库同步/配对/快照、迁移进度/取消/续跑、轮换中断续跑、备份恢复与独立进程只读；`oxygen` 已在 vivo V2359A（arm64 / Android 16）完成 JNI、APK 打包与杀进程重开验收。redb 4.4 的字节范围锁在 Android 上返回 `Unsupported`，facade 因此在该平台使用旁路 `<db>.lock` 文件与 `rustix::fs::flock`：写句柄独占、只读句柄共享；冲突映射为 `Locked`。默认 KDF 保持 `64 MiB、t=3`，低端机不纳入首版验证（决策 #41）。
 - **服务端**：同一存储格式，仅改变打开路径、并发部署与备份策略，不引入第二套内核。
 - **稳定性与 unsafe**：内核的首要要求是不出现未定义行为、不因内部错误崩溃。`shio-core` / `shio` / `shio-sync` 保持 `forbid(unsafe_code)`；`shio-ffi` 的 unsafe 已经用户明确批准，仅限 C ABI 边界模块，逐条以 SAFETY 注释审计。C ABI v1 已实现并通过 host 冒烟、Android 两 target 编译。
 - 未来插件系统通过“每插件独立命名空间 + 能力白名单”接入，不改变存储格式；本次只预留命名空间隔离。

@@ -26,15 +26,17 @@ pub use shio_core::model::{
     validate_name, ListOptions, NameKind, Page, RecordId, RecordMeta, Stored, Timestamp, WriteOp,
     DEFAULT_LIST_LIMIT, DEFAULT_MAX_VALUE_SIZE, MAX_LIST_LIMIT, MAX_NAME_LEN,
 };
-pub use shio_core::store::Stats;
+pub use shio_core::store::{BackupInfo, Stats};
 #[cfg(feature = "sync")]
 pub use shio_core::sync::pairing_fingerprint;
 #[cfg(feature = "sync")]
 pub use shio_core::{DeviceId, KeyId};
 #[cfg(feature = "sync")]
 pub use shio_sync::{
-    ApplyReport, ChangeEntry, ChangePage, OfferPage, PairingOffer, RotationInfo, RotationOffer,
-    SnapshotIter, SnapshotPage, SnapshotRecord, SyncHandle, SyncInfo,
+    ApplyReport, ChangeEntry, ChangePage, MigrationOptions, MigrationProgress, OfferPage,
+    PairingOffer, RotationInfo, RotationOffer, SnapshotIter, SnapshotPage, SnapshotRecord,
+    SyncHandle, SyncInfo, DEFAULT_MIGRATION_BATCH_SIZE, MAX_MIGRATION_BATCH_SIZE,
+    MAX_MIGRATION_PAUSE_MS,
 };
 
 /// 查询内核版本。

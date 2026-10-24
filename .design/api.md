@@ -90,6 +90,16 @@ pub struct Kernel { /* Arc<Inner> */ }
 impl Kernel {
     pub async fn open(options: OpenOptions, credential: Credential) -> Result<Kernel>;
 
+    /// 在线备份；目标必须不存在。
+    pub async fn backup(&self, target: PathBuf) -> Result<BackupInfo>;
+
+    /// 从备份恢复到 options.path；目标必须不存在或为空，create 被忽略。
+    pub async fn restore(
+        options: OpenOptions,
+        credential: Credential,
+        backup: PathBuf,
+    ) -> Result<Kernel>;
+
     pub fn namespace(&self, name: &str) -> Result<Namespace>;
 
     pub async fn flush(&self) -> Result<()>;
@@ -105,6 +115,13 @@ impl Kernel {
     pub fn stats(&self) -> Result<Stats>;
 }
 
+pub struct BackupInfo {
+    pub format_version: u16,
+    pub db_bytes: u64,
+    pub table_count: u64,
+    pub row_count: u64,
+}
+
 pub struct Stats {
     pub format_version: u16,
     pub key_id: KeyId,
@@ -115,6 +132,8 @@ pub struct Stats {
 `Kernel` 为 `Clone + Send + Sync + 'static`。`flush` 在默认持久化模式下是屏障语义；redb 每次提交即持久化，不依赖进程退出。
 
 `Stats.key_id` 在 `format=1` 下是 `KeyId::from_u16` 的映射，在 `format=2` 下是 16 字节随机值（见第 12 节）。
+
+`Kernel::backup` 在源库读事务中复制全部已知表；备份期间源库可继续写入，但旧页回收可能推迟。`Kernel::restore` 强制 `create=false`，在 Android 上先取得目标 `.lock` 独占锁，再用原口令校验临时副本；恢复后的库保留 `db_id`/`device_id`/key 链/同步游标，禁止把同一备份恢复到两台设备后同时启用同步。
 
 ### 4.4 `Namespace`
 
@@ -288,6 +307,7 @@ impl NameKind {
 - `Kernel`、`Namespace`、`Collection<T>` 均可跨任务克隆；内部共享同一引擎。
 - 并发写由 redb 写锁串行化；并发读使用 MVCC 快照，不阻塞写。
 - async 方法内部通过 `spawn_blocking` 调用 core；**取消 future 不会中止已开始的文件操作**，该操作可能仍会提交。调用方若需要“确定未执行”，应在取消后重新读取状态。
+- `format=2` 数据密钥迁移提供显式取消：取消在批次边界生效，已提交批次保留，旧 key 不删除；调用方应在后台线程执行迁移，在其它线程轮询进度或请求取消。
 - `close` 与进行中的操作并发时：新操作立即 `Closed`，已开始的操作允许完成。
 - `Collection<T>` 不缓存数据；不存在跨句柄的脏读。
 
@@ -311,6 +331,7 @@ pub enum Error {
     Closed,
     ReadOnly,
     Busy,
+    Cancelled,
     Locked,
     ValueTooLarge { size: usize, max: usize },
     Corrupted(&'static str),
@@ -327,12 +348,13 @@ pub enum NameKind { Namespace, Collection }
 
 - `InvalidKey` 不区分口令错误与密钥损坏，避免口令预言机。
 - `Busy` 表示密钥轮换未完成（存在多行 key），需先完成轮换；锁冲突仍用 `Locked`。
+- `Cancelled` 表示迁移在批次边界被调用方取消；已提交记录保留，可重新调用迁移继续。
 - `Corrupted` 表示结构或认证失败（AEAD tag 校验失败也归入此类，不泄露细节）。
 - 错误实现 `std::error::Error` 与 `Display`；不实现 `Clone`。
 - 可恢复错误不 panic；只有违反类型不变式（如内部状态机损坏）才允许 `debug_assert` 后返回 `Internal`。
 - 所有来自落盘字节的输入先做长度/边界校验；失败返回 `Corrupted` 或 `Deserialize`，绝不 panic、越界或 abort。
 
-## 8. C ABI 映射（v1 + P4 同步扩展）
+## 8. C ABI 映射（v1 + P4 同步扩展 + 存储维护 S1/S2）
 
 C++ 与 Android 通过 `shio-ffi` 调用；契约头文件为 `crates/shio-ffi/include/shio.h`。用户已批准 `shio-ffi` 的 unsafe 例外，允许范围只在本 crate 的 FFI 边界内；`shio-core` 与 `shio` 继续 `forbid(unsafe_code)`。JNI/Kotlin 包装层由 `shio-android` 实现，内核不绑定具体 Java 包名或 UI 技术栈。
 
@@ -346,6 +368,8 @@ C++ 与 Android 通过 `shio-ffi` 调用；契约头文件为 `crates/shio-ffi/i
 - FFI 内部为每个句柄持有 tokio multi-thread runtime，对外暴露**阻塞调用**；C++/Android 必须在 worker 线程调用，不阻塞 UI 线程。
 - 所有导出函数都经过 `catch_unwind`；panic 转为 `SHIO_INTERNAL`，不跨 C ABI。
 - 回调、取消令牌、异步 future 不在 v1。P4 以**增量符号**追加 sync/pairing；不改变现有函数签名或语义，因此 `SHIO_ABI_VERSION` 仍为 1，破坏性变更才升 2。
+- 存储维护 S1 的轮换取消通过旁路状态与批次边界实现，不引入回调或取消令牌；轮换接口是兼容性例外，允许不兼容旧客户端，其他非轮换接口仍按增量方式演进。
+- 存储维护 S2 的备份/恢复是新增非轮换符号；`shio_backup` 通过显式输出参数返回摘要 JSON，`shio_restore` 直接返回已打开的目标句柄。
 - 同步业务数据只以不透明的 `SHY2` 帧进出；Kotlin/Java 不解析帧内部结构。同步状态、轮换信息和应用报告是小体积 JSON。
 
 ```c
@@ -355,6 +379,12 @@ size_t   shio_last_error(const shio_kernel *k, char *buf, size_t len);
 int32_t shio_open(const char *path, const uint8_t *password, size_t password_len,
                   const uint8_t *options_json, size_t options_len,
                   shio_kernel **out);
+int32_t shio_backup(shio_kernel *k, const char *out_path,
+                    uint8_t **out_json, size_t *out_json_len);
+int32_t shio_restore(const char *backup_path, const char *target_path,
+                     const uint8_t *password, size_t password_len,
+                     const uint8_t *options_json, size_t options_len,
+                     shio_kernel **out);
 int32_t shio_close(shio_kernel *kernel);
 void    shio_kernel_destroy(shio_kernel *kernel);
 
@@ -439,6 +469,13 @@ int32_t shio_sync_rotation_state(shio_kernel *k,
 int32_t shio_sync_ack_rotation(shio_kernel *k, const uint8_t *to);
 int32_t shio_sync_migrate_all(shio_kernel *k, const uint8_t *to,
                               uint64_t *out_count);
+/* batch_size=0 使用默认 256；0<=pause_ms<=60000；取消在批次边界生效。 */
+int32_t shio_sync_migrate_all_ex(shio_kernel *k, const uint8_t *to,
+                                 uint32_t batch_size, uint32_t pause_ms);
+/* 返回 {"active":bool,"scanned":N,"migrated":N,"done":bool}。 */
+int32_t shio_sync_migration_progress(shio_kernel *k,
+                                     uint8_t **out_json, size_t *out_json_len);
+int32_t shio_sync_cancel_migration(shio_kernel *k);
 int32_t shio_sync_retire(shio_kernel *k, const uint8_t *from);
 int32_t shio_sync_prune_offers(shio_kernel *k, const uint8_t *to);
 int32_t shio_sync_compact(shio_kernel *k, uint64_t before,
@@ -473,8 +510,12 @@ JSON 形状：
 - `shio_list` 返回 `{"items":[...],"next":"uuid"|null}`；`after` 为 `NULL` 表示从头，`limit == 0` 使用默认值。
 - `shio_batch` 输入为 `[{"id":"uuid","value":...},{"id":"uuid","delete":true}]`，最多 1000 条，单次原子提交。
 - `shio_stats` 返回 `format_version`、`key_id`（32 位十六进制）和 `db_bytes`。
+- `shio_backup` 返回 `{"format_version":N,"db_bytes":N,"table_count":N,"row_count":N}`；备份文件使用原库口令打开，不携带明文或密钥。目标已存在返回 `SHIO_INVALID_ARGUMENT`；失败不会留下目标或临时文件。
+- `shio_restore` 的目标必须不存在或为 0 字节；`options_json` 的 `create` 被忽略。恢复失败返回对应错误并删除临时文件/未完成的目标；成功返回已打开的目标句柄。目标非空返回 `SHIO_INVALID_ARGUMENT`。
 - `shio_sync_info` / `shio_sync_enable` 返回 `{"db_id":"32hex","device_id":"32hex","current_key_id":"32hex","log_start":N,"log_end":N,"baseline_done":bool}`。
 - `shio_sync_begin_rotation` / `shio_sync_rotation_state` 返回 `{"from":"32hex","to":"32hex","created_at":millis,"acked":["32hex",...]}`；没有进行中的轮换时 `rotation_state` 返回 `null`。
+- `shio_sync_migration_progress` 返回 `{"active":bool,"scanned":N,"migrated":N,"done":bool}`；`scanned` 含已迁移记录，`done` 只表示最近一次迁移完整成功，不承诺百分比。
+- `shio_sync_migrate_all_ex` 在取消时返回 `SHIO_CANCELLED`；已提交批次保留，旧 key 不删除。恢复中断轮换先取 `shio_sync_rotation_state` 的 `to`，再迁移。
 - `shio_sync_apply` / `shio_sync_apply_snapshot` 返回 `{"applied":N,"skipped":N,"controls":N}`。
 - `shio_sync_create_pairing` 返回 `{"secret":"<Base32>","fingerprint":"<6 位十六进制>"}`；`secret` 只用于配对展示，不得写日志。
 - `shio_sync_changes`、`shio_sync_offers`、`shio_sync_snapshot_page` 的 `out_frame` 是 `SHY2` 帧；调用方不得解析或改写，只负责传输与 `shio_free`。
@@ -790,7 +831,35 @@ pub struct PairingOffer {
 ### 12.4 `shio-core` 同步接口
 
 ```rust
+pub struct MigrationOptions {
+    pub batch_size: usize, // 1..=1024，默认 256
+    pub pause: Duration,   // 0..=60s，默认 0
+}
+
+pub struct MigrationProgress {
+    pub active: bool,
+    pub scanned: u64,
+    pub migrated: u64,
+    pub done: bool,
+}
+
+pub struct BackupInfo {
+    pub format_version: u16,
+    pub db_bytes: u64,
+    pub table_count: u64,
+    pub row_count: u64,
+}
+```
+
+```rust
 impl Engine {
+    pub fn backup(&self, target: &Path) -> Result<BackupInfo>;
+    pub fn restore(
+        backup: &Path,
+        options: EngineOptions,
+        password: &[u8],
+    ) -> Result<Engine>;
+
     pub fn enable_sync(&self, device_id: Option<DeviceId>) -> Result<SyncInfo>;
     pub fn sync_info(&self) -> Result<SyncInfo>;
     pub fn changes_since(&self, after: u64, limit: usize) -> Result<ChangePage>;
@@ -805,6 +874,13 @@ impl Engine {
     pub fn rotation_offers(&self) -> Result<Vec<RotationOffer>>;
     pub fn acknowledge_rotation(&self, to: KeyId) -> Result<()>;
     pub fn migrate_all(&self, to: KeyId) -> Result<u64>;
+    pub fn migrate_all_with_options(
+        &self,
+        to: KeyId,
+        options: MigrationOptions,
+    ) -> Result<u64>;
+    pub fn migration_progress(&self) -> MigrationProgress;
+    pub fn cancel_migration(&self);
     pub fn retire_key(&self, from: KeyId) -> Result<()>;
     pub fn prune_rotation_offers(&self, to: KeyId) -> Result<()>;
 
@@ -824,12 +900,16 @@ impl Engine {
 }
 ```
 
+- `backup` 在一个 redb 读事务中复制全部已知表到临时文件，校验表行数与 `meta` 原始字节后原子改名；目标已存在返回 `InvalidArgument`。备份不压缩同步日志，也不解密/重加密。
+- `restore` 接受不存在的目标或 0 字节文件；先复制到同目录临时文件，用原口令打开校验，再替换空目标。校验失败删除临时文件；目标非空返回 `InvalidArgument`。`options.create` 被忽略，恢复出的库保留源库身份与同步状态。
 - `enable_sync` 在 `format=1` 上执行不可回退升级；`format=2` 直接初始化。
 - `apply_page` 整页一个写事务，推进 `peer/<sender>` 游标；缺 key 返回 `RotationRequired`。
 - `apply_snapshot_page` 同样整页原子，写入的记录日志以本机 `device_id` 为 `writer`；缺 key 返回 `RotationRequired`。
 - `begin_rotation` 任意设备可调用；并发轮换产生不同随机 `to`，写 key 按 `(created_at, key_id)` 收敛。
 - `migrate_all` 重加密记录时推进 `updated_at`（至少 +1），避免旧密钥的同一逻辑版本在 LWW 的 blob 次序里把已迁移记录翻回旧密钥。
-- `rotate_data_key` 在同步模式下等价于 `begin_rotation` + `migrate_all(to)`，不自动退役。
+- `migrate_all_with_options` 保持迁移期间 session 写锁；`migration_progress` 与 `cancel_migration` 走旁路状态，不获取该锁。取消在批次提交后的边界生效。
+- 取消后再次 `migrate_all(to)` 会从起点扫描并跳过已迁移记录；恢复中断轮换使用 `rotation_state()` 取 `to`，不要用 `rotate_data_key`。
+- `rotate_data_key` 在同步模式下等价于 `begin_rotation` + `migrate_all(to)`，不自动退役；`format=1` 路径不提供进度或取消。
 - 同步模式的 `change_password` 在同一事务内重新包裹所有 `shio.keys2` 行（同一新 salt/KEK、各自 nonce）；`format=1` 仍要求单行。
 - `open_with_pairing` 只创建新库，目标必须不存在或为空；成功时直接是 `format=2`，失败不会留下半成品文件。
 - 配对包不携带 TTL；接收端固定按 `DEFAULT_PAIRING_TTL`（10 分钟）窗口校验 `created_at`，`ttl` 由调用方用于展示与过期控制。
@@ -871,6 +951,13 @@ impl<'a> Sync<'a> {
     pub fn rotation_state(&self) -> Result<Option<RotationInfo>>;
     pub fn acknowledge_rotation(&self, to: KeyId) -> Result<()>;
     pub fn migrate_all(&self, to: KeyId) -> Result<u64>;
+    pub fn migrate_all_with_options(
+        &self,
+        to: KeyId,
+        options: MigrationOptions,
+    ) -> Result<u64>;
+    pub fn migration_progress(&self) -> MigrationProgress;
+    pub fn cancel_migration(&self);
     pub fn retire(&self, from: KeyId) -> Result<()>;
     pub fn prune_offers(&self, to: KeyId) -> Result<()>;
     pub fn compact(&self, before: u64) -> Result<u64>;
@@ -930,9 +1017,11 @@ pub enum Error {
     RotationRequired { key_id: KeyId },
     PairingExpired,
     PairingInvalid,
+    Cancelled,
 }
 ```
 
+- `Cancelled`：`format=2` 迁移在批次边界被取消；已迁移记录保留，可重新迁移。
 - `SyncDisabled`：未启用同步就拉取/应用日志。
 - `SyncEnabled`：同步模式下调用 `purge`。
 - `SyncResyncRequired`：游标早于 `log_start`，需走快照。

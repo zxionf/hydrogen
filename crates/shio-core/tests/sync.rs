@@ -8,11 +8,14 @@
 )]
 
 use std::path::Path;
+use std::sync::mpsc;
+use std::sync::{Arc, Barrier};
+use std::time::{Duration, Instant};
 
 use shio_core::crypto::kdf::KdfParams;
 use shio_core::model::RecordId;
 use shio_core::store::{Engine, EngineOptions};
-use shio_core::{ChangeEntry, DeviceId, Error, KeyId};
+use shio_core::{ChangeEntry, DeviceId, Error, KeyId, MigrationOptions};
 
 const PASSWORD: &[u8] = b"correct horse battery staple";
 
@@ -237,6 +240,141 @@ fn rotation_installs_keys_and_converges() {
 }
 
 #[test]
+fn migration_reports_progress_blocks_reads_and_resumes_after_cancel() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Arc::new(create(&dir.path().join("a.redb")));
+    enable(&engine);
+
+    let mut ids = Vec::new();
+    for index in 0..30 {
+        let id = RecordId::new_v7();
+        ids.push(id);
+        engine
+            .put("notes", "note", id, &format!("value-{index}"), 1)
+            .unwrap();
+    }
+    let old = engine.sync_info().unwrap().current_key_id;
+    let to = engine.begin_rotation().unwrap().to;
+    let options = MigrationOptions {
+        batch_size: 1,
+        pause: Duration::from_millis(20),
+    };
+
+    let worker_engine = Arc::clone(&engine);
+    let worker = std::thread::spawn(move || worker_engine.migrate_all_with_options(to, options));
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let progress = engine.migration_progress();
+        if progress.active && progress.migrated >= 1 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "migration did not make progress: {progress:?}"
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    }
+
+    let (sender, receiver) = mpsc::channel();
+    let reader_engine = Arc::clone(&engine);
+    let read_id = ids[0];
+    let reader = std::thread::spawn(move || {
+        let result = reader_engine.get::<String>("notes", "note", &read_id);
+        sender.send(result.is_ok()).unwrap();
+    });
+    std::thread::sleep(Duration::from_millis(30));
+    assert!(matches!(
+        receiver.try_recv(),
+        Err(mpsc::TryRecvError::Empty)
+    ));
+
+    engine.cancel_migration();
+    assert!(matches!(worker.join().unwrap(), Err(Error::Cancelled)));
+    reader.join().unwrap();
+    assert!(receiver.recv().unwrap());
+
+    let progress = engine.migration_progress();
+    assert!(!progress.active);
+    assert!(!progress.done);
+    assert!(progress.scanned >= progress.migrated);
+    assert!(progress.migrated >= 1);
+
+    let remaining = engine.migrate_all(to).unwrap();
+    assert!(remaining > 0);
+    let progress = engine.migration_progress();
+    assert!(!progress.active);
+    assert!(progress.done);
+    assert_eq!(progress.migrated, remaining);
+    assert!(progress.scanned >= progress.migrated);
+
+    for (index, id) in ids.iter().enumerate() {
+        assert_eq!(
+            engine
+                .get::<String>("notes", "note", id)
+                .unwrap()
+                .unwrap()
+                .value,
+            format!("value-{index}")
+        );
+    }
+    engine.retire_key(old).unwrap();
+}
+
+#[test]
+fn repeated_rotation_resets_progress() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = create(&dir.path().join("a.redb"));
+    enable(&engine);
+    let id = RecordId::new_v7();
+    engine.put("notes", "note", id, &"value", 1).unwrap();
+
+    for _ in 0..2 {
+        engine.rotate_data_key().unwrap();
+        let progress = engine.migration_progress();
+        assert!(!progress.active);
+        assert!(progress.done);
+        assert!(progress.migrated >= 1);
+        assert_eq!(
+            engine
+                .get::<String>("notes", "note", &id)
+                .unwrap()
+                .unwrap()
+                .value,
+            "value"
+        );
+    }
+}
+
+#[test]
+fn migration_rejects_out_of_range_options() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = create(&dir.path().join("a.redb"));
+    enable(&engine);
+    let to = engine.begin_rotation().unwrap().to;
+
+    for options in [
+        MigrationOptions {
+            batch_size: 0,
+            pause: Duration::ZERO,
+        },
+        MigrationOptions {
+            batch_size: shio_core::MAX_MIGRATION_BATCH_SIZE + 1,
+            pause: Duration::ZERO,
+        },
+        MigrationOptions {
+            batch_size: 1,
+            pause: Duration::from_millis(shio_core::MAX_MIGRATION_PAUSE_MS + 1),
+        },
+    ] {
+        assert!(matches!(
+            engine.migrate_all_with_options(to, options),
+            Err(Error::InvalidArgument(_))
+        ));
+    }
+}
+
+#[test]
 fn paired_after_rotation_acks_installed_offer() {
     let dir = tempfile::tempdir().unwrap();
     let a = create(&dir.path().join("a.redb"));
@@ -342,4 +480,179 @@ fn read_only_and_purge_guards() {
     let readonly = Engine::open(options(&path).read_only(true), PASSWORD).unwrap();
     assert!(matches!(readonly.enable_sync(None), Err(Error::ReadOnly)));
     assert!(matches!(readonly.compact_changes(1), Err(Error::ReadOnly)));
+}
+
+#[test]
+fn backup_and_restore_preserve_format1_data() {
+    let dir = tempfile::tempdir().unwrap();
+    let source_path = dir.path().join("source.redb");
+    let backup_path = dir.path().join("backup.redb");
+    let target_path = dir.path().join("target.redb");
+    let source = create(&source_path);
+    let id = RecordId::new_v7();
+    source.put("notes", "note", id, &"format-one", 1).unwrap();
+
+    let info = source.backup(&backup_path).unwrap();
+    assert_eq!(info.format_version, 1);
+    assert!(info.db_bytes > 0);
+    assert!(info.table_count >= 4);
+    drop(source);
+
+    let restored = Engine::restore(&backup_path, options(&target_path), PASSWORD).unwrap();
+    assert_eq!(restored.stats().unwrap().format_version, 1);
+    assert_eq!(
+        restored
+            .get::<String>("notes", "note", &id)
+            .unwrap()
+            .unwrap()
+            .value,
+        "format-one"
+    );
+}
+
+#[test]
+fn backup_and_restore_preserve_sync_identity() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = create(&dir.path().join("source.redb"));
+    let info = enable(&source);
+    let id = RecordId::new_v7();
+    source.put("notes", "note", id, &"format-two", 1).unwrap();
+    let before = source.sync_info().unwrap();
+    assert_eq!(before.db_id, info.db_id);
+
+    let backup_path = dir.path().join("backup.redb");
+    let backup = source.backup(&backup_path).unwrap();
+    assert_eq!(backup.format_version, 2);
+    assert!(backup.row_count >= 1);
+    drop(source);
+
+    let target_path = dir.path().join("target.redb");
+    let restored = Engine::restore(&backup_path, options(&target_path), PASSWORD).unwrap();
+    let after = restored.sync_info().unwrap();
+    assert_eq!(after.db_id, before.db_id);
+    assert_eq!(after.device_id, before.device_id);
+    assert_eq!(after.current_key_id, before.current_key_id);
+    assert_eq!(after.log_start, before.log_start);
+    assert_eq!(after.log_end, before.log_end);
+    assert_eq!(
+        restored
+            .get::<String>("notes", "note", &id)
+            .unwrap()
+            .unwrap()
+            .value,
+        "format-two"
+    );
+}
+
+#[test]
+fn backup_rejects_existing_target_and_restore_rejects_nonempty_target() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = create(&dir.path().join("source.redb"));
+    source
+        .put("notes", "note", RecordId::new_v7(), &"value", 1)
+        .unwrap();
+
+    let backup_path = dir.path().join("backup.redb");
+    std::fs::write(&backup_path, b"already here").unwrap();
+    assert!(matches!(
+        source.backup(&backup_path),
+        Err(Error::InvalidArgument(_))
+    ));
+    assert_eq!(std::fs::read(&backup_path).unwrap(), b"already here");
+
+    source.backup(&dir.path().join("good.redb")).unwrap();
+    let target_path = dir.path().join("target.redb");
+    std::fs::write(&target_path, b"do not overwrite").unwrap();
+    assert!(matches!(
+        Engine::restore(
+            &dir.path().join("good.redb"),
+            options(&target_path),
+            PASSWORD
+        ),
+        Err(Error::InvalidArgument(_))
+    ));
+    assert_eq!(std::fs::read(&target_path).unwrap(), b"do not overwrite");
+}
+
+#[test]
+fn restore_accepts_empty_target_and_cleans_up_on_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = create(&dir.path().join("source.redb"));
+    source
+        .put("notes", "note", RecordId::new_v7(), &"value", 1)
+        .unwrap();
+    let backup_path = dir.path().join("backup.redb");
+    source.backup(&backup_path).unwrap();
+
+    let empty_target = dir.path().join("empty.redb");
+    std::fs::write(&empty_target, b"").unwrap();
+    let restored = Engine::restore(&backup_path, options(&empty_target), PASSWORD).unwrap();
+    assert_eq!(restored.stats().unwrap().format_version, 1);
+    drop(restored);
+
+    let wrong_target = dir.path().join("wrong.redb");
+    assert!(matches!(
+        Engine::restore(&backup_path, options(&wrong_target), b"wrong password"),
+        Err(Error::InvalidKey)
+    ));
+    assert!(!wrong_target.exists());
+
+    let corrupt_path = dir.path().join("corrupt.redb");
+    let corrupt_target = dir.path().join("corrupt-target.redb");
+    std::fs::write(&corrupt_path, b"not a redb database").unwrap();
+    assert!(Engine::restore(&corrupt_path, options(&corrupt_target), PASSWORD).is_err());
+    assert!(!corrupt_target.exists());
+}
+
+#[test]
+fn backup_during_online_writes_stays_readable() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = Arc::new(create(&dir.path().join("source.redb")));
+    let id = RecordId::new_v7();
+    source
+        .put("notes", "note", id, &"before-backup", 1)
+        .unwrap();
+    let backup_path = dir.path().join("backup.redb");
+    let barrier = Arc::new(Barrier::new(3));
+
+    let writer_engine = Arc::clone(&source);
+    let writer_barrier = Arc::clone(&barrier);
+    let writer = std::thread::spawn(move || {
+        writer_barrier.wait();
+        for index in 0..300 {
+            writer_engine
+                .put(
+                    "notes",
+                    "note",
+                    RecordId::new_v7(),
+                    &format!("online-{index}"),
+                    1,
+                )
+                .unwrap();
+        }
+    });
+
+    let backup_engine = Arc::clone(&source);
+    let backup_barrier = Arc::clone(&barrier);
+    let backup_path_for_thread = backup_path.clone();
+    let backup_thread = std::thread::spawn(move || {
+        backup_barrier.wait();
+        backup_engine.backup(&backup_path_for_thread).unwrap()
+    });
+
+    barrier.wait();
+    let backup = backup_thread.join().unwrap();
+    writer.join().unwrap();
+    assert!(backup.row_count >= 1);
+
+    let target_path = dir.path().join("restored.redb");
+    let restored = Engine::restore(&backup_path, options(&target_path), PASSWORD).unwrap();
+    assert_eq!(
+        restored
+            .get::<String>("notes", "note", &id)
+            .unwrap()
+            .unwrap()
+            .value,
+        "before-backup"
+    );
 }

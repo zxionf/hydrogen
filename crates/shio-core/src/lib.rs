@@ -26,10 +26,11 @@ pub mod sync;
 
 pub use error::{Error, Result};
 pub use model::{DeviceId, KeyId};
-pub use store::engine::{Engine, EngineOptions, RawWriteOp, Stats};
+pub use store::engine::{BackupInfo, Engine, EngineOptions, RawWriteOp, Stats};
 pub use sync::{
-    ApplyReport, ChangeEntry, ChangePage, OfferPage, PairingOffer, RecordChange, RotationInfo,
-    RotationOffer, SnapshotPage, SnapshotRecord, SyncInfo,
+    ApplyReport, ChangeEntry, ChangePage, MigrationOptions, MigrationProgress, OfferPage,
+    PairingOffer, RecordChange, RotationInfo, RotationOffer, SnapshotPage, SnapshotRecord,
+    SyncInfo, DEFAULT_MIGRATION_BATCH_SIZE, MAX_MIGRATION_BATCH_SIZE, MAX_MIGRATION_PAUSE_MS,
 };
 
 /// 内核版本，与 crate 包版本一致（编译期常量）。

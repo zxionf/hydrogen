@@ -19,8 +19,9 @@ use std::time::Duration;
 
 pub use base32::{decode_secret as decode_pairing_secret, encode_secret};
 pub use shio_core::sync::{
-    ApplyReport, ChangeEntry, ChangePage, OfferPage, PairingOffer, RotationInfo, RotationOffer,
-    SnapshotPage, SnapshotRecord, SyncInfo,
+    ApplyReport, ChangeEntry, ChangePage, MigrationOptions, MigrationProgress, OfferPage,
+    PairingOffer, RotationInfo, RotationOffer, SnapshotPage, SnapshotRecord, SyncInfo,
+    DEFAULT_MIGRATION_BATCH_SIZE, MAX_MIGRATION_BATCH_SIZE, MAX_MIGRATION_PAUSE_MS,
 };
 pub use shio_core::{DeviceId, Engine, EngineOptions, Error, KeyId, Result};
 
@@ -162,6 +163,21 @@ impl<'a> Sync<'a> {
 
     pub fn migrate_all(&self, to: KeyId) -> Result<u64> {
         self.engine.migrate_all(to)
+    }
+
+    /// 带批次与暂停参数的迁移；取消在批次边界生效。
+    pub fn migrate_all_with_options(&self, to: KeyId, options: MigrationOptions) -> Result<u64> {
+        self.engine.migrate_all_with_options(to, options)
+    }
+
+    /// 迁移进度；不获取会话锁。
+    pub fn migration_progress(&self) -> MigrationProgress {
+        self.engine.migration_progress()
+    }
+
+    /// 请求取消正在执行的迁移。
+    pub fn cancel_migration(&self) {
+        self.engine.cancel_migration();
     }
 
     pub fn retire(&self, from: KeyId) -> Result<()> {
@@ -376,6 +392,21 @@ impl SyncHandle {
 
     pub fn migrate_all(&self, to: KeyId) -> Result<u64> {
         self.sync().migrate_all(to)
+    }
+
+    /// 带批次与暂停参数的迁移；取消在批次边界生效。
+    pub fn migrate_all_with_options(&self, to: KeyId, options: MigrationOptions) -> Result<u64> {
+        self.sync().migrate_all_with_options(to, options)
+    }
+
+    /// 迁移进度；不获取会话锁。
+    pub fn migration_progress(&self) -> MigrationProgress {
+        self.engine.migration_progress()
+    }
+
+    /// 请求取消正在执行的迁移。
+    pub fn cancel_migration(&self) {
+        self.engine.cancel_migration();
     }
 
     pub fn retire(&self, from: KeyId) -> Result<()> {

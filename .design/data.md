@@ -427,6 +427,7 @@ password (UTF-8 bytes)
 | `b"mig/" + key16 + dev16` | `u8` = 1 | 该设备已无 `key` 记录 |
 | `b"upgrade"` | `u8 phase` + `u16 cursor_len` + `cursor` | format 1→2 的可恢复状态 |
 | `b"upgrade/key/" + u16` | `key_id16` | 旧 u16 key_id 到新 id 的映射 |
+| `b"migration"` | `to16` + `u16 cursor_len` + `cursor` | 进行中的 format=2 迁移持久游标；完成、目标 key 变化或应用远端记录后重写/删除 |
 
 - `log_end` 不单独存储：等于 `shio.changes` 的最大键，空表为 0。
 - `upgrade.phase`：1 = meta 已切到 2；2 = 正在迁移；3 = 清理旧表。`cursor` 是最后迁移的记录键，空表示从起点开始。

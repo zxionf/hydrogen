@@ -7,7 +7,7 @@
 - [x] core：定义迁移参数与进度类型，校验 `batch_size`、`pause_ms` 上限
 - [x] core：为 `format=2` 的 `migrate_all` 增加批次间暂停、进度计数与批次边界取消
 - [x] core：进度查询走旁路状态，不获取 session 写锁；迁移期间读写阻塞语义保持不变
-- [x] core：取消后保留已迁移记录与旧 key；再次迁移从起点扫描并跳过已迁移记录
+- [x] core：取消后保留已迁移记录与旧 key；持久化游标从上次提交点续跑（方案 B 第一步）
 - [x] core：明确恢复入口为 `rotation_state()` + `migrate_all(to)`；`rotate_data_key()` 不再承担中断恢复
 - [x] core：`format=1` 不增加进度能力，既有轮换路径回归
 - [x] ffi：新增 `shio_sync_migrate_all_ex`、`shio_sync_migration_progress`、`shio_sync_cancel_migration`
@@ -30,7 +30,7 @@
 
 ## 后续计划
 
-- [ ] 方案 B：分步迁移 API（持久化 cursor、维护模式、合作式调度）
+- [ ] 方案 B：分步迁移 API（持久化 cursor 已完成；维护模式、合作式调度待做）
 - [ ] 物理文件压缩：接入 redb `Database::compact()`，需要关闭句柄或独占维护接口
 - [ ] 自动日志压缩策略；当前仍只手动 `compact_changes`
 - [ ] 多设备备份/克隆：新 `device_id`、清理 peer 状态、防止重复身份同步

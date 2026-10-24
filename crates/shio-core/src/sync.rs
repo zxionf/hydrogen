@@ -69,7 +69,7 @@ impl MigrationOptions {
 pub struct MigrationProgress {
     /// 是否有迁移正在执行。
     pub active: bool,
-    /// 已扫描的记录数，包含无需迁移的记录。
+    /// 本次调用已扫描的记录数，包含无需迁移的记录。
     pub scanned: u64,
     /// 本次已实际重新加密并提交的记录数。
     pub migrated: u64,

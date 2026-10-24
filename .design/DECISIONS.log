@@ -239,3 +239,13 @@ Change: 20261024-storage-maintenance
 Context: S2 设计中的 `shio_backup(handle, out_path)` 没有输出参数，却要求返回备份摘要 JSON；实现无法同时满足状态码与摘要输出
 Decision: `shio_backup` 增加显式 `out_json/out_json_len`，返回 `{"format_version","db_bytes","table_count","row_count"}`；目标已存在/恢复目标非空映射为 `InvalidArgument`，恢复忽略 `options.create`，不新增专用错误码
 Consequences: 头文件与 API 文档已同步；`shio_backup`/`shio_restore` 为新增非轮换符号，ABI 版本仍为 1；备份保留同设备身份，跨设备克隆仍后置
+## [49] 2026-10-24 15:58:17 UTC
+Change: 20261024-storage-maintenance
+Context: S1 的取消续跑仍从起点重新扫描；方案 B 需要可跨进程重启的迁移进度，但完整维护模式与合作式调度尚未实现
+Decision: 先落地方案 B 第一步：在 `shio.sync` 的 `b"migration"` 持久化 `to16 | u16 cursor_len | cursor`，每批与记录更新同一事务提交；仅当目标 key 相同才复用，完成时删除；C ABI 不变
+Consequences: 取消、崩溃或重开后 `migrate_all(to)` 从最后提交的扫描键继续；目标 key 变化从头开始；维护模式与合作式调度仍待做
+## [50] 2026-10-24 16:06:52 UTC
+Change: 20261024-storage-maintenance
+Context: 取消迁移后同步层仍可能应用远端记录，远端 blob 可能使用旧 key 且记录键落在持久化游标之前；仅按扫描键续跑会跳过这些记录
+Decision: `stage_remote_record` 实际写入记录时在同一事务删除 `b"migration"`；恢复迁移时从头扫描，宁可重扫也不漏迁
+Consequences: 同步活动会降低持久化游标的续跑收益，但保证 `migrate_all(to)` 最终覆盖所有本地记录；本地写入仍使用当前 key，不影响该安全性

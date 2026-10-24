@@ -867,6 +867,12 @@ impl Engine {
             let mut table = txn.open_table(records::TABLE)?;
             table.insert(key.as_slice(), change.blob.as_slice())?;
         }
+        // 远端记录可能仍用旧 key，且键序可能落在迁移游标之前；不能安全续跑。
+        // 统一让下一次迁移从头扫描，避免 skip 掉刚应用回来的旧 key 记录。
+        {
+            let mut table = txn.open_table(sync_state::TABLE)?;
+            table.remove(sync_state::KEY_MIGRATION)?;
+        }
         self.stage_catalog(txn, &change.namespace, &change.collection)?;
         append_change(
             txn,
@@ -1290,6 +1296,19 @@ impl Engine {
         Ok(())
     }
 
+    /// 读取指定目标 key 的持久化迁移游标。
+    ///
+    /// 游标与目标 key 绑定；切换到另一个目标时从头开始，不会误跳过记录。
+    fn read_migration_cursor(&self, to: KeyId) -> Result<Option<Vec<u8>>> {
+        let txn = self.handle.begin_read()?;
+        let table = txn.open_table(sync_state::TABLE)?;
+        let Some(value) = table.get(sync_state::KEY_MIGRATION)? else {
+            return Ok(None);
+        };
+        let (stored_to, cursor) = sync_state::decode_migration(value.value())?;
+        Ok((stored_to == to).then_some(cursor))
+    }
+
     /// 把全部记录重新加密到 `to`，并为不再被引用的 key 公告迁移完成。
     pub fn migrate_all(&self, to: KeyId) -> Result<u64> {
         self.migrate_all_with_options(to, MigrationOptions::default())
@@ -1330,7 +1349,7 @@ impl Engine {
         options: MigrationOptions,
     ) -> Result<u64> {
         let mut migrated = 0u64;
-        let mut after: Option<Vec<u8>> = None;
+        let mut after = self.read_migration_cursor(to)?;
         loop {
             if self.migration.is_cancelled() {
                 return Err(Error::Cancelled);
@@ -1358,6 +1377,7 @@ impl Engine {
             let last_key = last.0.clone();
             let full_batch = batch.len() >= options.batch_size;
             self.migration.add_scanned(batch.len() as u64);
+            let migration_cursor = sync_state::encode_migration(to, &last_key)?;
 
             let mut batch_migrated = 0u64;
             let txn = self.handle.begin_write()?;
@@ -1397,6 +1417,10 @@ impl Engine {
                     batch_migrated += 1;
                 }
             }
+            {
+                let mut table = txn.open_table(sync_state::TABLE)?;
+                table.insert(sync_state::KEY_MIGRATION, migration_cursor.as_slice())?;
+            }
             txn.commit()?;
             migrated += batch_migrated;
             self.migration.add_migrated(batch_migrated);
@@ -1428,25 +1452,27 @@ impl Engine {
             .copied()
             .filter(|key| *key != to && !referenced.contains(key))
             .collect();
-        if !announce.is_empty() {
-            let txn = self.handle.begin_write()?;
-            for key_id in announce {
-                append_change(
-                    &txn,
-                    state.device,
-                    &ChangeEntry::Migrated {
-                        key_id,
-                        at: Timestamp::now(),
-                    },
-                )?;
-                let mut table = txn.open_table(sync_state::TABLE)?;
-                table.insert(
-                    sync_state::migrated(key_id, state.device).as_slice(),
-                    [1u8].as_slice(),
-                )?;
-            }
-            txn.commit()?;
+        let txn = self.handle.begin_write()?;
+        {
+            let mut table = txn.open_table(sync_state::TABLE)?;
+            table.remove(sync_state::KEY_MIGRATION)?;
         }
+        for key_id in announce {
+            append_change(
+                &txn,
+                state.device,
+                &ChangeEntry::Migrated {
+                    key_id,
+                    at: Timestamp::now(),
+                },
+            )?;
+            let mut table = txn.open_table(sync_state::TABLE)?;
+            table.insert(
+                sync_state::migrated(key_id, state.device).as_slice(),
+                [1u8].as_slice(),
+            )?;
+        }
+        txn.commit()?;
 
         Ok(migrated)
     }

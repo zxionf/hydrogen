@@ -514,7 +514,7 @@ JSON 形状：
 - `shio_restore` 的目标必须不存在或为 0 字节；`options_json` 的 `create` 被忽略。恢复失败返回对应错误并删除临时文件/未完成的目标；成功返回已打开的目标句柄。目标非空返回 `SHIO_INVALID_ARGUMENT`。
 - `shio_sync_info` / `shio_sync_enable` 返回 `{"db_id":"32hex","device_id":"32hex","current_key_id":"32hex","log_start":N,"log_end":N,"baseline_done":bool}`。
 - `shio_sync_begin_rotation` / `shio_sync_rotation_state` 返回 `{"from":"32hex","to":"32hex","created_at":millis,"acked":["32hex",...]}`；没有进行中的轮换时 `rotation_state` 返回 `null`。
-- `shio_sync_migration_progress` 返回 `{"active":bool,"scanned":N,"migrated":N,"done":bool}`；`scanned` 含已迁移记录，`done` 只表示最近一次迁移完整成功，不承诺百分比。
+- `shio_sync_migration_progress` 返回 `{"active":bool,"scanned":N,"migrated":N,"done":bool}`；`scanned` 为本次迁移已扫描记录数（含无需迁移记录），`done` 只表示最近一次迁移完整成功，不承诺百分比。
 - `shio_sync_migrate_all_ex` 在取消时返回 `SHIO_CANCELLED`；已提交批次保留，旧 key 不删除。恢复中断轮换先取 `shio_sync_rotation_state` 的 `to`，再迁移。
 - `shio_sync_apply` / `shio_sync_apply_snapshot` 返回 `{"applied":N,"skipped":N,"controls":N}`。
 - `shio_sync_create_pairing` 返回 `{"secret":"<Base32>","fingerprint":"<6 位十六进制>"}`；`secret` 只用于配对展示，不得写日志。
@@ -908,7 +908,7 @@ impl Engine {
 - `begin_rotation` 任意设备可调用；并发轮换产生不同随机 `to`，写 key 按 `(created_at, key_id)` 收敛。
 - `migrate_all` 重加密记录时推进 `updated_at`（至少 +1），避免旧密钥的同一逻辑版本在 LWW 的 blob 次序里把已迁移记录翻回旧密钥。
 - `migrate_all_with_options` 保持迁移期间 session 写锁；`migration_progress` 与 `cancel_migration` 走旁路状态，不获取该锁。取消在批次提交后的边界生效。
-- 取消后再次 `migrate_all(to)` 会从起点扫描并跳过已迁移记录；恢复中断轮换使用 `rotation_state()` 取 `to`，不要用 `rotate_data_key`。
+- 每批提交时把目标 key 与最后扫描键持久化到 `shio.sync`；取消或重启后再次 `migrate_all(to)` 从该游标继续，目标 key 不同则从头开始。实际应用远端记录会删除游标，避免旧 key 记录落在扫描范围之前；恢复时改为从头扫描。恢复中断轮换使用 `rotation_state()` 取 `to`，不要用 `rotate_data_key`。
 - `rotate_data_key` 在同步模式下等价于 `begin_rotation` + `migrate_all(to)`，不自动退役；`format=1` 路径不提供进度或取消。
 - 同步模式的 `change_password` 在同一事务内重新包裹所有 `shio.keys2` 行（同一新 salt/KEK、各自 nonce）；`format=1` 仍要求单行。
 - `open_with_pairing` 只创建新库，目标必须不存在或为空；成功时直接是 `format=2`，失败不会留下半成品文件。

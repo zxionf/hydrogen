@@ -30,6 +30,10 @@ pub const KEY_BASELINE_KEY: &[u8] = b"baseline_key";
 pub const KEY_LOG_START: &[u8] = b"log_start";
 /// `b"upgrade"`。
 pub const KEY_UPGRADE: &[u8] = b"upgrade";
+/// `b"migration"`：进行中的 `format=2` 迁移游标。
+///
+/// 实际应用远端记录时删除，避免旧 key 记录落在游标之前被跳过。
+pub const KEY_MIGRATION: &[u8] = b"migration";
 
 const PEER_PREFIX: &[u8] = b"peer/";
 const ROTATION_PREFIX: &[u8] = b"rot/";
@@ -137,9 +141,68 @@ pub fn decode_upgrade(bytes: &[u8]) -> Result<(u8, Vec<u8>)> {
     Ok((phase, bytes[3..].to_vec()))
 }
 
+/// 编码迁移游标：`to[16] | cursor_len u16 | cursor`。
+pub fn encode_migration(to: KeyId, cursor: &[u8]) -> Result<Vec<u8>> {
+    let cursor_len = u16::try_from(cursor.len())
+        .map_err(|_| Error::InvalidArgument("migration cursor too long"))?;
+    let mut out = Vec::with_capacity(18 + cursor.len());
+    out.extend_from_slice(to.as_bytes());
+    out.extend_from_slice(&cursor_len.to_be_bytes());
+    out.extend_from_slice(cursor);
+    Ok(out)
+}
+
+/// 解码迁移游标。
+pub fn decode_migration(bytes: &[u8]) -> Result<(KeyId, Vec<u8>)> {
+    if bytes.len() < 18 {
+        return Err(Error::Corrupted("migration state too short"));
+    }
+    let key: [u8; 16] = bytes[0..16]
+        .try_into()
+        .map_err(|_| Error::Corrupted("migration key length mismatch"))?;
+    let len = usize::from(u16::from_be_bytes([bytes[16], bytes[17]]));
+    let expected = 18usize
+        .checked_add(len)
+        .ok_or(Error::Corrupted("migration cursor length overflow"))?;
+    if expected != bytes.len() {
+        return Err(Error::Corrupted("migration cursor length mismatch"));
+    }
+    Ok((KeyId::from_bytes(key), bytes[18..].to_vec()))
+}
+
 fn prefixed(prefix: &[u8], id: &[u8; 16]) -> Vec<u8> {
     let mut out = Vec::with_capacity(prefix.len() + 16);
     out.extend_from_slice(prefix);
     out.extend_from_slice(id);
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn migration_cursor_roundtrips() {
+        let to = KeyId::from_bytes([0x11; 16]);
+        let encoded = encode_migration(to, b"record-key").unwrap();
+        assert_eq!(
+            decode_migration(&encoded).unwrap(),
+            (to, b"record-key".to_vec())
+        );
+    }
+
+    #[test]
+    fn migration_cursor_rejects_bad_lengths() {
+        assert!(matches!(
+            decode_migration(&[0u8; 17]),
+            Err(Error::Corrupted(_))
+        ));
+
+        let mut encoded = encode_migration(KeyId::from_bytes([0x22; 16]), b"x").unwrap();
+        encoded.pop();
+        assert!(matches!(
+            decode_migration(&encoded),
+            Err(Error::Corrupted("migration cursor length mismatch"))
+        ));
+    }
 }

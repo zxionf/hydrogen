@@ -80,6 +80,7 @@ sele CLI用于管理 `.design/` 与 `.agent/` 目录的 C++20 命令行工具，
 - 只读并发：写者持锁时 `read-locked` 输出 `READ_LOCKED`；`read-hold` 持共享锁时 `probe` 输出 `PROBE_LOCKED`、`read-probe` 输出 `READ_PROBE_OK`。若写者被 `kill -9`，redb 可能先要求写句柄修复，直接只读打开会返回 `Database repair aborted`；先跑一次 `check`（写打开）再只读即可。
 - 同步 C ABI：`sync` 模式创建 A 库并 `sync_enable`，生成配对包后创建 B 库，双向变更、快照、轮换、ack 与压缩后重同步全部通过，输出 `ANDROID_SYNC_OK`；变更/快照使用 `limit=2`，确认多页路径。轮换现在通过 `shio_sync_migrate_all_ex` 执行，并检查进度 JSON。
 - 迁移取消：`migration-progress` 模式插入 40 条记录后启动 `batch_size=1,pause_ms=20` 的后台迁移，主线程轮询到 `active=true`/`migrated>=1` 后调用 `shio_sync_cancel_migration`；worker 返回 `SHIO_CANCELLED`，随后再次调用 `shio_sync_migrate_all_ex` 续跑并检查 `done=true`。x86_64 模拟器输出 `MIGRATION_PROGRESS_OK`。
+- 迁移续跑：`format=2` 每批提交时把目标 key 与最后扫描键写入 `shio.sync` 的 `b"migration"`；取消、崩溃或重开后同一 `to` 从未扫描位置继续，不重新扫描已提交范围。切换目标 key 会忽略旧游标，完成迁移或实际应用远端记录会删除游标并从头扫描。C ABI 未变化。
 - 轮换中断：`rotate-many` 建 60000 条记录后打印 `ROTATE_START` 再执行 `shio_rotate_data_key`；外部在启动后 `kill -9`，随后 `resume-rotation` 读取 `shio_sync_rotation_state` 的 `to`，用 `shio_sync_migrate_all_ex` 续跑并读首尾记录、写入新记录，输出 `ROTATE_RESUME_OK`。
 - 备份恢复：`backup-restore` 模式在 `format=2` 源库写入记录并 `sync_enable`，调用 `shio_backup` 检查摘要，拒绝已存在备份目标和非空恢复目标，错误口令返回 `SHIO_INVALID_KEY` 且不建目标；随后 `shio_restore` 打开目标、读取原记录并比较 `db_id`/`device_id`。x86_64 模拟器输出 `BACKUP_RESTORE_OK`。
 - redb 4.4 在 Android 上没有可用的文件锁：字节范围锁返回 `Unsupported`，跨进程第二写者原本可以直接打开。现在由 `crates/shio/src/lock.rs` 在数据库旁创建 `<db>.lock`，用 `rustix::fs::flock` 非阻塞加锁：写句柄独占、只读共享；冲突映射为 `Error::Locked`，`close` 后在途操作归零再释放。

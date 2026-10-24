@@ -322,6 +322,140 @@ fn migration_reports_progress_blocks_reads_and_resumes_after_cancel() {
 }
 
 #[test]
+fn migration_resumes_from_persisted_cursor_after_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("a.redb");
+    let engine = Arc::new(create(&path));
+    enable(&engine);
+
+    let mut ids = Vec::new();
+    for index in 0..8 {
+        let id = RecordId::new_v7();
+        ids.push(id);
+        engine
+            .put("notes", "note", id, &format!("value-{index}"), 1)
+            .unwrap();
+    }
+    let to = engine.begin_rotation().unwrap().to;
+    let migration_options = MigrationOptions {
+        batch_size: 1,
+        pause: Duration::from_millis(50),
+    };
+
+    let worker_engine = Arc::clone(&engine);
+    let worker =
+        std::thread::spawn(move || worker_engine.migrate_all_with_options(to, migration_options));
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let progress = engine.migration_progress();
+        if progress.active && progress.migrated >= 1 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "migration did not make progress: {progress:?}"
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    }
+
+    engine.cancel_migration();
+    assert!(matches!(worker.join().unwrap(), Err(Error::Cancelled)));
+    let scanned_before_reopen = engine.migration_progress().scanned;
+    assert!(scanned_before_reopen < ids.len() as u64);
+    drop(engine);
+
+    let reopened = Engine::open(options(&path), PASSWORD).unwrap();
+    let remaining = reopened
+        .migrate_all_with_options(
+            to,
+            MigrationOptions {
+                batch_size: 1,
+                pause: Duration::ZERO,
+            },
+        )
+        .unwrap();
+    assert!(remaining > 0);
+    let progress = reopened.migration_progress();
+    assert!(progress.done);
+    assert_eq!(progress.migrated, remaining);
+    assert_eq!(progress.scanned + scanned_before_reopen, ids.len() as u64);
+
+    for (index, id) in ids.iter().enumerate() {
+        assert_eq!(
+            reopened
+                .get::<String>("notes", "note", id)
+                .unwrap()
+                .unwrap()
+                .value,
+            format!("value-{index}")
+        );
+    }
+}
+
+#[test]
+fn remote_record_write_invalidates_migration_cursor() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = Arc::new(create(&dir.path().join("a.redb")));
+    enable(&a);
+    let mut ids = Vec::new();
+    for index in 0..8 {
+        let id = RecordId::new_v7();
+        ids.push(id);
+        a.put("notes", "note", id, &format!("local-{index}"), 1)
+            .unwrap();
+    }
+    let old = a.sync_info().unwrap().current_key_id;
+    let b = pair(&a, &dir.path().join("b.redb"));
+    let mut cursor_b = 0;
+    drain(&a, &mut cursor_b, &b);
+
+    let to = a.begin_rotation().unwrap().to;
+    let migration_options = MigrationOptions {
+        batch_size: 1,
+        pause: Duration::from_millis(50),
+    };
+    let worker_a = Arc::clone(&a);
+    let worker =
+        std::thread::spawn(move || worker_a.migrate_all_with_options(to, migration_options));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let progress = a.migration_progress();
+        if progress.active && progress.migrated >= 1 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "migration did not make progress: {progress:?}"
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    a.cancel_migration();
+    assert!(matches!(worker.join().unwrap(), Err(Error::Cancelled)));
+
+    // B 还没收到轮换，写入仍使用旧 key；这些记录可能落在 A 的迁移游标之前。
+    std::thread::sleep(Duration::from_millis(5));
+    for (index, id) in ids.iter().enumerate() {
+        b.put("notes", "note", *id, &format!("remote-{index}"), 1)
+            .unwrap();
+    }
+    drain(&b, &mut cursor_b, &a);
+
+    a.migrate_all(to).unwrap();
+    let progress = a.migration_progress();
+    assert!(progress.done);
+    assert_eq!(progress.scanned, ids.len() as u64);
+    assert_eq!(progress.migrated, ids.len() as u64);
+    for (index, id) in ids.iter().enumerate() {
+        assert_eq!(
+            a.get::<String>("notes", "note", id).unwrap().unwrap().value,
+            format!("remote-{index}")
+        );
+    }
+    a.retire_key(old).unwrap();
+}
+
+#[test]
 fn repeated_rotation_resets_progress() {
     let dir = tempfile::tempdir().unwrap();
     let engine = create(&dir.path().join("a.redb"));

@@ -477,3 +477,94 @@ fn rejects_invalid_arguments_and_reports_errors() {
     assert_eq!(status, SHIO_INVALID_ARGUMENT);
     assert!(!last_error().is_empty());
 }
+
+#[test]
+fn compact_file_requires_closed_handle_and_keeps_record() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("compact.db");
+    let create = br#"{"create":true}"#;
+    let handle = open(&path, b"compact-password", create);
+    let namespace = CString::new("vault").unwrap();
+    let collection = CString::new("entries").unwrap();
+    let id = [0x5au8; 16];
+    let mut buffer = ptr::null_mut();
+    let mut buffer_len = 0;
+
+    for index in 0..20u8 {
+        let payload = format!(r#"{{"n":{index}}}"#);
+        // SAFETY: 句柄、名称、载荷与输出指针有效。
+        let status = unsafe {
+            shio_put(
+                handle,
+                namespace.as_ptr(),
+                collection.as_ptr(),
+                id.as_ptr(),
+                payload.as_ptr(),
+                payload.len(),
+                &mut buffer,
+                &mut buffer_len,
+            )
+        };
+        assert_eq!(status, SHIO_OK, "put failed: {}", last_error());
+        assert!(!take_buffer(buffer, buffer_len).is_empty());
+        buffer = ptr::null_mut();
+        buffer_len = 0;
+    }
+
+    let path_c = CString::new(path.to_str().unwrap()).unwrap();
+    let mut json_ptr = ptr::null_mut();
+    let mut json_len = 0;
+    // SAFETY: 路径与输出指针有效；句柄仍打开。
+    let status = unsafe { shio_compact_file(path_c.as_ptr(), &mut json_ptr, &mut json_len) };
+    assert_eq!(status, SHIO_LOCKED);
+    assert!(json_ptr.is_null() && json_len == 0);
+
+    // SAFETY: 句柄有效。
+    unsafe { shio_close(handle) };
+    // SAFETY: 关闭后 destroy，且没有其它线程使用。
+    unsafe { shio_kernel_destroy(handle) };
+
+    // SAFETY: 路径与输出指针有效。
+    let status = unsafe { shio_compact_file(path_c.as_ptr(), &mut json_ptr, &mut json_len) };
+    assert_eq!(status, SHIO_OK, "compact failed: {}", last_error());
+    let summary = parse(take_buffer(json_ptr, json_len));
+    assert!(summary["before_bytes"].as_u64().unwrap() > 0);
+    assert!(summary["after_bytes"].as_u64().unwrap() <= summary["before_bytes"].as_u64().unwrap());
+    assert!(summary["compacted"].is_boolean());
+
+    let reopened = open(&path, b"compact-password", b"");
+    let mut get_ptr = ptr::null_mut();
+    let mut get_len = 0;
+    // SAFETY: 句柄、名称与输出指针有效。
+    let status = unsafe {
+        shio_get(
+            reopened,
+            namespace.as_ptr(),
+            collection.as_ptr(),
+            id.as_ptr(),
+            &mut get_ptr,
+            &mut get_len,
+        )
+    };
+    assert_eq!(
+        status,
+        SHIO_OK,
+        "get after compact failed: {}",
+        last_error()
+    );
+    let value = String::from_utf8(take_buffer(get_ptr, get_len)).unwrap();
+    assert!(value.contains("\"n\":19"), "unexpected value: {value}");
+
+    let missing = directory.path().join("missing.db");
+    let missing_c = CString::new(missing.to_str().unwrap()).unwrap();
+    let mut json_ptr = ptr::null_mut();
+    let mut json_len = 0;
+    // SAFETY: 路径与输出指针有效。
+    let status = unsafe { shio_compact_file(missing_c.as_ptr(), &mut json_ptr, &mut json_len) };
+    assert_eq!(status, SHIO_NOT_FOUND);
+
+    // SAFETY: 句柄有效。
+    unsafe { shio_close(reopened) };
+    // SAFETY: 关闭后 destroy，且没有其它线程使用。
+    unsafe { shio_kernel_destroy(reopened) };
+}

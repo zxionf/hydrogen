@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use secrecy::{ExposeSecret, SecretString};
 use shio_core::model::{validate_name, NameKind, DEFAULT_MAX_VALUE_SIZE};
-use shio_core::store::{BackupInfo, Engine, EngineOptions, Stats};
+use shio_core::store::{BackupInfo, CompactReport, Engine, EngineOptions, Stats};
 #[cfg(feature = "sync")]
 use shio_core::{KeyId, MaintenanceOutcome, MigrationStep};
 #[cfg(feature = "sync")]
@@ -442,6 +442,20 @@ pub async fn open_with_pairing(
     Ok(Kernel {
         inner: Arc::new(Inner::new(engine, false, data_lock)),
     })
+}
+
+/// 离线压缩数据库文件：整理空闲页并收缩文件。
+///
+/// 要求没有其它打开的句柄（同进程或其它进程）：本函数按独占方式取数据库旁路锁，
+/// 拿不到返回 [`Error::Locked`]。压缩不解密、不校验口令，也不改变格式与身份；
+/// 与 [`Kernel::restore`] 一样经阻塞线程池执行。
+pub async fn compact_file(path: PathBuf) -> Result<CompactReport> {
+    // 旁路锁在函数作用域结束时释放。
+    let _data_lock = DataFileLock::acquire(&path, false)?;
+    let target = path.clone();
+    tokio::task::spawn_blocking(move || Engine::compact_file(&target))
+        .await
+        .map_err(|_| Error::Internal("blocking task panicked"))?
 }
 
 /// 命名空间句柄。

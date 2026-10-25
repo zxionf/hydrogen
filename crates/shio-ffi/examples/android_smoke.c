@@ -802,6 +802,124 @@ static int cooperative_mode(const char *path)
     return 0;
 }
 
+static int compact_mode(const char *path)
+{
+    shio_kernel *kernel = NULL;
+    uint8_t *buf = NULL;
+    size_t len = 0;
+    uint8_t id[16];
+    int32_t existed = 0;
+    uint8_t *json = NULL;
+    size_t json_len = 0;
+    char *text = NULL;
+    int32_t status;
+    int index = 0;
+    uint64_t before = 0;
+    uint64_t after = 0;
+
+    remove(path);
+    expect(shio_open(path, (const uint8_t *)PASSWORD, strlen(PASSWORD),
+                     (const uint8_t *)"{\"create\":true}",
+                     strlen("{\"create\":true}"), &kernel),
+           "compact open");
+    for (index = 0; index < 40; index++) {
+        char payload[48];
+        snprintf(payload, sizeof(payload), "{\"n\":%d}", index);
+        record_id(index, id);
+        expect(shio_put(kernel, "compact", "entries", id,
+                        (const uint8_t *)payload, strlen(payload), &buf, &len),
+               "compact put");
+        shio_free(buf, len);
+        buf = NULL;
+        len = 0;
+    }
+
+    /* 删除大部分记录，制造可回收的空闲页。 */
+    for (index = 1; index < 40; index++) {
+        record_id(index, id);
+        expect(shio_delete(kernel, "compact", "entries", id, &existed),
+               "compact delete");
+        if (existed != 1) {
+            fprintf(stderr, "compact delete reported existed=%d\n",
+                    (int)existed);
+            return 1;
+        }
+    }
+
+    /* 句柄未关闭时压缩被拒绝，且不产生输出缓冲区。 */
+    status = shio_compact_file(path, &json, &json_len);
+    if (status != SHIO_LOCKED) {
+        fprintf(stderr, "compact while open returned %d instead of SHIO_LOCKED\n",
+                (int)status);
+        return 1;
+    }
+    if (json != NULL || json_len != 0) {
+        fprintf(stderr, "compact while open returned a buffer\n");
+        return 1;
+    }
+
+    expect(shio_close(kernel), "compact close");
+    shio_kernel_destroy(kernel);
+    kernel = NULL;
+
+    expect(shio_compact_file(path, &json, &json_len), "compact file");
+    text = take_text(json, json_len, "compact file");
+    json = NULL;
+    json_len = 0;
+    before = json_u64(text, "before_bytes", "compact file");
+    after = json_u64(text, "after_bytes", "compact file");
+    if (before == 0 || after >= before) {
+        fprintf(stderr, "compact file sizes: %llu -> %llu\n",
+                (unsigned long long)before, (unsigned long long)after);
+        free(text);
+        return 1;
+    }
+    if (strstr(text, "\"compacted\":true") == NULL) {
+        fprintf(stderr, "compact file reported compacted=false\n");
+        free(text);
+        return 1;
+    }
+    free(text);
+    printf("compact bytes: %llu -> %llu\n", (unsigned long long)before,
+           (unsigned long long)after);
+
+    /* 连续压缩不再有工作。 */
+    expect(shio_compact_file(path, &json, &json_len), "compact file(again)");
+    text = take_text(json, json_len, "compact file(again)");
+    json = NULL;
+    json_len = 0;
+    if (strstr(text, "\"compacted\":false") == NULL) {
+        fprintf(stderr, "second compact reported work\n");
+        free(text);
+        return 1;
+    }
+    free(text);
+
+    /* 重开后保留记录可读，写入照常。 */
+    expect(shio_open(path, (const uint8_t *)PASSWORD, strlen(PASSWORD), NULL, 0,
+                     &kernel),
+           "compact reopen");
+    record_id(0, id);
+    expect(shio_get(kernel, "compact", "entries", id, &buf, &len),
+           "compact get");
+    text = take_text(buf, len, "compact get");
+    contains(text, "\"n\":0", "compact get");
+    free(text);
+    record_id(100, id);
+    expect(shio_put(kernel, "compact", "entries", id,
+                    (const uint8_t *)"{\"n\":100}", strlen("{\"n\":100}"),
+                    &buf, &len),
+           "compact put(after)");
+    shio_free(buf, len);
+    buf = NULL;
+    len = 0;
+    expect(shio_close(kernel), "compact close(after)");
+    shio_kernel_destroy(kernel);
+    remove(path);
+    printf("COMPACT_OK\n");
+    return 0;
+}
+
 static int backup_restore_mode(const char *path)
 {
     shio_kernel *source = NULL;
@@ -1137,7 +1255,7 @@ int main(int argc, char **argv)
                 "usage: %s <database-path> "
                 "[smoke|sync|hold|probe|check|read-hold|read-probe|read-locked|"
                 "rotate-many|resume-rotation|migration-progress|maintenance|"
-                "cooperative|backup-restore]\n",
+                "cooperative|compact|backup-restore]\n",
                 argv[0]);
         return 2;
     }
@@ -1210,6 +1328,10 @@ int main(int argc, char **argv)
 
     if (strcmp(mode, "cooperative") == 0) {
         return cooperative_mode(path);
+    }
+
+    if (strcmp(mode, "compact") == 0) {
+        return compact_mode(path);
     }
 
     if (strcmp(mode, "backup-restore") == 0) {

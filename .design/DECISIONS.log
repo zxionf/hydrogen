@@ -274,3 +274,8 @@ Change: 20261025-cooperative-scheduling
 Context: 按记录数控制的批次在快慢设备上耗时差异大，调用方难以既保证每次有进展又限制单次阻塞时长；进度计数与取消标志也需要明确的序列边界。
 Decision: tick 的时间预算与批次配额同时生效：预算默认 10ms、上限 1s，单批默认 32、上限 256，0 取默认、越界返回 InvalidArgument；预算检查放在每批之后，保证每次调用至少推进一批；短批次视为扫描结束并在同一次调用内收尾；进度计数在序列开始（目标 key 没有游标）时清零，取消标志在每次 tick 开始时清除，只影响正在执行的调用。
 Consequences: 单次 tick 的阻塞时长有上界且必有进展，慢设备只是更早返回；进度 JSON 在 TICK 序列内累计，单次返回值只含本次；停止调度即不再调用，无需额外状态。\n
+## [56] 2026-10-25 09:49:11 UTC
+Change: 20261025-file-compaction
+Context: redb 4.4 的 Database::compact 需要唯一可变借用，且要求调用时没有在途事务/读引用/savepoint；Engine 被 Arc 共享、Handle 直接持有 Database，在线压缩要先改成 RwLock<Handle>，并发读会让压缩频繁返回 TransactionInProgress。计划要求物理压缩，但允许『关闭句柄或独占维护接口』。
+Decision: 物理压缩先做离线入口：core 的 Engine::compact_file(path)、facade 的 shio::compact_file(path)（先取 .lock 独占，冲突返回 Locked）与 C ABI shio_compact_file；打开 redb 后调用 compact，再用 check_integrity 校验，返回 before_bytes/after_bytes/compacted。不改格式、身份、密钥与同步游标，不需要口令。在线压缩与自动日志压缩留待后续变更。
+Consequences: 应用在关闭所有句柄后可整理文件，跨进程同样适用；句柄未关时错误可预测（Locked）。redb 关闭句柄时会收缩预分配空间，stats().db_bytes 与压缩前大小可能不同。自动日志压缩需先补跨设备进度上报（SHY2 kind=3 帧 + heard/<device>）。

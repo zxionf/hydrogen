@@ -295,3 +295,50 @@ async fn change_password_and_rotate() {
     );
     kernel.close().await.unwrap();
 }
+
+#[tokio::test]
+async fn compact_file_requires_closed_handles_and_keeps_data() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("compact.redb");
+    let kernel = Kernel::open(create(&path), Credential::password(PASSWORD))
+        .await
+        .unwrap();
+    let notes = collection(&kernel);
+    let mut keep = Vec::new();
+    for index in 0..60 {
+        let id = RecordId::new_v7();
+        notes.put(id, &note(&format!("v{index}"))).await.unwrap();
+        if index % 3 == 0 {
+            keep.push((id, note(&format!("v{index}"))));
+        }
+    }
+
+    // 句柄未关闭时旁路锁被占用。
+    assert!(matches!(
+        shio::compact_file(path.clone()).await,
+        Err(Error::Locked)
+    ));
+    kernel.close().await.unwrap();
+    drop(kernel);
+    drop(notes);
+
+    let report = shio::compact_file(path.clone()).await.unwrap();
+    assert!(report.compacted);
+    assert!(report.after_bytes <= report.before_bytes);
+
+    let kernel = Kernel::open(create(&path), Credential::password(PASSWORD))
+        .await
+        .unwrap();
+    let notes = collection(&kernel);
+    for (id, value) in &keep {
+        assert_eq!(notes.get(id).await.unwrap().unwrap().value, *value);
+    }
+    kernel.close().await.unwrap();
+    drop(kernel);
+    drop(notes);
+
+    assert!(matches!(
+        shio::compact_file(dir.path().join("missing.redb")).await,
+        Err(Error::NotFound)
+    ));
+}

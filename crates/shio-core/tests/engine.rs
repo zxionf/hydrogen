@@ -642,3 +642,87 @@ fn interrupted_rotation_is_resumable_and_blocks_change_password() {
         .unwrap()
         .is_some());
 }
+
+#[test]
+fn compact_file_shrinks_free_pages_and_keeps_data() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("compact.redb");
+    let engine = create(&path);
+    let mut keep = Vec::new();
+    for index in 0..200 {
+        let id = RecordId::new_v7();
+        if index % 4 == 0 {
+            keep.push((id, note(&format!("keep-{index}"))));
+        }
+        engine
+            .put("notes", "notes", id, &note(&format!("drop-{index}")), 1)
+            .unwrap();
+    }
+    for index in 0..200 {
+        if index % 4 != 0 {
+            continue;
+        }
+        let id = keep[index / 4].0;
+        engine.purge("notes", "notes", &id).unwrap();
+    }
+    // 先确认所有待删记录确实被物理删除，再填回保留记录。
+    for (id, value) in &keep {
+        engine.put("notes", "notes", *id, value, 1).unwrap();
+    }
+    drop(engine);
+    let before_bytes = std::fs::metadata(&path).unwrap().len();
+
+    let report = Engine::compact_file(&path).unwrap();
+    assert_eq!(report.before_bytes, before_bytes);
+    assert!(report.compacted, "compaction reported no work");
+    assert!(
+        report.after_bytes < report.before_bytes,
+        "file did not shrink: {} -> {}",
+        report.before_bytes,
+        report.after_bytes
+    );
+
+    // 连续压缩不应再有工作；重新打开会写页，因此幂等性只在同一轮验证。
+    let again = Engine::compact_file(&path).unwrap();
+    assert!(!again.compacted, "consecutive compaction did work");
+    assert_eq!(again.before_bytes, again.after_bytes);
+
+    let engine = open(&path);
+    for (id, value) in &keep {
+        assert_eq!(
+            engine
+                .get::<Note>("notes", "notes", id)
+                .unwrap()
+                .unwrap()
+                .value,
+            *value
+        );
+    }
+    assert_eq!(engine.stats().unwrap().key_id, 1);
+}
+
+#[test]
+fn compact_file_rejects_locked_missing_and_empty_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let missing = dir.path().join("missing.redb");
+    assert!(matches!(
+        Engine::compact_file(&missing),
+        Err(Error::NotFound)
+    ));
+
+    let empty = dir.path().join("empty.redb");
+    std::fs::write(&empty, b"").unwrap();
+    assert!(matches!(
+        Engine::compact_file(&empty),
+        Err(Error::InvalidArgument(_))
+    ));
+
+    let path = dir.path().join("locked.redb");
+    let engine = create(&path);
+    engine
+        .put("notes", "notes", RecordId::new_v7(), &note("locked"), 1)
+        .unwrap();
+    assert!(matches!(Engine::compact_file(&path), Err(Error::Locked)));
+    drop(engine);
+    assert!(Engine::compact_file(&path).is_ok());
+}

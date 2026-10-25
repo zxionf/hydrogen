@@ -125,6 +125,15 @@ int32_t shio_restore(const char *backup_path,
                      size_t options_len,
                      shio_kernel **out_handle);
 
+/*
+ * 离线物理压缩：整理空闲页并收缩文件；要求没有其它打开的句柄。
+ * 返回 {"before_bytes":N,"after_bytes":N,"compacted":bool}；
+ * 句柄未关闭返回 SHIO_LOCKED，路径不存在返回 SHIO_NOT_FOUND。
+ */
+int32_t shio_compact_file(const char *path,
+                          uint8_t **out_json,
+                          size_t *out_json_len);
+
 /* 关闭并等待在途操作；不释放句柄，可重复调用。 */
 int32_t shio_close(shio_kernel *handle);
 

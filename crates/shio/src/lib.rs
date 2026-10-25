@@ -19,14 +19,14 @@ mod lock;
 pub use collection::Collection;
 #[cfg(feature = "sync")]
 pub use kernel::open_with_pairing;
-pub use kernel::{Credential, Kernel, Namespace, OpenOptions};
+pub use kernel::{compact_file, Credential, Kernel, Namespace, OpenOptions};
 
 pub use shio_core::error::{Error, Result};
 pub use shio_core::model::{
     validate_name, ListOptions, NameKind, Page, RecordId, RecordMeta, Stored, Timestamp, WriteOp,
     DEFAULT_LIST_LIMIT, DEFAULT_MAX_VALUE_SIZE, MAX_LIST_LIMIT, MAX_NAME_LEN,
 };
-pub use shio_core::store::{BackupInfo, Stats};
+pub use shio_core::store::{BackupInfo, CompactReport, Stats};
 #[cfg(feature = "sync")]
 pub use shio_core::sync::pairing_fingerprint;
 #[cfg(feature = "sync")]

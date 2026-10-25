@@ -157,6 +157,18 @@ impl From<redb::CommitError> for Error {
     }
 }
 
+impl From<redb::CompactionError> for Error {
+    fn from(value: redb::CompactionError) -> Self {
+        match value {
+            redb::CompactionError::PersistentSavepointExists
+            | redb::CompactionError::EphemeralSavepointExists
+            | redb::CompactionError::TransactionInProgress => Self::Busy,
+            redb::CompactionError::Storage(storage) => Self::Database(storage.to_string()),
+            other => Self::Database(other.to_string()),
+        }
+    }
+}
+
 impl From<redb::TransactionError> for Error {
     fn from(value: redb::TransactionError) -> Self {
         Self::Database(value.to_string())

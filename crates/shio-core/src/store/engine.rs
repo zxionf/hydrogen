@@ -10,7 +10,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
 use std::ops::Bound;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
@@ -136,6 +136,17 @@ pub struct BackupInfo {
     pub table_count: u64,
     /// 复制出的键值行总数。
     pub row_count: u64,
+}
+
+/// 离线物理压缩结果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CompactReport {
+    /// 压缩前文件字节数。
+    pub before_bytes: u64,
+    /// 压缩后文件字节数。
+    pub after_bytes: u64,
+    /// 是否实际整理了空闲页；`false` 表示已无可压缩空间。
+    pub compacted: bool,
 }
 
 /// 批量写操作，载荷为已序列化的明文。
@@ -493,6 +504,37 @@ impl Engine {
             session: RwLock::new(session),
             migration: MigrationState::default(),
             maintenance: AtomicBool::new(false),
+        })
+    }
+
+    /// 离线压缩数据库文件：整理 redb 空闲页并收缩文件。
+    ///
+    /// 要求没有其它打开的句柄（同进程或其它进程），否则返回 [`Error::Locked`]；
+    /// 压缩不解密、不改格式与身份，format=1/2 都可使用。
+    pub fn compact_file(path: &Path) -> Result<CompactReport> {
+        let before_bytes = match std::fs::metadata(path) {
+            Ok(meta) => meta.len(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(Error::NotFound)
+            }
+            Err(error) => return Err(Error::Io(error)),
+        };
+        if before_bytes == 0 {
+            return Err(Error::InvalidArgument("database file is empty"));
+        }
+
+        let mut db = Database::open(path)?;
+        let compacted = db.compact()?;
+        if !db.check_integrity()? {
+            return Err(Error::Corrupted("database integrity check failed"));
+        }
+        drop(db);
+
+        let after_bytes = std::fs::metadata(path)?.len();
+        Ok(CompactReport {
+            before_bytes,
+            after_bytes,
+            compacted,
         })
     }
 

@@ -495,6 +495,35 @@ pub unsafe extern "C" fn shio_open(
     })
 }
 
+/// 离线物理压缩：要求没有其它打开的句柄。
+///
+/// 返回 `{"before_bytes":N,"after_bytes":N,"compacted":bool}`；句柄未关闭时返回
+/// `SHIO_LOCKED`，路径不存在返回 `SHIO_NOT_FOUND`。
+///
+/// # Safety
+///
+/// NUL 结尾路径与输出指针必须按 `include/shio.h` 的契约有效。
+#[no_mangle]
+pub unsafe extern "C" fn shio_compact_file(
+    path: *const c_char,
+    out_json: *mut *mut u8,
+    out_json_len: *mut usize,
+) -> i32 {
+    ffi_guard(|| {
+        reset_output(out_json, out_json_len)?;
+        // SAFETY: 由调用方契约保证路径指针有效。
+        let path = unsafe { input_str(path)? };
+        let runtime = new_runtime()?;
+        let report = runtime.block_on(shio::compact_file(PathBuf::from(path)))?;
+        let value = json!({
+            "before_bytes": report.before_bytes,
+            "after_bytes": report.after_bytes,
+            "compacted": report.compacted,
+        });
+        set_output(value_to_bytes(&value)?, out_json, out_json_len)
+    })
+}
+
 /// 在线备份到 `out_path`，返回摘要 JSON；目标必须不存在。
 ///
 /// # Safety

@@ -35,6 +35,7 @@ sele CLI用于管理 `.design/` 与 `.agent/` 目录的 C++20 命令行工具，
 - `change_password(SecretString)` 与 `rotate_data_key()` 都是 async；轮换会长时间占用一个阻塞线程。
 - 维护模式：`begin_maintenance()` / `end_maintenance()` / `migrate_step(to, max_records)` / `migrate_tick(to, budget, max_records)` 都是 async；前两个走读路径，后两个走写路径。窗口内 `Collection` 的写方法返回 `Busy`，读方法不受影响；`migrate_tick` 不要求维护模式，调用间隙普通读写照常。
 - `shio::version()` 返回编译期包版本，不需要打开数据库；库的格式版本从 `Kernel::stats().format_version` 读取。
+- 离线物理压缩：`shio::compact_file(PathBuf)` 是自由函数（不是 `Kernel` 方法），要求先关闭所有句柄；内部取 `.lock` 独占，句柄未关返回 `Locked`。返回 `CompactReport { before_bytes, after_bytes, compacted }`，不需要口令。
 
 ## 踩坑
 
@@ -58,6 +59,10 @@ sele CLI用于管理 `.design/` 与 `.agent/` 目录的 C++20 命令行工具，
 - tick 的预算检查放在每批之后，保证每次调用至少推进一批；`Duration::from_nanos(1)` 这种极小预算下也只是「一批就返回」，不会空转。短批次（不足 `max_records`）视为扫描结束，收尾与最后一批不在同一事务。
 - tick 的进度计数在序列开始时（目标 key 没有游标）清零，单次返回值只含本次调用；取消标志在每次 tick 开始时清除，与 `migrate_step` 一致，停止调度就是不再调用。
 - tick 与 `migrate_all` / `migrate_step` 共用游标和会话写锁，可任意混用；`retire_key` 自带「仍有记录引用该 key 则返回 `Busy`」，迁移途中误调用不会删掉旧 key。
+- 压缩只整理 redb 空闲页：`Database::compact` 需要唯一可变借用且没有在途事务/savepoint，所以先做离线入口；`Engine` 被 `Arc` 共享、`Handle` 直接持有 `Database`，在线压缩要先改成 `RwLock<Handle>`，且并发读会让它退化成 `Busy` 重试。
+- redb 关闭句柄时会收缩预分配空间，`Kernel::stats().db_bytes`（关闭前）与 `compact_file` 的 `before_bytes`（关闭后）可能不相等；测试与文档不要假设两者相同。
+- `compact_file` 的错误映射：`.lock` 被占或 `DatabaseAlreadyOpen` → `Locked`；文件不存在 → `NotFound`；0 字节 → `InvalidArgument`；`TransactionInProgress`/`SavepointExists` → `Busy`；压缩后 `check_integrity` 失败 → `Corrupted`。
+- 压缩不受 format 限制、不需要 DK；format=1/2 都可压缩，压缩后 `db_id`/key 链/同步游标不变。
 - S2 备份在一个 redb 读事务里按已知表定义逐表复制原始键值，不解密、不重加密；表名与键类型不一致会编译失败，新增表必须同步更新 `engine_backup.rs` 的复制清单。
 - 备份先写目标同目录的随机临时文件，复制后只读打开校验每张表的行数与 `meta` 原始字节，再 `rename` 发布；目标已存在直接返回 `InvalidArgument`。临时文件由 `Drop` 清理，不引入 `tempfile` 运行时依赖。
 - 恢复只接受不存在或 0 字节目标；先 `fs::copy` 到临时文件，用原口令只读打开完成 key check/结构校验，再移除空目标并 `rename`，最后按调用方选项重新打开。最终打开失败会删除目标；错误口令/损坏备份不会发布目标。
@@ -88,7 +93,7 @@ sele CLI用于管理 `.design/` 与 `.agent/` 目录的 C++20 命令行工具，
 
 - AVD：`shio_x86_64`，系统镜像 `system-images;android-35;google_apis;x86_64`；Emulator 37.2.12。Linux 开发机上当前 AVD 为 `Medium_Phone`（x86_64、Android 17），另有一台 arm64 真机 `10AE4N38SA000LK`（Android 16）。
 - NDK：`ANDROID_HOME=/home/zxionf/Android/Sdk`，`NDK_HOME=/home/zxionf/Android/Sdk/ndk/29.0.14206865`（另有 30.0.14904198）；`rustup target` 已装 `aarch64-linux-android` 与 `x86_64-linux-android`。
-- Harness：`crates/shio-ffi/examples/android_smoke.c`，模式 `smoke`、`sync`、`hold`、`probe`、`check`、`read-hold`、`read-probe`、`read-locked`、`rotate-many`、`resume-rotation`、`migration-progress`、`maintenance`、`cooperative`、`backup-restore`。用 NDK 的 `x86_64-linux-android24-clang` 编译，与 `libshio_ffi.so` 一起 push 到 `/data/local/tmp/shio-smoke`，运行时设 `LD_LIBRARY_PATH=.`。
+- Harness：`crates/shio-ffi/examples/android_smoke.c`，模式 `smoke`、`sync`、`hold`、`probe`、`check`、`read-hold`、`read-probe`、`read-locked`、`rotate-many`、`resume-rotation`、`migration-progress`、`maintenance`、`cooperative`、`compact`、`backup-restore`。用 NDK 的 `x86_64-linux-android24-clang` 编译，与 `libshio_ffi.so` 一起 push 到 `/data/local/tmp/shio-smoke`，运行时设 `LD_LIBRARY_PATH=.`。
 - 结果：`smoke` 输出 `ANDROID_SMOKE_OK`，覆盖 create/open、stats、insert/get/put/list/batch/delete、close/重开、改口令、轮换、只读拒写；同进程第二写者返回 `SHIO_LOCKED`。
 - 跨进程锁：`hold` 模式持锁 20 秒，另一进程 `probe` 输出 `PROBE_LOCKED`；`kill -9 $(pidof android_smoke)` 后 `check` 输出 `CHECK_OK`，确认锁随进程退出释放且库可重开。
 - 只读并发：写者持锁时 `read-locked` 输出 `READ_LOCKED`；`read-hold` 持共享锁时 `probe` 输出 `PROBE_LOCKED`、`read-probe` 输出 `READ_PROBE_OK`。若写者被 `kill -9`，redb 可能先要求写句柄修复，直接只读打开会返回 `Database repair aborted`；先跑一次 `check`（写打开）再只读即可。
@@ -96,6 +101,7 @@ sele CLI用于管理 `.design/` 与 `.agent/` 目录的 C++20 命令行工具，
 - 迁移取消：`migration-progress` 模式插入 40 条记录后启动 `batch_size=1,pause_ms=20` 的后台迁移，主线程轮询到 `active=true`/`migrated>=1` 后调用 `shio_sync_cancel_migration`；worker 返回 `SHIO_CANCELLED`，随后再次调用 `shio_sync_migrate_all_ex` 续跑并检查 `done=true`。x86_64 模拟器输出 `MIGRATION_PROGRESS_OK`。
 - 维护模式：`maintenance` 模式写入 24 条记录并发起轮换，`shio_sync_begin_maintenance` 后 `shio_put` 返回 `SHIO_BUSY` 且不产生缓冲区，`shio_get`/`shio_collections` 正常，`shio_purge` 返回 `SHIO_SYNC_ENABLED`（优先于 `SHIO_BUSY`）；随后每步 5 条分 5 步迁移到 `done`，`shio_sync_end_maintenance` 返回 `done=1`，退出后写入并读回新值。x86_64 模拟器 `emulator-5554`（Android 17）与 arm64 真机 `10AE4N38SA000LK`（Android 16）均输出 `MAINTENANCE_OK`；同轮回归 `smoke`、`sync`、`migration-progress`、`backup-restore` 全部通过。
 - 迁移续跑：`format=2` 每批提交时把目标 key 与最后扫描键写入 `shio.sync` 的 `b"migration"`；取消、崩溃或重开后同一 `to` 从未扫描位置继续，不重新扫描已提交范围。切换目标 key 会忽略旧游标，完成迁移或实际应用远端记录会删除游标并从头扫描。C ABI 未变化。
+- 物理压缩：`compact` 模式写入 40 条并删除 39 条，句柄未关闭时 `shio_compact_file` 返回 `SHIO_LOCKED` 且不产生缓冲区；关闭后压缩把文件从 86016 字节收缩到 57344 字节，连续压缩返回 `compacted=0`，重开后保留记录可读并可继续写入。x86_64 模拟器 `emulator-5554` 与 arm64 真机 `10AE4N38SA000LK` 均输出 `COMPACT_OK`。
 - 合作式调度：`cooperative` 模式写入 18 条记录并发起轮换，`shio_sync_migrate_tick(kernel, to, 1, 4, ...)` 首次只推进一批；随后直接 `shio_put` 写入中间记录并读回（不进维护模式、写不被拒绝），继续 tick 到 `done=1`，检查进度 `active=false`/`done=true`、首尾记录可读，最后断言 `budget_ms=1001` 与 `max_records=257` 返回 `SHIO_INVALID_ARGUMENT`。x86_64 模拟器 `emulator-5554`、arm64 真机 `10AE4N38SA000LK` 均输出 `COOPERATIVE_OK`。
 - 轮换中断：`rotate-many` 建 60000 条记录后打印 `ROTATE_START` 再执行 `shio_rotate_data_key`；外部在启动后 `kill -9`，随后 `resume-rotation` 读取 `shio_sync_rotation_state` 的 `to`，用 `shio_sync_migrate_all_ex` 续跑并读首尾记录、写入新记录，输出 `ROTATE_RESUME_OK`。
 - 备份恢复：`backup-restore` 模式在 `format=2` 源库写入记录并 `sync_enable`，调用 `shio_backup` 检查摘要，拒绝已存在备份目标和非空恢复目标，错误口令返回 `SHIO_INVALID_KEY` 且不建目标；随后 `shio_restore` 打开目标、读取原记录并比较 `db_id`/`device_id`。x86_64 模拟器输出 `BACKUP_RESTORE_OK`。
@@ -109,7 +115,7 @@ sele CLI用于管理 `.design/` 与 `.agent/` 目录的 C++20 命令行工具，
 - 导出：`shio_abi_version`、`shio_last_error`、`shio_open`、`shio_close`、`shio_kernel_destroy`、`shio_free`、`shio_insert`、`shio_put`、`shio_get`、`shio_delete`、`shio_purge`、`shio_list`、`shio_collections`、`shio_batch`、`shio_change_password`、`shio_rotate_data_key`、`shio_flush`、`shio_stats`。
 - `shio_purge` 是物理删除（facade `Collection::purge`）：`shio_delete` 只写墓碑；同步启用后物理删除返回 `SHIO_SYNC_ENABLED`，记录不存在时返回成功且 `out_existed=0`。
 - `shio_collections` 返回命名空间下已登记集合名，JSON 字符串数组、按名称升序；未写入过任何集合时返回 `[]`。
-- P4 追加 18 个同步/配对符号：`shio_sync_enable/info/changes/apply/offers/apply_offers/snapshot_start/snapshot_page/apply_snapshot/begin_rotation/rotation_state/ack_rotation/migrate_all/retire/prune_offers/compact/create_pairing` 与 `shio_open_with_pairing`；S1 再追加 `shio_sync_migrate_all_ex`、`shio_sync_migration_progress`、`shio_sync_cancel_migration` 与错误码 `SHIO_CANCELLED(-23)`；S2 追加 `shio_backup`、`shio_restore`；维护模式追加 `shio_sync_begin_maintenance`、`shio_sync_end_maintenance`、`shio_sync_migrate_step`（窗口内普通写返回 `SHIO_BUSY`，步进返回 `{"scanned","migrated","done"}`）；合作式调度追加 `shio_sync_migrate_tick`（时间预算内多批推进，不冻结写）。完整签名见 `include/shio.h` 与 `.design/api.md` §8。ABI 版本仍为 1（只增符号）。
+- P4 追加 18 个同步/配对符号：`shio_sync_enable/info/changes/apply/offers/apply_offers/snapshot_start/snapshot_page/apply_snapshot/begin_rotation/rotation_state/ack_rotation/migrate_all/retire/prune_offers/compact/create_pairing` 与 `shio_open_with_pairing`；S1 再追加 `shio_sync_migrate_all_ex`、`shio_sync_migration_progress`、`shio_sync_cancel_migration` 与错误码 `SHIO_CANCELLED(-23)`；S2 追加 `shio_backup`、`shio_restore`；维护模式追加 `shio_sync_begin_maintenance`、`shio_sync_end_maintenance`、`shio_sync_migrate_step`（窗口内普通写返回 `SHIO_BUSY`，步进返回 `{"scanned","migrated","done"}`）；合作式调度追加 `shio_sync_migrate_tick`（时间预算内多批推进，不冻结写）；物理压缩追加 `shio_compact_file`（离线整理空闲页，不需要句柄）。完整签名见 `include/shio.h` 与 `.design/api.md` §8。ABI 版本仍为 1（只增符号）。
 - `shio_open` 的 options JSON：`create`、`read_only`、`max_value_size`、`cache_size`；未知字段拒绝。字符串为 NUL 结尾 UTF-8，载荷/口令/ID 显式带长度。
 - 同步业务帧是 `SHY2` 不透明字节，调用方不要把帧内容塞进 JSON 或自行改写；状态、轮换信息和应用报告才是 JSON。首版建库先 `shio_open`，紧接着 `shio_sync_enable`，成功后才写业务记录；失败就关闭并删除尚未使用的库。
 - `shio_sync_changes` 的 `after` 是上一页 `out_next`；日志被压缩后返回 `SHIO_SYNC_RESYNC_REQUIRED`，改用 `snapshot_start/page`。`shio_sync_snapshot_page` 的 `out_next` 是另一条不透明游标，`out_done=1` 时为空。

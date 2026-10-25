@@ -26,7 +26,7 @@ pub mod sync;
 
 pub use error::{Error, Result};
 pub use model::{DeviceId, KeyId};
-pub use store::engine::{BackupInfo, Engine, EngineOptions, RawWriteOp, Stats};
+pub use store::engine::{BackupInfo, CompactReport, Engine, EngineOptions, RawWriteOp, Stats};
 pub use sync::{
     ApplyReport, ChangeEntry, ChangePage, MaintenanceOutcome, MigrationOptions, MigrationProgress,
     MigrationStep, OfferPage, PairingOffer, RecordChange, RotationInfo, RotationOffer,

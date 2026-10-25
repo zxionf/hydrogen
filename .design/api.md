@@ -42,6 +42,7 @@ kernel.close().await?;
 - 同一进程内可克隆 `Kernel` 句柄共享；跨进程由文件锁保证单写，冲突时返回 `Error::Locked`。非 Android 平台使用 redb 自带锁；Android 上 redb 4.4 的字节范围锁不可用，facade 改用数据库旁的 `<db>.lock` 文件加 `flock`：写句柄独占、只读句柄共享。`.lock` 文件在句柄关闭时释放，不要在持有期间删除。
 - `open` 是唯一需要口令的入口；解锁后的密钥材料只驻留内存。
 - `shio::version()` 返回编译期内核版本（与包版本一致），不需要打开数据库；库的格式版本用 `Kernel::stats().format_version` 查询。
+- 离线物理压缩：`shio::compact_file(path)` 要求没有其它打开的句柄（同进程或其它进程），按独占方式取 `.lock`，冲突返回 `Error::Locked`；不解密、不改格式与身份，返回 `CompactReport { before_bytes, after_bytes, compacted }`。
 
 ## 4. 核心类型
 
@@ -129,11 +130,20 @@ impl Kernel {
     ) -> Result<MigrationStep>;
 }
 
+/// 离线压缩数据库文件：要求没有其它打开的句柄。
+pub async fn compact_file(path: PathBuf) -> Result<CompactReport>;
+
 pub struct BackupInfo {
     pub format_version: u16,
     pub db_bytes: u64,
     pub table_count: u64,
     pub row_count: u64,
+}
+
+pub struct CompactReport {
+    pub before_bytes: u64,
+    pub after_bytes: u64,
+    pub compacted: bool,
 }
 
 pub struct Stats {
@@ -384,6 +394,7 @@ C++ 与 Android 通过 `shio-ffi` 调用；契约头文件为 `crates/shio-ffi/i
 - 回调、取消令牌、异步 future 不在 v1。P4 以**增量符号**追加 sync/pairing；不改变现有函数签名或语义，因此 `SHIO_ABI_VERSION` 仍为 1，破坏性变更才升 2。
 - 存储维护 S1 的轮换取消通过旁路状态与批次边界实现，不引入回调或取消令牌；轮换接口是兼容性例外，允许不兼容旧客户端，其他非轮换接口仍按增量方式演进。
 - 存储维护 S2 的备份/恢复是新增非轮换符号；`shio_backup` 通过显式输出参数返回摘要 JSON，`shio_restore` 直接返回已打开的目标句柄。
+- 物理压缩以增量符号追加：`shio_compact_file` 只整理 redb 空闲页，不需要口令，不改格式/身份/游标；`SHIO_ABI_VERSION` 保持 1。
 - C ABI 补齐同样只做增量符号：`shio_purge` 暴露 facade 已有的物理删除（同步启用时返回 `SHIO_SYNC_ENABLED`，不写墓碑），`shio_collections` 返回按名称升序的 JSON 字符串数组；`SHIO_ABI_VERSION` 保持 1。
 - 维护模式同样是增量符号：`shio_sync_begin_maintenance` / `shio_sync_end_maintenance` / `shio_sync_migrate_step`。窗口内普通写返回 `SHIO_BUSY`，读放行；`SHIO_ABI_VERSION` 保持 1。
 - 合作式调度 `shio_sync_migrate_tick` 同样以增量符号追加：不要求维护模式、不冻结写，调用间隙普通读写照常；`SHIO_ABI_VERSION` 保持 1。
@@ -402,6 +413,8 @@ int32_t shio_restore(const char *backup_path, const char *target_path,
                      const uint8_t *password, size_t password_len,
                      const uint8_t *options_json, size_t options_len,
                      shio_kernel **out);
+int32_t shio_compact_file(const char *path,
+                          uint8_t **out_json, size_t *out_json_len);
 int32_t shio_close(shio_kernel *kernel);
 void    shio_kernel_destroy(shio_kernel *kernel);
 
@@ -550,6 +563,7 @@ JSON 形状：
 - `shio_stats` 返回 `format_version`、`key_id`（32 位十六进制）和 `db_bytes`。
 - `shio_backup` 返回 `{"format_version":N,"db_bytes":N,"table_count":N,"row_count":N}`；备份文件使用原库口令打开，不携带明文或密钥。目标已存在返回 `SHIO_INVALID_ARGUMENT`；失败不会留下目标或临时文件。
 - `shio_restore` 的目标必须不存在或为 0 字节；`options_json` 的 `create` 被忽略。恢复失败返回对应错误并删除临时文件/未完成的目标；成功返回已打开的目标句柄。目标非空返回 `SHIO_INVALID_ARGUMENT`。
+- `shio_compact_file` 返回 `{"before_bytes":N,"after_bytes":N,"compacted":bool}`；要求句柄全部关闭，否则返回 `SHIO_LOCKED`；路径不存在返回 `SHIO_NOT_FOUND`；0 字节文件返回 `SHIO_INVALID_ARGUMENT`。`compacted=false` 表示已无可整理空闲页。
 - `shio_sync_info` / `shio_sync_enable` 返回 `{"db_id":"32hex","device_id":"32hex","current_key_id":"32hex","log_start":N,"log_end":N,"baseline_done":bool}`。
 - `shio_sync_begin_rotation` / `shio_sync_rotation_state` 返回 `{"from":"32hex","to":"32hex","created_at":millis,"acked":["32hex",...]}`；没有进行中的轮换时 `rotation_state` 返回 `null`。
 - `shio_sync_migration_progress` 返回 `{"active":bool,"scanned":N,"migrated":N,"done":bool}`；`scanned` 为本次迁移已扫描记录数（含无需迁移记录），`done` 只表示最近一次迁移完整成功，不承诺百分比。
@@ -581,6 +595,7 @@ JSON 形状：
 - 新增字段只能追加在 header 尾部并提升 `format`；旧库由显式迁移升级，不静默改写。
 - `key_id` 允许新旧密钥并存，是轮换与多设备密钥分发的基础；`format=1` 为 u16，`format=2` 为 16 字节 `KeyId`。
 - `shio.changes`、`shio.sync`、`shio.keys2` 是同步库新增表，旧版本不可见；旧版本也不会写变更日志。
+- 物理压缩只重排 redb 页，不改变记录格式、密钥链或同步状态；压缩前后的库对任何支持的版本都可读。
 
 ## 10. 示例
 
@@ -1076,6 +1091,9 @@ impl Kernel {
         max_records: usize,
     ) -> Result<MigrationStep>;
 }
+
+/// 离线压缩数据库文件：要求没有其它打开的句柄。
+pub async fn compact_file(path: PathBuf) -> Result<CompactReport>;
 
 #[cfg(feature = "sync")]
 pub async fn open_with_pairing(

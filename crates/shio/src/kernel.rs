@@ -16,6 +16,8 @@ use secrecy::{ExposeSecret, SecretString};
 use shio_core::model::{validate_name, NameKind, DEFAULT_MAX_VALUE_SIZE};
 use shio_core::store::{BackupInfo, Engine, EngineOptions, Stats};
 #[cfg(feature = "sync")]
+use shio_core::{KeyId, MaintenanceOutcome, MigrationStep};
+#[cfg(feature = "sync")]
 use shio_sync::{PairingOffer, Sync as SyncApi, SyncHandle, SyncInfo};
 use tokio::sync::Notify;
 use zeroize::Zeroizing;
@@ -370,6 +372,46 @@ impl Kernel {
     pub async fn rotate_data_key(&self) -> Result<()> {
         self.inner
             .run_write(|engine| engine.rotate_data_key())
+            .await
+    }
+
+    /// 进入维护模式：迁移窗口内普通写返回 [`Error::Busy`]，读操作不受影响。
+    ///
+    /// 只读句柄返回 [`Error::ReadOnly`]，未启用同步返回 [`Error::SyncDisabled`]。
+    #[cfg(feature = "sync")]
+    pub async fn begin_maintenance(&self) -> Result<()> {
+        self.inner.run(|engine| engine.begin_maintenance()).await
+    }
+
+    /// 退出维护模式；`done` 表示当前已无待续跑的迁移游标。
+    #[cfg(feature = "sync")]
+    pub async fn end_maintenance(&self) -> Result<MaintenanceOutcome> {
+        self.inner.run(|engine| engine.end_maintenance()).await
+    }
+
+    /// 单步迁移：每次至多一批，`max_records` 为 0 时使用默认 256，上限 1024。
+    ///
+    /// 最后一批之后的收尾在同一次调用内完成并返回 `done=true`。
+    #[cfg(feature = "sync")]
+    pub async fn migrate_step(&self, to: KeyId, max_records: usize) -> Result<MigrationStep> {
+        self.inner
+            .run_write(move |engine| engine.migrate_step(to, max_records))
+            .await
+    }
+
+    /// 合作式调度：在 `budget` 内推进若干小批次，提交即释放写锁。
+    ///
+    /// 不要求维护模式，调用间隙普通读写照常；`budget` 为零取默认 10ms、
+    /// 上限 1s，`max_records` 为零取默认 32、上限 256。
+    #[cfg(feature = "sync")]
+    pub async fn migrate_tick(
+        &self,
+        to: KeyId,
+        budget: Duration,
+        max_records: usize,
+    ) -> Result<MigrationStep> {
+        self.inner
+            .run_write(move |engine| engine.migrate_tick(to, budget, max_records))
             .await
     }
 }

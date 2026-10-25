@@ -113,6 +113,20 @@ impl Kernel {
     pub async fn rotate_data_key(&self) -> Result<()>;
 
     pub fn stats(&self) -> Result<Stats>;
+
+    #[cfg(feature = "sync")]
+    pub async fn begin_maintenance(&self) -> Result<()>;
+    #[cfg(feature = "sync")]
+    pub async fn end_maintenance(&self) -> Result<MaintenanceOutcome>;
+    #[cfg(feature = "sync")]
+    pub async fn migrate_step(&self, to: KeyId, max_records: usize) -> Result<MigrationStep>;
+    #[cfg(feature = "sync")]
+    pub async fn migrate_tick(
+        &self,
+        to: KeyId,
+        budget: Duration,
+        max_records: usize,
+    ) -> Result<MigrationStep>;
 }
 
 pub struct BackupInfo {
@@ -354,7 +368,7 @@ pub enum NameKind { Namespace, Collection }
 - 可恢复错误不 panic；只有违反类型不变式（如内部状态机损坏）才允许 `debug_assert` 后返回 `Internal`。
 - 所有来自落盘字节的输入先做长度/边界校验；失败返回 `Corrupted` 或 `Deserialize`，绝不 panic、越界或 abort。
 
-## 8. C ABI 映射（v1 + P4 同步扩展 + 存储维护 S1/S2）
+## 8. C ABI 映射（v1 + P4 同步扩展 + 存储维护 S1/S2 + C ABI 补齐）
 
 C++ 与 Android 通过 `shio-ffi` 调用；契约头文件为 `crates/shio-ffi/include/shio.h`。用户已批准 `shio-ffi` 的 unsafe 例外，允许范围只在本 crate 的 FFI 边界内；`shio-core` 与 `shio` 继续 `forbid(unsafe_code)`。JNI/Kotlin 包装层由 `shio-android` 实现，内核不绑定具体 Java 包名或 UI 技术栈。
 
@@ -370,6 +384,9 @@ C++ 与 Android 通过 `shio-ffi` 调用；契约头文件为 `crates/shio-ffi/i
 - 回调、取消令牌、异步 future 不在 v1。P4 以**增量符号**追加 sync/pairing；不改变现有函数签名或语义，因此 `SHIO_ABI_VERSION` 仍为 1，破坏性变更才升 2。
 - 存储维护 S1 的轮换取消通过旁路状态与批次边界实现，不引入回调或取消令牌；轮换接口是兼容性例外，允许不兼容旧客户端，其他非轮换接口仍按增量方式演进。
 - 存储维护 S2 的备份/恢复是新增非轮换符号；`shio_backup` 通过显式输出参数返回摘要 JSON，`shio_restore` 直接返回已打开的目标句柄。
+- C ABI 补齐同样只做增量符号：`shio_purge` 暴露 facade 已有的物理删除（同步启用时返回 `SHIO_SYNC_ENABLED`，不写墓碑），`shio_collections` 返回按名称升序的 JSON 字符串数组；`SHIO_ABI_VERSION` 保持 1。
+- 维护模式同样是增量符号：`shio_sync_begin_maintenance` / `shio_sync_end_maintenance` / `shio_sync_migrate_step`。窗口内普通写返回 `SHIO_BUSY`，读放行；`SHIO_ABI_VERSION` 保持 1。
+- 合作式调度 `shio_sync_migrate_tick` 同样以增量符号追加：不要求维护模式、不冻结写，调用间隙普通读写照常；`SHIO_ABI_VERSION` 保持 1。
 - 同步业务数据只以不透明的 `SHY2` 帧进出；Kotlin/Java 不解析帧内部结构。同步状态、轮换信息和应用报告是小体积 JSON。
 
 ```c
@@ -398,9 +415,13 @@ int32_t shio_get(shio_kernel *k, const char *ns, const char *coll,
                  const uint8_t id[16], uint8_t **out_json, size_t *out_json_len);
 int32_t shio_delete(shio_kernel *k, const char *ns, const char *coll,
                     const uint8_t id[16], int32_t *out_existed);
+int32_t shio_purge(shio_kernel *k, const char *ns, const char *coll,
+                   const uint8_t id[16], int32_t *out_existed);
 int32_t shio_list(shio_kernel *k, const char *ns, const char *coll,
                   const uint8_t *after, size_t limit, uint8_t include_deleted,
                   uint8_t **out_json, size_t *out_json_len);
+int32_t shio_collections(shio_kernel *k, const char *ns,
+                         uint8_t **out_json, size_t *out_json_len);
 int32_t shio_batch(shio_kernel *k, const char *ns, const char *coll,
                    const uint8_t *ops_json, size_t ops_json_len,
                    uint8_t **out_meta, size_t *out_meta_len);
@@ -476,6 +497,23 @@ int32_t shio_sync_migrate_all_ex(shio_kernel *k, const uint8_t *to,
 int32_t shio_sync_migration_progress(shio_kernel *k,
                                      uint8_t **out_json, size_t *out_json_len);
 int32_t shio_sync_cancel_migration(shio_kernel *k);
+/* 维护模式：窗口内普通写返回 SHIO_BUSY，读放行。 */
+int32_t shio_sync_begin_maintenance(shio_kernel *k);
+/* out_done=1 表示已无待续跑的迁移游标；out_done 可为 NULL。 */
+int32_t shio_sync_end_maintenance(shio_kernel *k, uint8_t *out_done);
+/* 单步迁移；max_records=0 用默认 256，上限 1024；返回 {"scanned":N,"migrated":N,"done":bool}。 */
+int32_t shio_sync_migrate_step(shio_kernel *k, const uint8_t *to,
+                               uint32_t max_records,
+                               uint8_t **out_json, size_t *out_json_len);
+/*
+ * 合作式调度：budget_ms 内连续推进若干小批次，提交即释放写锁；
+ * 不要求维护模式，调用间隙普通读写照常。
+ * budget_ms=0 用默认 10、上限 1000；max_records=0 用默认 32、上限 256。
+ * 返回 {"scanned":N,"migrated":N,"done":bool}。
+ */
+int32_t shio_sync_migrate_tick(shio_kernel *k, const uint8_t *to,
+                               uint32_t budget_ms, uint32_t max_records,
+                               uint8_t **out_json, size_t *out_json_len);
 int32_t shio_sync_retire(shio_kernel *k, const uint8_t *from);
 int32_t shio_sync_prune_offers(shio_kernel *k, const uint8_t *to);
 int32_t shio_sync_compact(shio_kernel *k, uint64_t before,
@@ -516,6 +554,9 @@ JSON 形状：
 - `shio_sync_begin_rotation` / `shio_sync_rotation_state` 返回 `{"from":"32hex","to":"32hex","created_at":millis,"acked":["32hex",...]}`；没有进行中的轮换时 `rotation_state` 返回 `null`。
 - `shio_sync_migration_progress` 返回 `{"active":bool,"scanned":N,"migrated":N,"done":bool}`；`scanned` 为本次迁移已扫描记录数（含无需迁移记录），`done` 只表示最近一次迁移完整成功，不承诺百分比。
 - `shio_sync_migrate_all_ex` 在取消时返回 `SHIO_CANCELLED`；已提交批次保留，旧 key 不删除。恢复中断轮换先取 `shio_sync_rotation_state` 的 `to`，再迁移。
+- `shio_sync_migrate_step` 返回本步的 `{"scanned":N,"migrated":N,"done":bool}`；`done=1` 表示已收尾。取消只影响正在执行的这一步，之后仍可继续步进。
+- `shio_sync_migrate_tick` 返回本次 tick 的 `{"scanned":N,"migrated":N,"done":bool}`；`done=1` 表示已收尾。一次调用在 `budget_ms` 内可跑多批，每批单独提交；调用间隙普通读写不受限，不需要维护模式。`budget_ms` / `max_records` 越界返回 `SHIO_INVALID_ARGUMENT`，只读句柄返回 `SHIO_READ_ONLY`，未启用同步返回 `SHIO_SYNC_DISABLED`。
+- 维护模式期间 `shio_insert` / `shio_put` / `shio_delete` / `shio_batch` / `shio_change_password` / `shio_rotate_data_key` 等写入口返回 `SHIO_BUSY`；`shio_sync_begin_maintenance` 在只读句柄返回 `SHIO_READ_ONLY`、未启用同步返回 `SHIO_SYNC_DISABLED`。
 - `shio_sync_apply` / `shio_sync_apply_snapshot` 返回 `{"applied":N,"skipped":N,"controls":N}`。
 - `shio_sync_create_pairing` 返回 `{"secret":"<Base32>","fingerprint":"<6 位十六进制>"}`；`secret` 只用于配对展示，不得写日志。
 - `shio_sync_changes`、`shio_sync_offers`、`shio_sync_snapshot_page` 的 `out_frame` 是 `SHY2` 帧；调用方不得解析或改写，只负责传输与 `shio_free`。
@@ -843,6 +884,16 @@ pub struct MigrationProgress {
     pub done: bool,
 }
 
+pub struct MigrationStep {
+    pub scanned: u64,   // 本步扫描记录数
+    pub migrated: u64,  // 本步重加密记录数
+    pub done: bool,     // 本步是否完成收尾
+}
+
+pub struct MaintenanceOutcome {
+    pub done: bool,     // 退出时是否已无待续跑的迁移游标
+}
+
 pub struct BackupInfo {
     pub format_version: u16,
     pub db_bytes: u64,
@@ -881,6 +932,16 @@ impl Engine {
     ) -> Result<u64>;
     pub fn migration_progress(&self) -> MigrationProgress;
     pub fn cancel_migration(&self);
+    pub fn begin_maintenance(&self) -> Result<()>;
+    pub fn end_maintenance(&self) -> Result<MaintenanceOutcome>;
+    pub fn migrate_step(&self, to: KeyId, max_records: usize) -> Result<MigrationStep>;
+    pub fn migrate_tick(
+        &self,
+        to: KeyId,
+        budget: Duration,
+        max_records: usize,
+    ) -> Result<MigrationStep>;
+    pub fn maintenance_active(&self) -> bool;
     pub fn retire_key(&self, from: KeyId) -> Result<()>;
     pub fn prune_rotation_offers(&self, to: KeyId) -> Result<()>;
 
@@ -910,6 +971,9 @@ impl Engine {
 - `migrate_all_with_options` 保持迁移期间 session 写锁；`migration_progress` 与 `cancel_migration` 走旁路状态，不获取该锁。取消在批次提交后的边界生效。
 - 每批提交时把目标 key 与最后扫描键持久化到 `shio.sync`；取消或重启后再次 `migrate_all(to)` 从该游标继续，目标 key 不同则从头开始。实际应用远端记录会删除游标，避免旧 key 记录落在扫描范围之前；恢复时改为从头扫描。恢复中断轮换使用 `rotation_state()` 取 `to`，不要用 `rotate_data_key`。
 - `rotate_data_key` 在同步模式下等价于 `begin_rotation` + `migrate_all(to)`，不自动退役；`format=1` 路径不提供进度或取消。
+- 维护模式：`begin_maintenance` 置进程内标志（不落盘），期间普通写返回 `Busy`、读操作放行；`end_maintenance` 返回 `MaintenanceOutcome { done }`，`done=false` 表示游标仍在、可继续步进。进入/退出会短暂获取会话写锁，与正在执行的迁移串行化；只读句柄进入返回 `ReadOnly`，未启用同步返回 `SyncDisabled`。
+- `migrate_step(to, max_records)` 每次只处理一批并在批内持有会话写锁，提交后立即释放；`max_records=0` 取默认 256、上限 1024。最后一批之后的收尾（公告 `Migrated`、删除游标）在同一次调用内完成并返回 `done=true`。游标与 `migrate_all` 共用，两种模式可混用；`migrate_step` 不要求先进入维护模式。
+- 合作式调度：`migrate_tick(to, budget, max_records)` 在一次调用内按时间预算连续推进若干小批次，每批单独提交、提交即让出；`budget` 为零取默认 10ms、上限 1s，`max_records` 为零取默认 32、上限 256，越界返回 `InvalidArgument`。预算检查在每批之后，因此每次 tick 至少推进一批；短批次视为扫描结束，同一次调用内收尾并返回 `done=true`。tick 不要求维护模式、不冻结写：调用间隙普通读写照常，会话写锁只在单次调用期间持有；轮换开始后新写入天然落在目标 key，扫描按 key 跳过。进度计数在一个迁移序列内累计，序列开始（目标 key 没有游标）时清零；取消只影响正在执行的 tick。
 - 同步模式的 `change_password` 在同一事务内重新包裹所有 `shio.keys2` 行（同一新 salt/KEK、各自 nonce）；`format=1` 仍要求单行。
 - `open_with_pairing` 只创建新库，目标必须不存在或为空；成功时直接是 `format=2`，失败不会留下半成品文件。
 - 配对包不携带 TTL；接收端固定按 `DEFAULT_PAIRING_TTL`（10 分钟）窗口校验 `created_at`，`ttl` 由调用方用于展示与过期控制。
@@ -958,6 +1022,16 @@ impl<'a> Sync<'a> {
     ) -> Result<u64>;
     pub fn migration_progress(&self) -> MigrationProgress;
     pub fn cancel_migration(&self);
+    pub fn begin_maintenance(&self) -> Result<()>;
+    pub fn end_maintenance(&self) -> Result<MaintenanceOutcome>;
+    pub fn migrate_step(&self, to: KeyId, max_records: usize) -> Result<MigrationStep>;
+    pub fn migrate_tick(
+        &self,
+        to: KeyId,
+        budget: Duration,
+        max_records: usize,
+    ) -> Result<MigrationStep>;
+    pub fn maintenance_active(&self) -> bool;
     pub fn retire(&self, from: KeyId) -> Result<()>;
     pub fn prune_offers(&self, to: KeyId) -> Result<()>;
     pub fn compact(&self, before: u64) -> Result<u64>;
@@ -992,6 +1066,15 @@ impl Kernel {
     pub fn sync_info(&self) -> Result<SyncInfo>;
     pub fn sync(&self) -> Result<SyncHandle>; // 绑定同一 Arc<Engine>；关闭后返回 Closed
     pub async fn create_pairing_offer(&self, ttl: Duration) -> Result<PairingOffer>;
+    pub async fn begin_maintenance(&self) -> Result<()>;
+    pub async fn end_maintenance(&self) -> Result<MaintenanceOutcome>;
+    pub async fn migrate_step(&self, to: KeyId, max_records: usize) -> Result<MigrationStep>;
+    pub async fn migrate_tick(
+        &self,
+        to: KeyId,
+        budget: Duration,
+        max_records: usize,
+    ) -> Result<MigrationStep>;
 }
 
 #[cfg(feature = "sync")]
@@ -1004,6 +1087,8 @@ pub async fn open_with_pairing(
 ```
 
 `sync_info` 与 `sync` 是廉价的同步调用（与 `stats` 一致）；`create_pairing_offer` 与 `open_with_pairing` 经 `spawn_blocking`。口令与 pairing secret 用 `Zeroizing` 搬运，`Debug` 不输出内容。`SyncHandle` 拥有同一 `Arc<Engine>`，方法集与 `shio_sync::Sync` 相同，避免 facade 句柄生命周期外借。
+
+维护模式的四个方法均经 `spawn_blocking`（`begin_maintenance` / `end_maintenance` 走读路径，`migrate_step` / `migrate_tick` 走写路径）；语义与 `Engine` 同名方法一致。
 
 ### 12.7 新增错误变体
 
@@ -1033,4 +1118,5 @@ pub enum Error {
 - `enable_sync` 在单事务内写 `shio.keys2` 与 `format=2` meta，再分批把 `SHR1` 迁成 `SHR2`；升级不可回退。
 - 旧二进制只认识 `format=1`，打开同步库时在 meta 阶段被拒绝。
 - 升级期间 `change_password` / `rotate_data_key` 返回 `Busy`。
+- 维护模式复用现有 `Busy`：窗口内普通写返回 `Busy`，不新增错误变体；`SyncEnabled` 仍优先于 `Busy`（物理删除永久禁止）。
 - 新设备配对包携带整条密钥链；旧 key 的退役需要所有已知设备公告迁移完成。

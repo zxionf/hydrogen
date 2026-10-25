@@ -170,6 +170,16 @@ int32_t shio_delete(shio_kernel *handle,
                     int32_t *out_existed);
 
 /*
+ * 物理删除：连墓碑一起移除，不可恢复；out_existed 可为 NULL。
+ * 同步启用后禁止使用，返回 SHIO_SYNC_ENABLED。
+ */
+int32_t shio_purge(shio_kernel *handle,
+                   const char *namespace_name,
+                   const char *collection_name,
+                   const uint8_t *id,
+                   int32_t *out_existed);
+
+/*
  * 按记录 ID 升序分页，返回 {"items":[...],"next":...}。
  * after 可为 NULL；limit 为 0 时使用默认值。
  */
@@ -181,6 +191,12 @@ int32_t shio_list(shio_kernel *handle,
                   uint8_t include_deleted,
                   uint8_t **out_json,
                   size_t *out_json_len);
+
+/* 按名称升序列出命名空间下已登记的集合，返回 JSON 字符串数组。 */
+int32_t shio_collections(shio_kernel *handle,
+                         const char *namespace_name,
+                         uint8_t **out_json,
+                         size_t *out_json_len);
 
 /*
  * 原子批量写。输入 JSON 数组：
@@ -316,6 +332,39 @@ int32_t shio_sync_migration_progress(shio_kernel *handle,
 
 /* 请求取消迁移；在下一次批次边界生效。 */
 int32_t shio_sync_cancel_migration(shio_kernel *handle);
+
+/*
+ * 维护模式：窗口内普通写返回 SHIO_BUSY，读操作不受影响。
+ * 只读句柄返回 SHIO_READ_ONLY，未启用同步返回 SHIO_SYNC_DISABLED。
+ */
+int32_t shio_sync_begin_maintenance(shio_kernel *handle);
+
+/* 退出维护模式；out_done=1 表示已无待续跑的迁移游标。out_done 可为 NULL。 */
+int32_t shio_sync_end_maintenance(shio_kernel *handle, uint8_t *out_done);
+
+/*
+ * 单步迁移：每次至多一批，批内持写锁，提交后立即释放。
+ * max_records=0 使用默认 256，上限 1024。
+ * 返回 {"scanned":N,"migrated":N,"done":bool}；done=1 表示已收尾。
+ */
+int32_t shio_sync_migrate_step(shio_kernel *handle,
+                               const uint8_t *to,
+                               uint32_t max_records,
+                               uint8_t **out_json,
+                               size_t *out_json_len);
+
+/*
+ * 合作式调度：在时间预算内连续推进若干小批次，提交即释放写锁；
+ * 不要求维护模式，调用间隙普通读写照常。
+ * budget_ms=0 使用默认 10，上限 1000；max_records=0 使用默认 32，上限 256。
+ * 返回 {"scanned":N,"migrated":N,"done":bool}；done=1 表示已收尾。
+ */
+int32_t shio_sync_migrate_tick(shio_kernel *handle,
+                               const uint8_t *to,
+                               uint32_t budget_ms,
+                               uint32_t max_records,
+                               uint8_t **out_json,
+                               size_t *out_json_len);
 
 /* 退役 from key。 */
 int32_t shio_sync_retire(shio_kernel *handle, const uint8_t *from);

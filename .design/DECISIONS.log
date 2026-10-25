@@ -249,3 +249,28 @@ Change: 20261024-storage-maintenance
 Context: 取消迁移后同步层仍可能应用远端记录，远端 blob 可能使用旧 key 且记录键落在持久化游标之前；仅按扫描键续跑会跳过这些记录
 Decision: `stage_remote_record` 实际写入记录时在同一事务删除 `b"migration"`；恢复迁移时从头扫描，宁可重扫也不漏迁
 Consequences: 同步活动会降低持久化游标的续跑收益，但保证 `migrate_all(to)` 最终覆盖所有本地记录；本地写入仍使用当前 key，不影响该安全性
+## [51] 2026-10-25 08:20:24 UTC
+Change: 20261025-maintenance-mode
+Context: 迁移与轮换会长期持有会话写锁，应用在迁移期间无法写入；维护窗口需要可预测的写语义，Android 上不能把调用线程拖成长等待。
+Decision: 维护模式窗口内普通写直接返回 Busy（C ABI 为 SHIO_BUSY），读操作全部放行；不采用排队等待，也不延后到步边界。
+Consequences: 错误可预测，应用可把草稿留在内存稍后重试；新增写入口必须继续走 Engine::require_writable 才能被闸门覆盖；同步启用的物理删除仍优先返回 SyncEnabled。
+## [52] 2026-10-25 08:20:30 UTC
+Change: 20261025-maintenance-mode
+Context: 维护窗口标志若落盘，崩溃会留下『永久维护中』或需要额外恢复流程，与现有可中断续跑语义冲突。
+Decision: 维护模式标志只存进程内 AtomicBool，不写库；失败恢复依赖已持久化的迁移游标与批次事务。
+Consequences: 重开自动回到普通模式，普通写立即可用；游标仍在，migrate_step 可从断点续跑；多进程互斥仍只依赖 .lock。
+## [53] 2026-10-25 08:20:37 UTC
+Change: 20261025-maintenance-mode
+Context: 长事务迁移无法让应用在批次之间读写；需要一种既能推进迁移又能释放写锁的调度方式。
+Decision: 新增 migrate_step(to, max_records)：每次只处理一批，批内持会话写锁，提交并推进游标后立即释放；最后一批之后的收尾（扫引用、公告 Migrated、删游标）在同一次调用内完成并返回 done=true。begin/end_maintenance 取会话写锁与在途迁移串行化。
+Consequences: 应用可在步之间读写（写仍受维护窗口拒绝）；连续迁移与步进共用游标，可混用；收尾前崩溃只需再跑一步；步进参数上限 1024 沿用既有迁移常量。
+## [54] 2026-10-25 09:02:19 UTC
+Change: 20261025-cooperative-scheduling
+Context: 维护窗口把迁移和写严格二选一：应用要么停写，要么不迁移；协作场景需要迁移在应用正常读写期间推进。
+Decision: 新增 migrate_tick(to, budget, max_records)：tick 不要求维护模式、不冻结写，会话写锁只在单次调用期间持有；每批单独提交，调用间隙普通读写照常；轮换开始后新写入落在目标 key，扫描按 key_id 跳过，批内由 redb 写事务与应用写串行化。维护模式语义不变（#51 仍有效）。
+Consequences: 应用可按自己的节奏（前台空闲、充电、后台任务）调用 tick；不需要停机窗口，也不会把长事务拖进 UI 线程；维护模式仍是需要硬冻结写时的显式选择，两者可组合。\n
+## [55] 2026-10-25 09:02:24 UTC
+Change: 20261025-cooperative-scheduling
+Context: 按记录数控制的批次在快慢设备上耗时差异大，调用方难以既保证每次有进展又限制单次阻塞时长；进度计数与取消标志也需要明确的序列边界。
+Decision: tick 的时间预算与批次配额同时生效：预算默认 10ms、上限 1s，单批默认 32、上限 256，0 取默认、越界返回 InvalidArgument；预算检查放在每批之后，保证每次调用至少推进一批；短批次视为扫描结束并在同一次调用内收尾；进度计数在序列开始（目标 key 没有游标）时清零，取消标志在每次 tick 开始时清除，只影响正在执行的调用。
+Consequences: 单次 tick 的阻塞时长有上界且必有进展，慢设备只是更早返回；进度 JSON 在 TICK 序列内累计，单次返回值只含本次；停止调度即不再调用，无需额外状态。\n

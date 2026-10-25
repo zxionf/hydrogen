@@ -529,6 +529,279 @@ static int migration_progress_mode(const char *path)
     return 0;
 }
 
+static int maintenance_mode(const char *path)
+{
+    shio_kernel *kernel = NULL;
+    uint8_t *buf = NULL;
+    size_t len = 0;
+    uint8_t id[16];
+    uint8_t to[16];
+    uint8_t *json = NULL;
+    size_t json_len = 0;
+    char *text = NULL;
+    char *to_text = NULL;
+    uint8_t done = 0;
+    int32_t status;
+    int index = 0;
+    int steps = 0;
+
+    remove(path);
+    expect(shio_open(path, (const uint8_t *)PASSWORD, strlen(PASSWORD),
+                     (const uint8_t *)"{\"create\":true}",
+                     strlen("{\"create\":true}"), &kernel),
+           "maintenance open");
+    expect(shio_sync_enable(kernel, NULL, &buf, &len), "maintenance enable");
+    shio_free(buf, len);
+    buf = NULL;
+    len = 0;
+
+    for (index = 0; index < 24; index++) {
+        char payload[48];
+        snprintf(payload, sizeof(payload), "{\"n\":%d}", index);
+        record_id(index, id);
+        expect(shio_put(kernel, "maintenance", "entries", id,
+                        (const uint8_t *)payload, strlen(payload), &buf, &len),
+               "maintenance put");
+        shio_free(buf, len);
+        buf = NULL;
+        len = 0;
+    }
+
+    expect(shio_sync_begin_rotation(kernel, &json, &json_len),
+           "maintenance begin_rotation");
+    text = take_text(json, json_len, "maintenance begin_rotation");
+    to_text = json_string(text, "to", "maintenance begin_rotation");
+    hex_decode_16(to_text, to);
+    free(to_text);
+    free(text);
+    json = NULL;
+    json_len = 0;
+
+    expect(shio_sync_begin_maintenance(kernel), "maintenance begin");
+
+    /* 维护窗口内普通写被拒绝，且不产生输出缓冲区。 */
+    record_id(0, id);
+    status = shio_put(kernel, "maintenance", "entries", id,
+                      (const uint8_t *)"{\"n\":99}", strlen("{\"n\":99}"),
+                      &buf, &len);
+    if (status != SHIO_BUSY) {
+        fprintf(stderr, "maintenance put returned %d instead of SHIO_BUSY\n",
+                (int)status);
+        return 1;
+    }
+    if (buf != NULL || len != 0) {
+        fprintf(stderr, "maintenance put returned a buffer\n");
+        return 1;
+    }
+
+    /* 读与集合枚举不受维护模式影响。 */
+    expect(shio_get(kernel, "maintenance", "entries", id, &buf, &len),
+           "maintenance get");
+    text = take_text(buf, len, "maintenance get");
+    contains(text, "\"n\":0", "maintenance get");
+    free(text);
+    expect(shio_collections(kernel, "maintenance", &buf, &len),
+           "maintenance collections");
+    text = take_text(buf, len, "maintenance collections");
+    contains(text, "\"entries\"", "maintenance collections");
+    free(text);
+
+    /* 同步启用时物理删除先于维护窗口拒绝。 */
+    status = shio_purge(kernel, "maintenance", "entries", id, NULL);
+    if (status != SHIO_SYNC_ENABLED) {
+        fprintf(stderr, "maintenance purge returned %d instead of SHIO_SYNC_ENABLED\n",
+                (int)status);
+        return 1;
+    }
+
+    /* 每步 5 条，直到 done。 */
+    for (steps = 0; steps < 20; steps++) {
+        uint64_t scanned;
+        expect(shio_sync_migrate_step(kernel, to, 5, &json, &json_len),
+               "maintenance migrate_step");
+        text = take_text(json, json_len, "maintenance migrate_step");
+        json = NULL;
+        json_len = 0;
+        scanned = json_u64(text, "scanned", "maintenance migrate_step");
+        if (scanned > 5) {
+            fprintf(stderr, "maintenance step scanned %llu records\n",
+                    (unsigned long long)scanned);
+            free(text);
+            return 1;
+        }
+        if (strstr(text, "\"done\":true") != NULL) {
+            free(text);
+            break;
+        }
+        free(text);
+    }
+    if (steps >= 20) {
+        fprintf(stderr, "maintenance step migration did not finish\n");
+        return 1;
+    }
+    printf("maintenance steps: %d\n", steps + 1);
+
+    expect(shio_sync_end_maintenance(kernel, &done), "maintenance end");
+    if (done != 1) {
+        fprintf(stderr, "maintenance end reported done=%u\n", (unsigned)done);
+        return 1;
+    }
+
+    /* 退出后普通写恢复，并读到新值。 */
+    expect(shio_put(kernel, "maintenance", "entries", id,
+                    (const uint8_t *)"{\"n\":100}", strlen("{\"n\":100}"),
+                    &buf, &len),
+           "maintenance put(after)");
+    shio_free(buf, len);
+    buf = NULL;
+    len = 0;
+    expect(shio_get(kernel, "maintenance", "entries", id, &buf, &len),
+           "maintenance get(after)");
+    text = take_text(buf, len, "maintenance get(after)");
+    contains(text, "\"n\":100", "maintenance get(after)");
+    free(text);
+
+    expect(shio_close(kernel), "maintenance close");
+    shio_kernel_destroy(kernel);
+    remove(path);
+    printf("MAINTENANCE_OK\n");
+    return 0;
+}
+
+static int cooperative_mode(const char *path)
+{
+    shio_kernel *kernel = NULL;
+    uint8_t *buf = NULL;
+    size_t len = 0;
+    uint8_t id[16];
+    uint8_t to[16];
+    uint8_t *json = NULL;
+    size_t json_len = 0;
+    char *text = NULL;
+    char *to_text = NULL;
+    int32_t status;
+    int index = 0;
+    int ticks = 0;
+    uint64_t scanned = 0;
+
+    remove(path);
+    expect(shio_open(path, (const uint8_t *)PASSWORD, strlen(PASSWORD),
+                     (const uint8_t *)"{\"create\":true}",
+                     strlen("{\"create\":true}"), &kernel),
+           "cooperative open");
+    expect(shio_sync_enable(kernel, NULL, &buf, &len), "cooperative enable");
+    shio_free(buf, len);
+    buf = NULL;
+    len = 0;
+
+    for (index = 0; index < 18; index++) {
+        char payload[48];
+        snprintf(payload, sizeof(payload), "{\"n\":%d}", index);
+        record_id(index, id);
+        expect(shio_put(kernel, "cooperative", "entries", id,
+                        (const uint8_t *)payload, strlen(payload), &buf, &len),
+               "cooperative put");
+        shio_free(buf, len);
+        buf = NULL;
+        len = 0;
+    }
+
+    expect(shio_sync_begin_rotation(kernel, &json, &json_len),
+           "cooperative begin_rotation");
+    text = take_text(json, json_len, "cooperative begin_rotation");
+    to_text = json_string(text, "to", "cooperative begin_rotation");
+    hex_decode_16(to_text, to);
+    free(to_text);
+    free(text);
+    json = NULL;
+    json_len = 0;
+
+    /* 不进入维护模式：单次 tick 只推进一个小批次。 */
+    expect(shio_sync_migrate_tick(kernel, to, 1, 4, &json, &json_len),
+           "cooperative tick");
+    text = take_text(json, json_len, "cooperative tick");
+    json = NULL;
+    json_len = 0;
+    scanned = json_u64(text, "scanned", "cooperative tick");
+    if (scanned < 1) {
+        fprintf(stderr, "cooperative tick scanned no records\n");
+        free(text);
+        return 1;
+    }
+    free(text);
+
+    /* tick 之间普通写不被拒绝，并可立即读回。 */
+    record_id(100, id);
+    expect(shio_put(kernel, "cooperative", "entries", id,
+                    (const uint8_t *)"{\"n\":100}", strlen("{\"n\":100}"),
+                    &buf, &len),
+           "cooperative put(between)");
+    shio_free(buf, len);
+    buf = NULL;
+    len = 0;
+    expect(shio_get(kernel, "cooperative", "entries", id, &buf, &len),
+           "cooperative get(between)");
+    text = take_text(buf, len, "cooperative get(between)");
+    contains(text, "\"n\":100", "cooperative get(between)");
+    free(text);
+
+    /* 继续 tick 直到 done。 */
+    for (ticks = 0; ticks < 100; ticks++) {
+        expect(shio_sync_migrate_tick(kernel, to, 1, 4, &json, &json_len),
+               "cooperative tick");
+        text = take_text(json, json_len, "cooperative tick");
+        json = NULL;
+        json_len = 0;
+        if (strstr(text, "\"done\":true") != NULL) {
+            free(text);
+            break;
+        }
+        free(text);
+    }
+    if (ticks >= 100) {
+        fprintf(stderr, "cooperative tick migration did not finish\n");
+        return 1;
+    }
+    printf("cooperative ticks: %d\n", ticks + 2);
+
+    text = migration_progress_text(kernel, "cooperative progress");
+    contains(text, "\"active\":false", "cooperative progress");
+    contains(text, "\"done\":true", "cooperative progress");
+    free(text);
+
+    /* 迁移完成后所有记录仍可读。 */
+    record_id(0, id);
+    expect(shio_get(kernel, "cooperative", "entries", id, &buf, &len),
+           "cooperative get(first)");
+    text = take_text(buf, len, "cooperative get(first)");
+    contains(text, "\"n\":0", "cooperative get(first)");
+    free(text);
+    record_id(17, id);
+    expect(shio_get(kernel, "cooperative", "entries", id, &buf, &len),
+           "cooperative get(last)");
+    text = take_text(buf, len, "cooperative get(last)");
+    contains(text, "\"n\":17", "cooperative get(last)");
+    free(text);
+
+    /* 预算与批次配额越界在写事务前被拒绝。 */
+    status = shio_sync_migrate_tick(kernel, to, 1001, 4, &json, &json_len);
+    if (status != SHIO_INVALID_ARGUMENT) {
+        fprintf(stderr, "cooperative tick(budget) returned %d\n", (int)status);
+        return 1;
+    }
+    status = shio_sync_migrate_tick(kernel, to, 10, 257, &json, &json_len);
+    if (status != SHIO_INVALID_ARGUMENT) {
+        fprintf(stderr, "cooperative tick(batch) returned %d\n", (int)status);
+        return 1;
+    }
+
+    expect(shio_close(kernel), "cooperative close");
+    shio_kernel_destroy(kernel);
+    remove(path);
+    printf("COOPERATIVE_OK\n");
+    return 0;
+}
+
 static int backup_restore_mode(const char *path)
 {
     shio_kernel *source = NULL;
@@ -863,7 +1136,8 @@ int main(int argc, char **argv)
         fprintf(stderr,
                 "usage: %s <database-path> "
                 "[smoke|sync|hold|probe|check|read-hold|read-probe|read-locked|"
-                "rotate-many|resume-rotation|migration-progress|backup-restore]\n",
+                "rotate-many|resume-rotation|migration-progress|maintenance|"
+                "cooperative|backup-restore]\n",
                 argv[0]);
         return 2;
     }
@@ -928,6 +1202,14 @@ int main(int argc, char **argv)
 
     if (strcmp(mode, "migration-progress") == 0) {
         return migration_progress_mode(path);
+    }
+
+    if (strcmp(mode, "maintenance") == 0) {
+        return maintenance_mode(path);
+    }
+
+    if (strcmp(mode, "cooperative") == 0) {
+        return cooperative_mode(path);
     }
 
     if (strcmp(mode, "backup-restore") == 0) {

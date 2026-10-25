@@ -172,6 +172,7 @@ pub struct Engine {
     max_value_size: usize,
     session: RwLock<Session>,
     migration: MigrationState,
+    maintenance: AtomicBool,
 }
 
 /// 迁移的旁路状态：查询进度与请求取消不获取会话锁。
@@ -196,6 +197,34 @@ impl MigrationState {
     fn finish(&self, done: bool) {
         self.active.store(false, Ordering::SeqCst);
         self.done.store(done, Ordering::SeqCst);
+    }
+
+    /// 进入维护窗口：清零本序列的进度并清除旧的取消请求。
+    fn reset_for_maintenance(&self) {
+        self.active.store(false, Ordering::SeqCst);
+        self.cancel.store(false, Ordering::SeqCst);
+        self.reset_counters();
+    }
+
+    /// 清零进度计数，保留激活与取消状态。
+    fn reset_counters(&self) {
+        self.scanned.store(0, Ordering::SeqCst);
+        self.migrated.store(0, Ordering::SeqCst);
+        self.done.store(false, Ordering::SeqCst);
+    }
+
+    /// 单步迁移开始：清除上一批留下的取消请求。
+    fn begin_step(&self) {
+        self.cancel.store(false, Ordering::SeqCst);
+        self.active.store(true, Ordering::SeqCst);
+    }
+
+    /// 单步迁移结束：`active` 只在本步调用期间为真。
+    fn end_step(&self, done: bool) {
+        self.active.store(false, Ordering::SeqCst);
+        if done {
+            self.done.store(true, Ordering::SeqCst);
+        }
     }
 
     fn request_cancel(&self) {
@@ -463,6 +492,7 @@ impl Engine {
             max_value_size: options.max_value_size,
             session: RwLock::new(session),
             migration: MigrationState::default(),
+            maintenance: AtomicBool::new(false),
         })
     }
 
@@ -612,12 +642,15 @@ impl Engine {
     }
 
     /// 物理删除；多端同步启用后不得使用。
+    ///
+    /// 同步启用与维护模式的判定顺序固定为：`SyncEnabled` 先于 `Busy`，
+    /// 因为前者是永久禁止，后者只是当前窗口。
     pub fn purge(&self, namespace: &str, collection: &str, id: &RecordId) -> Result<bool> {
         let key = codec::encode_record_key(namespace, collection, id)?;
-        self.require_writable()?;
         if self.read_session()?.sync.is_some() {
             return Err(Error::SyncEnabled);
         }
+        self.require_writable()?;
 
         let txn = self.handle.begin_write()?;
         let existed = {
@@ -1191,10 +1224,24 @@ impl Engine {
     }
 
     fn require_writable(&self) -> Result<()> {
+        self.require_writable_internal()?;
+        if self.maintenance.load(Ordering::SeqCst) {
+            return Err(Error::Busy);
+        }
+        Ok(())
+    }
+
+    /// 只检查句柄是否可写，不看维护模式；仅供维护模式内部的迁移路径使用。
+    fn require_writable_internal(&self) -> Result<()> {
         if self.handle.is_read_only() {
             return Err(Error::ReadOnly);
         }
         Ok(())
+    }
+
+    /// 维护模式是否处于激活状态。
+    pub fn maintenance_active(&self) -> bool {
+        self.maintenance.load(Ordering::SeqCst)
     }
 
     fn encode_value<T: Serialize>(&self, value: &T) -> Result<Zeroizing<Vec<u8>>> {

@@ -33,6 +33,18 @@ pub const MAX_MIGRATION_BATCH_SIZE: usize = 1024;
 /// 批次间暂停允许的最大毫秒数。
 pub const MAX_MIGRATION_PAUSE_MS: u64 = 60_000;
 
+/// 合作式调度单次调用的默认时间预算（毫秒）。
+pub const DEFAULT_TICK_BUDGET_MS: u64 = 10;
+
+/// 合作式调度单次调用允许的最大时间预算（毫秒）。
+pub const MAX_TICK_BUDGET_MS: u64 = 1_000;
+
+/// 合作式调度单批默认记录数。
+pub const DEFAULT_TICK_BATCH_SIZE: usize = 32;
+
+/// 合作式调度单批允许的最大记录数。
+pub const MAX_TICK_BATCH_SIZE: usize = 256;
+
 /// `format=2` 数据密钥迁移参数。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MigrationOptions {
@@ -62,6 +74,26 @@ impl MigrationOptions {
         }
         Ok(())
     }
+}
+
+/// 单次分步迁移的结果。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MigrationStep {
+    /// 本步扫描的记录数，包含无需迁移的记录。
+    pub scanned: u64,
+    /// 本步实际重新加密并提交的记录数。
+    pub migrated: u64,
+    /// 迁移是否已在本次调用内收尾完成。
+    pub done: bool,
+}
+
+/// 退出维护模式的结果。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MaintenanceOutcome {
+    /// 退出时是否已无待续跑的迁移游标。
+    ///
+    /// `false` 表示迁移未完成，游标保留；再次 `migrate_step` 可从游标继续。
+    pub done: bool,
 }
 
 /// 迁移进度快照；查询时不获取会话锁。

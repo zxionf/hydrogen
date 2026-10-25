@@ -15,8 +15,10 @@ use crate::error::{Error, Result};
 use crate::model::{DeviceId, KeyId, Timestamp};
 use crate::store::{catalog, changes, keys, keys2, meta2, records, sync_state, FORMAT, FORMAT_V2};
 use crate::sync::{
-    ApplyReport, ChangeEntry, ChangePage, MigrationOptions, RecordChange, RotationInfo,
-    RotationOffer, SnapshotPage, SnapshotRecord, SyncInfo, MAX_KEY_COUNT, MAX_PAGE_ENTRIES,
+    ApplyReport, ChangeEntry, ChangePage, MaintenanceOutcome, MigrationOptions, MigrationStep,
+    RecordChange, RotationInfo, RotationOffer, SnapshotPage, SnapshotRecord, SyncInfo,
+    DEFAULT_MIGRATION_BATCH_SIZE, DEFAULT_TICK_BATCH_SIZE, DEFAULT_TICK_BUDGET_MS, MAX_KEY_COUNT,
+    MAX_MIGRATION_BATCH_SIZE, MAX_PAGE_ENTRIES, MAX_TICK_BATCH_SIZE, MAX_TICK_BUDGET_MS,
 };
 
 /// 已读取的同步状态。
@@ -1355,76 +1357,16 @@ impl Engine {
                 return Err(Error::Cancelled);
             }
 
-            let mut batch: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(options.batch_size);
-            {
-                let txn = self.handle.begin_read()?;
-                let table = txn.open_table(records::TABLE)?;
-                let range: (Bound<&[u8]>, Bound<&[u8]>) = match after.as_deref() {
-                    Some(last) => (Bound::Excluded(last), Bound::Unbounded),
-                    None => (Bound::Unbounded, Bound::Unbounded),
-                };
-                for item in table.range::<&[u8]>(range)? {
-                    let (key, value) = item?;
-                    batch.push((key.value().to_vec(), value.value().to_vec()));
-                    if batch.len() >= options.batch_size {
-                        break;
-                    }
-                }
-            }
-            let Some(last) = batch.last() else {
+            let batch = self.read_migration_batch(after.as_deref(), options.batch_size)?;
+            if batch.is_empty() {
                 break;
-            };
-            let last_key = last.0.clone();
+            }
             let full_batch = batch.len() >= options.batch_size;
             self.migration.add_scanned(batch.len() as u64);
-            let migration_cursor = sync_state::encode_migration(to, &last_key)?;
-
-            let mut batch_migrated = 0u64;
-            let txn = self.handle.begin_write()?;
-            {
-                let mut table = txn.open_table(records::TABLE)?;
-                for (key, raw) in &batch {
-                    let blob = BlobView::decode(raw)?;
-                    if blob.key_id() == to {
-                        continue;
-                    }
-                    let (namespace, collection, id) = codec::decode_record_key(key)?;
-                    let path = RecordPath {
-                        namespace: &namespace,
-                        collection: &collection,
-                        id,
-                    };
-                    let plaintext = self.decrypt(session, path, &blob)?;
-                    let entry = session
-                        .keys
-                        .get(&to)
-                        .ok_or(Error::Internal("target key missing"))?;
-                    // 迁移改变了字节表示；推进 updated_at 使旧密钥的同一逻辑版本
-                    // 不会在 LWW 的 blob 次序里把已迁移记录翻回旧密钥。
-                    let updated_at = Timestamp::now()
-                        .as_millis()
-                        .max(blob.updated_at().saturating_add(1));
-                    let header = codec2::RecordHeader::new(
-                        to,
-                        blob.rev(),
-                        blob.created_at(),
-                        updated_at,
-                        blob.data_version(),
-                    )
-                    .with_deleted(blob.is_deleted());
-                    let out = self.build_record_v2(&entry.subkeys, path, &plaintext, header)?;
-                    table.insert(key.as_slice(), out.as_slice())?;
-                    batch_migrated += 1;
-                }
-            }
-            {
-                let mut table = txn.open_table(sync_state::TABLE)?;
-                table.insert(sync_state::KEY_MIGRATION, migration_cursor.as_slice())?;
-            }
-            txn.commit()?;
+            let batch_migrated = self.migrate_batch(session, to, &batch)?;
             migrated += batch_migrated;
             self.migration.add_migrated(batch_migrated);
-            after = Some(last_key);
+            after = batch.last().map(|(key, _)| key.clone());
 
             if full_batch {
                 self.pause_between_batches(options.pause)?;
@@ -1435,6 +1377,93 @@ impl Engine {
             return Err(Error::Cancelled);
         }
 
+        self.finalize_migration(session, state, to)?;
+        Ok(migrated)
+    }
+
+    /// 读取游标之后的一批原始记录；只读事务，不推进任何状态。
+    fn read_migration_batch(
+        &self,
+        after: Option<&[u8]>,
+        batch_size: usize,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        let mut batch: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(batch_size);
+        let txn = self.handle.begin_read()?;
+        let table = txn.open_table(records::TABLE)?;
+        let range: (Bound<&[u8]>, Bound<&[u8]>) = match after {
+            Some(last) => (Bound::Excluded(last), Bound::Unbounded),
+            None => (Bound::Unbounded, Bound::Unbounded),
+        };
+        for item in table.range::<&[u8]>(range)? {
+            let (key, value) = item?;
+            batch.push((key.value().to_vec(), value.value().to_vec()));
+            if batch.len() >= batch_size {
+                break;
+            }
+        }
+        Ok(batch)
+    }
+
+    /// 重加密一批记录，并在同一事务内推进持久化游标。
+    fn migrate_batch(
+        &self,
+        session: &Session,
+        to: KeyId,
+        batch: &[(Vec<u8>, Vec<u8>)],
+    ) -> Result<u64> {
+        let entry = session
+            .keys
+            .get(&to)
+            .ok_or(Error::Internal("target key missing"))?;
+        let Some((last_key, _)) = batch.last() else {
+            return Ok(0);
+        };
+        let migration_cursor = sync_state::encode_migration(to, last_key)?;
+
+        let mut batch_migrated = 0u64;
+        let txn = self.handle.begin_write()?;
+        {
+            let mut table = txn.open_table(records::TABLE)?;
+            for (key, raw) in batch {
+                let blob = BlobView::decode(raw)?;
+                if blob.key_id() == to {
+                    continue;
+                }
+                let (namespace, collection, id) = codec::decode_record_key(key)?;
+                let path = RecordPath {
+                    namespace: &namespace,
+                    collection: &collection,
+                    id,
+                };
+                let plaintext = self.decrypt(session, path, &blob)?;
+                // 迁移改变了字节表示；推进 updated_at 使旧密钥的同一逻辑版本
+                // 不会在 LWW 的 blob 次序里把已迁移记录翻回旧密钥。
+                let updated_at = Timestamp::now()
+                    .as_millis()
+                    .max(blob.updated_at().saturating_add(1));
+                let header = codec2::RecordHeader::new(
+                    to,
+                    blob.rev(),
+                    blob.created_at(),
+                    updated_at,
+                    blob.data_version(),
+                )
+                .with_deleted(blob.is_deleted());
+                let out = self.build_record_v2(&entry.subkeys, path, &plaintext, header)?;
+                table.insert(key.as_slice(), out.as_slice())?;
+                batch_migrated += 1;
+            }
+        }
+        {
+            let mut table = txn.open_table(sync_state::TABLE)?;
+            table.insert(sync_state::KEY_MIGRATION, migration_cursor.as_slice())?;
+        }
+        txn.commit()?;
+        Ok(batch_migrated)
+    }
+
+    /// 收尾：为不再被引用的旧 key 公告迁移完成，并删除游标。
+    fn finalize_migration(&self, session: &Session, state: SyncState, to: KeyId) -> Result<()> {
         let mut referenced: BTreeSet<KeyId> = BTreeSet::new();
         {
             let txn = self.handle.begin_read()?;
@@ -1474,7 +1503,235 @@ impl Engine {
         }
         txn.commit()?;
 
-        Ok(migrated)
+        Ok(())
+    }
+
+    /// 进入维护模式：置进程内标志并清零本序列的迁移进度。
+    ///
+    /// 进入会短暂获取会话写锁，与正在执行的迁移串行化；只读句柄返回
+    /// [`Error::ReadOnly`]，未启用同步返回 [`Error::SyncDisabled`]。
+    pub fn begin_maintenance(&self) -> Result<()> {
+        if self.handle.is_read_only() {
+            return Err(Error::ReadOnly);
+        }
+        let _session = self.write_session()?;
+        self.read_sync_state()?.ok_or(Error::SyncDisabled)?;
+        self.migration.reset_for_maintenance();
+        self.maintenance.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+
+    /// 退出维护模式；`done` 表示当前已无待续跑的迁移游标。
+    ///
+    /// 只读句柄同样可以退出（维护标志只影响写操作）。
+    pub fn end_maintenance(&self) -> Result<MaintenanceOutcome> {
+        let _session = self.write_session()?;
+        self.read_sync_state()?.ok_or(Error::SyncDisabled)?;
+        self.maintenance.store(false, Ordering::SeqCst);
+        Ok(MaintenanceOutcome {
+            done: !self.has_migration_cursor()?,
+        })
+    }
+
+    fn has_migration_cursor(&self) -> Result<bool> {
+        let txn = self.handle.begin_read()?;
+        let table = txn.open_table(sync_state::TABLE)?;
+        Ok(table.get(sync_state::KEY_MIGRATION)?.is_some())
+    }
+
+    /// 单步迁移：只处理一批记录，批内持有会话写锁，提交后立即释放。
+    ///
+    /// 最后一批之后的收尾在同一次调用内完成并返回 `done=true`；
+    /// 游标与连续模式共用，可随时改用 [`Self::migrate_all`] 跑完剩余记录。
+    pub fn migrate_step(&self, to: KeyId, max_records: usize) -> Result<MigrationStep> {
+        let batch_size = if max_records == 0 {
+            DEFAULT_MIGRATION_BATCH_SIZE
+        } else {
+            max_records
+        };
+        if batch_size > MAX_MIGRATION_BATCH_SIZE {
+            return Err(Error::InvalidArgument(
+                "max_records must be within 1..=1024",
+            ));
+        }
+
+        self.require_writable_internal()?;
+        let session = self.write_session()?;
+        let state = self.read_sync_state()?.ok_or(Error::SyncDisabled)?;
+        if !session.keys.contains_key(&to) {
+            return Err(Error::InvalidArgument("target data key is not installed"));
+        }
+
+        self.migration.begin_step();
+        let outcome = self.migrate_step_locked(&session, state, to, batch_size);
+        match outcome {
+            Ok(step) => {
+                self.migration.end_step(step.done);
+                Ok(step)
+            }
+            Err(error) => {
+                self.migration.end_step(false);
+                Err(error)
+            }
+        }
+    }
+
+    fn migrate_step_locked(
+        &self,
+        session: &Session,
+        state: SyncState,
+        to: KeyId,
+        batch_size: usize,
+    ) -> Result<MigrationStep> {
+        let after = self.read_migration_cursor(to)?;
+        let batch = self.read_migration_batch(after.as_deref(), batch_size)?;
+        if batch.is_empty() {
+            self.finalize_migration(session, state, to)?;
+            return Ok(MigrationStep {
+                scanned: 0,
+                migrated: 0,
+                done: true,
+            });
+        }
+        if self.migration.is_cancelled() {
+            return Err(Error::Cancelled);
+        }
+
+        let scanned = batch.len() as u64;
+        let full_batch = batch.len() >= batch_size;
+        self.migration.add_scanned(scanned);
+        let migrated = self.migrate_batch(session, to, &batch)?;
+        self.migration.add_migrated(migrated);
+        if full_batch {
+            return Ok(MigrationStep {
+                scanned,
+                migrated,
+                done: false,
+            });
+        }
+
+        self.finalize_migration(session, state, to)?;
+        Ok(MigrationStep {
+            scanned,
+            migrated,
+            done: true,
+        })
+    }
+
+    /// 合作式调度：在时间预算内连续推进若干小批次，提交即释放写锁。
+    ///
+    /// 不要求维护模式；调用间隙普通读写照常。`budget` 为零取默认
+    /// [`DEFAULT_TICK_BUDGET_MS`]，`max_records` 为零取默认
+    /// [`DEFAULT_TICK_BATCH_SIZE`]；越界返回 [`Error::InvalidArgument`]。
+    pub fn migrate_tick(
+        &self,
+        to: KeyId,
+        budget: std::time::Duration,
+        max_records: usize,
+    ) -> Result<MigrationStep> {
+        let budget = if budget.is_zero() {
+            std::time::Duration::from_millis(DEFAULT_TICK_BUDGET_MS)
+        } else {
+            budget
+        };
+        if budget > std::time::Duration::from_millis(MAX_TICK_BUDGET_MS) {
+            return Err(Error::InvalidArgument(
+                "migration tick budget must be within 1..=1000 ms",
+            ));
+        }
+        let batch_size = if max_records == 0 {
+            DEFAULT_TICK_BATCH_SIZE
+        } else {
+            max_records
+        };
+        if batch_size > MAX_TICK_BATCH_SIZE {
+            return Err(Error::InvalidArgument(
+                "migration tick batch size must be within 1..=256",
+            ));
+        }
+
+        self.require_writable_internal()?;
+        let session = self.write_session()?;
+        let state = self.read_sync_state()?.ok_or(Error::SyncDisabled)?;
+        if !session.keys.contains_key(&to) {
+            return Err(Error::InvalidArgument("target data key is not installed"));
+        }
+
+        // 没有游标表示新的迁移序列：从零开始计数。
+        let after = self.read_migration_cursor(to)?;
+        if after.is_none() {
+            self.migration.reset_counters();
+        }
+        self.migration.begin_step();
+        let outcome = self.run_tick(&session, state, to, batch_size, budget, after);
+        match outcome {
+            Ok(step) => {
+                self.migration.end_step(step.done);
+                Ok(step)
+            }
+            Err(error) => {
+                self.migration.end_step(false);
+                Err(error)
+            }
+        }
+    }
+
+    fn run_tick(
+        &self,
+        session: &Session,
+        state: SyncState,
+        to: KeyId,
+        batch_size: usize,
+        budget: std::time::Duration,
+        mut after: Option<Vec<u8>>,
+    ) -> Result<MigrationStep> {
+        let started = std::time::Instant::now();
+        let mut scanned = 0u64;
+        let mut migrated = 0u64;
+
+        loop {
+            if self.migration.is_cancelled() {
+                return Err(Error::Cancelled);
+            }
+
+            let batch = self.read_migration_batch(after.as_deref(), batch_size)?;
+            if batch.is_empty() {
+                self.finalize_migration(session, state, to)?;
+                return Ok(MigrationStep {
+                    scanned,
+                    migrated,
+                    done: true,
+                });
+            }
+            let full_batch = batch.len() >= batch_size;
+            let batch_scanned = batch.len() as u64;
+            self.migration.add_scanned(batch_scanned);
+            scanned += batch_scanned;
+            let batch_migrated = self.migrate_batch(session, to, &batch)?;
+            self.migration.add_migrated(batch_migrated);
+            migrated += batch_migrated;
+            after = batch.last().map(|(key, _)| key.clone());
+
+            if !full_batch {
+                self.finalize_migration(session, state, to)?;
+                return Ok(MigrationStep {
+                    scanned,
+                    migrated,
+                    done: true,
+                });
+            }
+
+            // 预算检查放在批次之后：每次调用至少推进一批，避免空转。
+            if started.elapsed() >= budget {
+                break;
+            }
+        }
+
+        Ok(MigrationStep {
+            scanned,
+            migrated,
+            done: false,
+        })
     }
 
     fn pause_between_batches(&self, pause: std::time::Duration) -> Result<()> {

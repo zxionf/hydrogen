@@ -236,6 +236,149 @@ fn crud_batch_rotation_and_password_change() {
 }
 
 #[test]
+fn purge_removes_record_and_collections_are_sorted() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("purge.db");
+    let handle = open(&path, b"pw", br#"{"create":true}"#);
+    let namespace = CString::new("notes").unwrap();
+    let items = CString::new("items").unwrap();
+    let archive = CString::new("archive").unwrap();
+
+    let mut list_ptr = ptr::null_mut();
+    let mut list_len = 0;
+    // SAFETY: 句柄、名称和输出指针有效。
+    let status =
+        unsafe { shio_collections(handle, namespace.as_ptr(), &mut list_ptr, &mut list_len) };
+    assert_eq!(status, SHIO_OK, "collections failed: {}", last_error());
+    let empty = parse(take_buffer(list_ptr, list_len));
+    assert_eq!(empty.as_array().unwrap().len(), 0);
+
+    let id = [7u8; 16];
+    for collection in [&items, &archive] {
+        let mut meta_ptr = ptr::null_mut();
+        let mut meta_len = 0;
+        // SAFETY: 句柄、名称、ID、载荷和输出指针有效。
+        let status = unsafe {
+            shio_put(
+                handle,
+                namespace.as_ptr(),
+                collection.as_ptr(),
+                id.as_ptr(),
+                br#"{"v":1}"#.as_ptr(),
+                br#"{"v":1}"#.len(),
+                &mut meta_ptr,
+                &mut meta_len,
+            )
+        };
+        assert_eq!(status, SHIO_OK, "put failed: {}", last_error());
+        assert!(!take_buffer(meta_ptr, meta_len).is_empty());
+    }
+
+    let mut list_ptr = ptr::null_mut();
+    let mut list_len = 0;
+    // SAFETY: 句柄、名称和输出指针有效。
+    let status =
+        unsafe { shio_collections(handle, namespace.as_ptr(), &mut list_ptr, &mut list_len) };
+    assert_eq!(status, SHIO_OK, "collections failed: {}", last_error());
+    let names = parse(take_buffer(list_ptr, list_len));
+    assert_eq!(names, serde_json::json!(["archive", "items"]));
+
+    let mut existed = -1;
+    // SAFETY: 句柄、名称、ID 与输出指针有效。
+    let status = unsafe {
+        shio_purge(
+            handle,
+            namespace.as_ptr(),
+            items.as_ptr(),
+            id.as_ptr(),
+            &mut existed,
+        )
+    };
+    assert_eq!(status, SHIO_OK, "purge failed: {}", last_error());
+    assert_eq!(existed, 1);
+
+    let mut get_ptr = ptr::null_mut();
+    let mut get_len = 0;
+    // SAFETY: 句柄、名称、ID 和输出指针有效。
+    let status = unsafe {
+        shio_get(
+            handle,
+            namespace.as_ptr(),
+            items.as_ptr(),
+            id.as_ptr(),
+            &mut get_ptr,
+            &mut get_len,
+        )
+    };
+    assert_eq!(status, SHIO_NOT_FOUND);
+    assert!(get_ptr.is_null());
+
+    let mut list_ptr = ptr::null_mut();
+    let mut list_len = 0;
+    // SAFETY: 句柄、名称和输出指针有效；include_deleted=1 也不应看到已物理删除的记录。
+    let status = unsafe {
+        shio_list(
+            handle,
+            namespace.as_ptr(),
+            items.as_ptr(),
+            ptr::null(),
+            10,
+            1,
+            &mut list_ptr,
+            &mut list_len,
+        )
+    };
+    assert_eq!(status, SHIO_OK, "list failed: {}", last_error());
+    let page = parse(take_buffer(list_ptr, list_len));
+    assert_eq!(page["items"].as_array().unwrap().len(), 0);
+
+    let mut existed = -1;
+    // SAFETY: 句柄、名称、ID 与输出指针有效；重复物理删除返回成功且 existed=0。
+    let status = unsafe {
+        shio_purge(
+            handle,
+            namespace.as_ptr(),
+            items.as_ptr(),
+            id.as_ptr(),
+            &mut existed,
+        )
+    };
+    assert_eq!(status, SHIO_OK, "purge failed: {}", last_error());
+    assert_eq!(existed, 0);
+
+    let mut purge_ptr = ptr::null_mut();
+    let mut purge_len = 0;
+    // SAFETY: NULL 句柄应被拒绝。
+    let status = unsafe {
+        shio_purge(
+            ptr::null_mut(),
+            namespace.as_ptr(),
+            items.as_ptr(),
+            id.as_ptr(),
+            ptr::null_mut(),
+        )
+    };
+    assert_eq!(status, SHIO_INVALID_ARGUMENT);
+    assert!(!last_error().is_empty());
+    // SAFETY: NULL 句柄应被拒绝。
+    let status = unsafe {
+        shio_collections(
+            ptr::null_mut(),
+            namespace.as_ptr(),
+            &mut purge_ptr,
+            &mut purge_len,
+        )
+    };
+    assert_eq!(status, SHIO_INVALID_ARGUMENT);
+    assert!(purge_ptr.is_null());
+
+    // SAFETY: 句柄有效。
+    unsafe { shio_close(handle) };
+    // SAFETY: 关闭后 destroy。
+    unsafe { shio_kernel_destroy(handle) };
+}
+
+#[test]
 fn close_waits_for_inflight_calls_and_rejects_new_ones() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("race.db");

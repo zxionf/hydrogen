@@ -788,6 +788,79 @@ pub unsafe extern "C" fn shio_delete(
     })
 }
 
+/// 物理删除记录，连墓碑一起移除；同步启用时返回 `SHIO_SYNC_ENABLED`。
+///
+/// `out_existed` 可为 `NULL`；记录不存在时返回成功且 `out_existed == 0`。
+///
+/// # Safety
+///
+/// 句柄、名称和 ID 必须按 `include/shio.h` 的契约有效；`out_existed` 非空时必须可写。
+#[no_mangle]
+pub unsafe extern "C" fn shio_purge(
+    handle: *mut ShioKernel,
+    namespace: *const c_char,
+    collection: *const c_char,
+    id: *const u8,
+    out_existed: *mut i32,
+) -> i32 {
+    ffi_guard(|| {
+        if !out_existed.is_null() {
+            // SAFETY: 调用方提供了非空输出指针。
+            unsafe {
+                *out_existed = 0;
+            }
+        }
+        // SAFETY: 由调用方契约保证输入有效。
+        let namespace = unsafe { input_str(namespace)? };
+        // SAFETY: 由调用方契约保证输入有效。
+        let collection = unsafe { input_str(collection)? };
+        let id = input_id(id)?;
+
+        // SAFETY: 调用方保证句柄来自 `shio_open` 且未 destroy。
+        let handle =
+            unsafe { handle.as_ref() }.ok_or(Error::InvalidArgument("kernel handle is null"))?;
+        let kernel = handle.kernel()?;
+        let collection = kernel
+            .namespace(namespace)?
+            .collection::<Value>(collection)?;
+        let existed = handle.block_on(collection.purge(&id))?;
+        if !out_existed.is_null() {
+            // SAFETY: 调用方提供了非空输出指针。
+            unsafe {
+                *out_existed = i32::from(existed);
+            }
+        }
+        Ok(())
+    })
+}
+
+/// 列出命名空间下已登记的集合名，按名称升序；返回 JSON 字符串数组。
+///
+/// # Safety
+///
+/// 句柄、名称和输出指针必须按 `include/shio.h` 的契约有效。
+#[no_mangle]
+pub unsafe extern "C" fn shio_collections(
+    handle: *mut ShioKernel,
+    namespace: *const c_char,
+    out_json: *mut *mut u8,
+    out_json_len: *mut usize,
+) -> i32 {
+    ffi_guard(|| {
+        reset_output(out_json, out_json_len)?;
+        // SAFETY: 由调用方契约保证输入有效。
+        let namespace = unsafe { input_str(namespace)? };
+
+        // SAFETY: 调用方保证句柄来自 `shio_open` 且未 destroy。
+        let handle =
+            unsafe { handle.as_ref() }.ok_or(Error::InvalidArgument("kernel handle is null"))?;
+        let kernel = handle.kernel()?;
+        let namespace = kernel.namespace(namespace)?;
+        let names = handle.block_on(namespace.collections())?;
+        set_output(value_to_bytes(&json!(names))?, out_json, out_json_len)
+    })
+}
+
 /// 按记录 ID 升序分页；返回 `{"items":[...],"next":...}`。
 ///
 /// `after` 为 `NULL` 表示从头；`limit == 0` 使用默认值。
@@ -1450,6 +1523,124 @@ pub unsafe extern "C" fn shio_sync_cancel_migration(handle: *mut ShioKernel) -> 
             unsafe { handle.as_ref() }.ok_or(Error::InvalidArgument("kernel handle is null"))?;
         handle.kernel()?.sync()?.cancel_migration();
         Ok(())
+    })
+}
+
+/// 进入维护模式：窗口内普通写返回 `SHIO_BUSY`，读操作不受影响。
+///
+/// 只读句柄返回 `SHIO_READ_ONLY`，未启用同步返回 `SHIO_SYNC_DISABLED`。
+///
+/// # Safety
+///
+/// 句柄必须按 `include/shio.h` 的契约有效。
+#[no_mangle]
+pub unsafe extern "C" fn shio_sync_begin_maintenance(handle: *mut ShioKernel) -> i32 {
+    ffi_guard(|| {
+        // SAFETY: 调用方保证句柄来自 `shio_open` 且未 destroy。
+        let handle =
+            unsafe { handle.as_ref() }.ok_or(Error::InvalidArgument("kernel handle is null"))?;
+        handle.kernel()?.sync()?.begin_maintenance()
+    })
+}
+
+/// 退出维护模式；`out_done` 表示已无待续跑的迁移游标，可为 `NULL`。
+///
+/// # Safety
+///
+/// 句柄必须按 `include/shio.h` 的契约有效；`out_done` 非空时必须可写。
+#[no_mangle]
+pub unsafe extern "C" fn shio_sync_end_maintenance(
+    handle: *mut ShioKernel,
+    out_done: *mut u8,
+) -> i32 {
+    ffi_guard(|| {
+        if !out_done.is_null() {
+            // SAFETY: 调用方提供了非空输出指针。
+            unsafe {
+                *out_done = 0;
+            }
+        }
+        // SAFETY: 调用方保证句柄来自 `shio_open` 且未 destroy。
+        let handle =
+            unsafe { handle.as_ref() }.ok_or(Error::InvalidArgument("kernel handle is null"))?;
+        let outcome = handle.kernel()?.sync()?.end_maintenance()?;
+        if !out_done.is_null() {
+            // SAFETY: 调用方提供了非空输出指针。
+            unsafe {
+                *out_done = u8::from(outcome.done);
+            }
+        }
+        Ok(())
+    })
+}
+
+/// 单步迁移：每次至多一批；`max_records == 0` 使用默认 256，上限 1024。
+///
+/// 返回 `{"scanned":N,"migrated":N,"done":bool}`；`done=true` 表示已收尾。
+///
+/// # Safety
+///
+/// 句柄、16 字节 key ID 与输出指针必须按 `include/shio.h` 的契约有效。
+#[no_mangle]
+pub unsafe extern "C" fn shio_sync_migrate_step(
+    handle: *mut ShioKernel,
+    to: *const u8,
+    max_records: u32,
+    out_json: *mut *mut u8,
+    out_json_len: *mut usize,
+) -> i32 {
+    ffi_guard(|| {
+        reset_output(out_json, out_json_len)?;
+        let to = input_key_id(to)?;
+        // SAFETY: 调用方保证句柄来自 `shio_open` 且未 destroy。
+        let handle =
+            unsafe { handle.as_ref() }.ok_or(Error::InvalidArgument("kernel handle is null"))?;
+        let step = handle
+            .kernel()?
+            .sync()?
+            .migrate_step(to, max_records as usize)?;
+        let value = json!({
+            "scanned": step.scanned,
+            "migrated": step.migrated,
+            "done": step.done,
+        });
+        set_output(value_to_bytes(&value)?, out_json, out_json_len)
+    })
+}
+
+/// 合作式调度：在时间预算内推进若干小批次；`budget_ms`/`max_records` 为 0 取默认值。
+///
+/// 返回 `{"scanned":N,"migrated":N,"done":bool}`；`done=true` 表示已收尾。
+///
+/// # Safety
+///
+/// 句柄、16 字节 key ID 与输出指针必须按 `include/shio.h` 的契约有效。
+#[no_mangle]
+pub unsafe extern "C" fn shio_sync_migrate_tick(
+    handle: *mut ShioKernel,
+    to: *const u8,
+    budget_ms: u32,
+    max_records: u32,
+    out_json: *mut *mut u8,
+    out_json_len: *mut usize,
+) -> i32 {
+    ffi_guard(|| {
+        reset_output(out_json, out_json_len)?;
+        let to = input_key_id(to)?;
+        // SAFETY: 调用方保证句柄来自 `shio_open` 且未 destroy。
+        let handle =
+            unsafe { handle.as_ref() }.ok_or(Error::InvalidArgument("kernel handle is null"))?;
+        let step = handle.kernel()?.sync()?.migrate_tick(
+            to,
+            Duration::from_millis(u64::from(budget_ms)),
+            max_records as usize,
+        )?;
+        let value = json!({
+            "scanned": step.scanned,
+            "migrated": step.migrated,
+            "done": step.done,
+        });
+        set_output(value_to_bytes(&value)?, out_json, out_json_len)
     })
 }
 

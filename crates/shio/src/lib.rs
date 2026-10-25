@@ -33,10 +33,11 @@ pub use shio_core::sync::pairing_fingerprint;
 pub use shio_core::{DeviceId, KeyId};
 #[cfg(feature = "sync")]
 pub use shio_sync::{
-    ApplyReport, ChangeEntry, ChangePage, MigrationOptions, MigrationProgress, OfferPage,
-    PairingOffer, RotationInfo, RotationOffer, SnapshotIter, SnapshotPage, SnapshotRecord,
-    SyncHandle, SyncInfo, DEFAULT_MIGRATION_BATCH_SIZE, MAX_MIGRATION_BATCH_SIZE,
-    MAX_MIGRATION_PAUSE_MS,
+    ApplyReport, ChangeEntry, ChangePage, MaintenanceOutcome, MigrationOptions, MigrationProgress,
+    MigrationStep, OfferPage, PairingOffer, RotationInfo, RotationOffer, SnapshotIter,
+    SnapshotPage, SnapshotRecord, SyncHandle, SyncInfo, DEFAULT_MIGRATION_BATCH_SIZE,
+    DEFAULT_TICK_BATCH_SIZE, DEFAULT_TICK_BUDGET_MS, MAX_MIGRATION_BATCH_SIZE,
+    MAX_MIGRATION_PAUSE_MS, MAX_TICK_BATCH_SIZE, MAX_TICK_BUDGET_MS,
 };
 
 /// 查询内核版本。

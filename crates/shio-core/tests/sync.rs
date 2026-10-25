@@ -13,7 +13,7 @@ use std::sync::{Arc, Barrier};
 use std::time::{Duration, Instant};
 
 use shio_core::crypto::kdf::KdfParams;
-use shio_core::model::RecordId;
+use shio_core::model::{ListOptions, RecordId};
 use shio_core::store::{Engine, EngineOptions};
 use shio_core::{ChangeEntry, DeviceId, Error, KeyId, MigrationOptions};
 
@@ -506,6 +506,269 @@ fn migration_rejects_out_of_range_options() {
             Err(Error::InvalidArgument(_))
         ));
     }
+}
+
+#[test]
+fn maintenance_mode_rejects_writes_and_steps_through_migration() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("a.redb");
+    let engine = create(&path);
+    enable(&engine);
+    let mut ids = Vec::new();
+    for index in 0..8 {
+        let id = RecordId::new_v7();
+        ids.push(id);
+        engine
+            .put("notes", "note", id, &format!("value-{index}"), 1)
+            .unwrap();
+    }
+    let old = engine.sync_info().unwrap().current_key_id;
+    let to = engine.begin_rotation().unwrap().to;
+
+    engine.begin_maintenance().unwrap();
+    assert!(engine.maintenance_active());
+    // 重复进入是幂等的。
+    engine.begin_maintenance().unwrap();
+
+    assert!(matches!(
+        engine.put("notes", "note", RecordId::new_v7(), &"blocked", 1),
+        Err(Error::Busy)
+    ));
+    assert!(matches!(
+        engine.delete("notes", "note", &ids[0]),
+        Err(Error::Busy)
+    ));
+    assert!(matches!(
+        engine.batch_raw("notes", "note", &[]),
+        Err(Error::Busy)
+    ));
+    assert!(matches!(
+        engine.change_password(b"another password"),
+        Err(Error::Busy)
+    ));
+    assert!(matches!(engine.rotate_data_key(), Err(Error::Busy)));
+    assert!(matches!(engine.migrate_all(to), Err(Error::Busy)));
+    // 同步启用的物理删除禁令优先于维护模式。
+    assert!(matches!(
+        engine.purge("notes", "note", &ids[0]),
+        Err(Error::SyncEnabled)
+    ));
+
+    // 读操作不受维护模式影响。
+    assert_eq!(
+        engine
+            .get::<String>("notes", "note", &ids[0])
+            .unwrap()
+            .unwrap()
+            .value,
+        "value-0"
+    );
+    assert_eq!(
+        engine
+            .list("notes", "note", ListOptions::default())
+            .unwrap()
+            .items
+            .len(),
+        8
+    );
+    assert_eq!(engine.stats().unwrap().format_version, 2);
+
+    let mut steps = 0;
+    loop {
+        let step = engine.migrate_step(to, 3).unwrap();
+        assert!(step.scanned >= step.migrated);
+        assert!(step.scanned <= 3);
+        assert!(!engine.migration_progress().active);
+        steps += 1;
+        assert!(steps < 10, "migration did not finish");
+        if step.done {
+            break;
+        }
+    }
+    assert!(engine.migration_progress().done);
+
+    let outcome = engine.end_maintenance().unwrap();
+    assert!(outcome.done);
+    assert!(!engine.maintenance_active());
+    // 退出后普通写恢复。
+    engine
+        .put("notes", "note", RecordId::new_v7(), &"after-step", 1)
+        .unwrap();
+    for (index, id) in ids.iter().enumerate() {
+        assert_eq!(
+            engine
+                .get::<String>("notes", "note", id)
+                .unwrap()
+                .unwrap()
+                .value,
+            format!("value-{index}")
+        );
+    }
+    engine.retire_key(old).unwrap();
+
+    // 中途退出：游标保留，`done=false`，普通模式可继续写。
+    let rotation = engine.begin_rotation().unwrap();
+    let to2 = rotation.to;
+    let old2 = rotation.from;
+    engine.begin_maintenance().unwrap();
+    let step = engine.migrate_step(to2, 4).unwrap();
+    assert!(!step.done);
+    let outcome = engine.end_maintenance().unwrap();
+    assert!(!outcome.done, "cursor should still be pending");
+    engine
+        .put("notes", "note", RecordId::new_v7(), &"between-windows", 1)
+        .unwrap();
+
+    // 维护标志不落盘：重开后回到普通模式，游标仍可续跑。
+    drop(engine);
+    let reopened = Engine::open(options(&path), PASSWORD).unwrap();
+    assert!(!reopened.maintenance_active());
+    assert!(!reopened.migration_progress().active);
+    let mut steps = 0;
+    loop {
+        let step = reopened.migrate_step(to2, 4).unwrap();
+        steps += 1;
+        assert!(steps < 10, "resumed migration did not finish");
+        if step.done {
+            break;
+        }
+    }
+    assert!(reopened.end_maintenance().unwrap().done);
+    reopened.retire_key(old2).unwrap();
+}
+
+#[test]
+fn cooperative_tick_migrates_in_slices_and_keeps_writes() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = create(&dir.path().join("a.redb"));
+    enable(&engine);
+    let mut ids = Vec::new();
+    for index in 0..50 {
+        let id = RecordId::new_v7();
+        ids.push(id);
+        engine
+            .put("notes", "note", id, &format!("value-{index}"), 1)
+            .unwrap();
+    }
+    let old = engine.sync_info().unwrap().current_key_id;
+    let to = engine.begin_rotation().unwrap().to;
+
+    // 1ns 预算：每次 tick 只跑一批（8 条），保证可观察的切片。
+    let budget = Duration::from_nanos(1);
+    let first = engine.migrate_tick(to, budget, 8).unwrap();
+    assert_eq!(first.scanned, 8);
+    assert_eq!(first.migrated, 8);
+    assert!(!first.done);
+    assert!(!engine.migration_progress().active);
+    assert!(!engine.maintenance_active());
+
+    // tick 之间普通读写照常：没有维护窗口，也没有写拒绝。
+    let extra = RecordId::new_v7();
+    engine
+        .put("notes", "note", extra, &"written-between-ticks", 1)
+        .unwrap();
+    assert_eq!(
+        engine
+            .get::<String>("notes", "note", &extra)
+            .unwrap()
+            .unwrap()
+            .value,
+        "written-between-ticks"
+    );
+    assert_eq!(engine.migration_progress().scanned, 8);
+
+    let mut ticks = 1;
+    loop {
+        let step = engine.migrate_tick(to, budget, 8).unwrap();
+        ticks += 1;
+        assert!(step.scanned <= 8, "tick ran more than one batch");
+        assert!(ticks < 30, "tick migration did not finish");
+        if step.done {
+            break;
+        }
+    }
+    assert!(engine.migration_progress().done);
+    assert!(!engine.migration_progress().active);
+
+    for (index, id) in ids.iter().enumerate() {
+        assert_eq!(
+            engine
+                .get::<String>("notes", "note", id)
+                .unwrap()
+                .unwrap()
+                .value,
+            format!("value-{index}")
+        );
+    }
+    assert_eq!(
+        engine
+            .get::<String>("notes", "note", &extra)
+            .unwrap()
+            .unwrap()
+            .value,
+        "written-between-ticks"
+    );
+    engine.retire_key(old).unwrap();
+
+    // 新序列开始时进度计数清零，不继承上一次迁移的累计值。
+    let to2 = engine.begin_rotation().unwrap().to;
+    let first = engine.migrate_tick(to2, budget, 8).unwrap();
+    assert_eq!(first.scanned, 8);
+    assert_eq!(engine.migration_progress().scanned, 8);
+}
+
+#[test]
+fn maintenance_requires_sync_and_writable_handle() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("plain.redb");
+    let engine = create(&path);
+    let to = KeyId::from_bytes([3u8; 16]);
+    assert!(matches!(
+        engine.begin_maintenance(),
+        Err(Error::SyncDisabled)
+    ));
+    assert!(matches!(engine.end_maintenance(), Err(Error::SyncDisabled)));
+    assert!(matches!(
+        engine.migrate_step(to, 1),
+        Err(Error::SyncDisabled)
+    ));
+    assert!(matches!(
+        engine.migrate_tick(to, Duration::from_millis(10), 8),
+        Err(Error::SyncDisabled)
+    ));
+    assert!(!engine.maintenance_active());
+
+    enable(&engine);
+    // 目标 key 不存在时拒绝步进。
+    assert!(matches!(
+        engine.migrate_step(to, 1),
+        Err(Error::InvalidArgument(_))
+    ));
+    assert!(matches!(
+        engine.migrate_step(to, shio_core::MAX_MIGRATION_BATCH_SIZE + 1),
+        Err(Error::InvalidArgument(_))
+    ));
+    assert!(matches!(
+        engine.migrate_tick(to, Duration::from_millis(1_001), 8),
+        Err(Error::InvalidArgument(_))
+    ));
+    assert!(matches!(
+        engine.migrate_tick(to, Duration::from_millis(10), 257),
+        Err(Error::InvalidArgument(_))
+    ));
+    assert!(matches!(
+        engine.migrate_tick(to, Duration::from_millis(10), 8),
+        Err(Error::InvalidArgument(_))
+    ));
+    drop(engine);
+
+    let readonly = Engine::open(options(&path).read_only(true), PASSWORD).unwrap();
+    assert!(matches!(readonly.begin_maintenance(), Err(Error::ReadOnly)));
+    assert!(matches!(
+        readonly.migrate_tick(to, Duration::from_millis(10), 8),
+        Err(Error::ReadOnly)
+    ));
+    assert!(!readonly.maintenance_active());
 }
 
 #[test]

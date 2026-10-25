@@ -330,6 +330,12 @@ fn sync_pair_changes_snapshot_and_rotation() {
     let status = unsafe { shio_sync_info(a, &mut info_pointer, &mut info_len) };
     assert_eq!(status, SHIO_SYNC_DISABLED);
     assert!(info_pointer.is_null());
+    // 维护模式要求先启用同步。
+    // SAFETY: 句柄有效。
+    assert_eq!(
+        unsafe { shio_sync_begin_maintenance(a) },
+        SHIO_SYNC_DISABLED
+    );
 
     let info_a = enable_sync(a);
     assert_eq!(info_a["device_id"].as_str().unwrap().len(), 32);
@@ -347,6 +353,21 @@ fn sync_pair_changes_snapshot_and_rotation() {
     let collection = CString::new("entries").unwrap();
     let meta = insert(a, &namespace, &collection, br#"{"title":"from-a"}"#);
     let id_a = meta["id"].as_str().unwrap().to_owned();
+
+    // 同步启用后禁止物理删除。
+    let mut purged = -1;
+    // SAFETY: 句柄、名称、ID 与输出指针有效。
+    let status = unsafe {
+        shio_purge(
+            a,
+            namespace.as_ptr(),
+            collection.as_ptr(),
+            uuid_bytes(&id_a).as_ptr(),
+            &mut purged,
+        )
+    };
+    assert_eq!(status, SHIO_SYNC_ENABLED);
+    assert_eq!(purged, 0);
 
     let (pairing_frame, secret) = create_pairing(a);
     let mut wrong_secret = secret.clone().into_bytes();
@@ -575,6 +596,200 @@ fn sync_migration_progress_cancel_and_resume() {
     // 非法参数在启动迁移前被拒绝。
     // SAFETY: 句柄与 key ID 有效。
     let status = unsafe { shio_sync_migrate_all_ex(a, to.as_ptr(), 0, 60_001) };
+    assert_eq!(status, SHIO_INVALID_ARGUMENT);
+
+    // 维护模式：期间写被拒绝，步进每次只处理一批，退出报告是否仍有游标。
+    let mut rotation_pointer = ptr::null_mut();
+    let mut rotation_len = 0;
+    // SAFETY: 句柄与输出指针有效。
+    let status = unsafe { shio_sync_begin_rotation(a, &mut rotation_pointer, &mut rotation_len) };
+    assert_eq!(status, SHIO_OK, "begin_rotation failed: {}", last_error());
+    let rotation = parse(take_buffer(rotation_pointer, rotation_len));
+    let to2 = hex_bytes(rotation["to"].as_str().unwrap());
+
+    // SAFETY: 句柄有效。
+    let status = unsafe { shio_sync_begin_maintenance(a) };
+    assert_eq!(
+        status,
+        SHIO_OK,
+        "begin_maintenance failed: {}",
+        last_error()
+    );
+
+    let mut id = [0u8; 16];
+    let mut meta_ptr = ptr::null_mut();
+    let mut meta_len = 0;
+    let payload = br#"{"blocked":true}"#;
+    // SAFETY: 句柄、名称、载荷与输出指针有效。
+    let status = unsafe {
+        shio_insert(
+            a,
+            namespace.as_ptr(),
+            collection.as_ptr(),
+            payload.as_ptr(),
+            payload.len(),
+            id.as_mut_ptr(),
+            &mut meta_ptr,
+            &mut meta_len,
+        )
+    };
+    assert_eq!(status, SHIO_BUSY);
+    assert!(meta_ptr.is_null());
+
+    // 读操作不受维护模式影响。
+    let mut collections_ptr = ptr::null_mut();
+    let mut collections_len = 0;
+    // SAFETY: 句柄、名称与输出指针有效。
+    let status = unsafe {
+        shio_collections(
+            a,
+            namespace.as_ptr(),
+            &mut collections_ptr,
+            &mut collections_len,
+        )
+    };
+    assert_eq!(status, SHIO_OK, "collections failed: {}", last_error());
+    assert_eq!(
+        parse(take_buffer(collections_ptr, collections_len)),
+        serde_json::json!(["entries"])
+    );
+
+    // 单步迁移：每步 7 条，直到 done。
+    let mut steps = 0;
+    let mut step_done = false;
+    while !step_done {
+        let mut json_ptr = ptr::null_mut();
+        let mut json_len = 0;
+        // SAFETY: 句柄、key ID 与输出指针有效。
+        let status =
+            unsafe { shio_sync_migrate_step(a, to2.as_ptr(), 7, &mut json_ptr, &mut json_len) };
+        assert_eq!(status, SHIO_OK, "migrate_step failed: {}", last_error());
+        let step = parse(take_buffer(json_ptr, json_len));
+        let scanned = step["scanned"].as_u64().unwrap();
+        assert!(scanned <= 7);
+        assert!(scanned >= step["migrated"].as_u64().unwrap());
+        step_done = step["done"].as_bool().unwrap();
+        steps += 1;
+        assert!(steps < 20, "step migration did not finish");
+    }
+    assert_eq!(migration_progress(a)["done"], true);
+
+    let mut done = 0u8;
+    // SAFETY: 句柄与输出指针有效。
+    let status = unsafe { shio_sync_end_maintenance(a, &mut done) };
+    assert_eq!(status, SHIO_OK, "end_maintenance failed: {}", last_error());
+    assert_eq!(done, 1);
+
+    // 退出后普通写恢复。
+    let mut meta_ptr = ptr::null_mut();
+    let mut meta_len = 0;
+    // SAFETY: 句柄、名称、载荷与输出指针有效。
+    let status = unsafe {
+        shio_insert(
+            a,
+            namespace.as_ptr(),
+            collection.as_ptr(),
+            payload.as_ptr(),
+            payload.len(),
+            id.as_mut_ptr(),
+            &mut meta_ptr,
+            &mut meta_len,
+        )
+    };
+    assert_eq!(
+        status,
+        SHIO_OK,
+        "insert after maintenance failed: {}",
+        last_error()
+    );
+    assert!(!take_buffer(meta_ptr, meta_len).is_empty());
+
+    // 步进参数越界与空 key ID 在写事务前被拒绝。
+    let mut json_ptr = ptr::null_mut();
+    let mut json_len = 0;
+    // SAFETY: 句柄、key ID 与输出指针有效。
+    let status =
+        unsafe { shio_sync_migrate_step(a, to2.as_ptr(), 2048, &mut json_ptr, &mut json_len) };
+    assert_eq!(status, SHIO_INVALID_ARGUMENT);
+    // SAFETY: NULL key ID 应被拒绝。
+    let status = unsafe { shio_sync_migrate_step(a, ptr::null(), 1, &mut json_ptr, &mut json_len) };
+    assert_eq!(status, SHIO_INVALID_ARGUMENT);
+
+    // 合作式调度：不进入维护模式，tick 之间普通写照常。
+    let mut rotation_pointer = ptr::null_mut();
+    let mut rotation_len = 0;
+    // SAFETY: 句柄与输出指针有效。
+    let status = unsafe { shio_sync_begin_rotation(a, &mut rotation_pointer, &mut rotation_len) };
+    assert_eq!(status, SHIO_OK, "begin_rotation failed: {}", last_error());
+    let rotation = parse(take_buffer(rotation_pointer, rotation_len));
+    let to3 = hex_bytes(rotation["to"].as_str().unwrap());
+
+    let mut json_ptr = ptr::null_mut();
+    let mut json_len = 0;
+    // SAFETY: 句柄、key ID 与输出指针有效。
+    let status =
+        unsafe { shio_sync_migrate_tick(a, to3.as_ptr(), 1, 4, &mut json_ptr, &mut json_len) };
+    assert_eq!(status, SHIO_OK, "migrate_tick failed: {}", last_error());
+    let tick = parse(take_buffer(json_ptr, json_len));
+    assert!(tick["scanned"].as_u64().unwrap() >= 1);
+
+    let mut tick_id = [0u8; 16];
+    let mut meta_ptr = ptr::null_mut();
+    let mut meta_len = 0;
+    let tick_payload = br#"{"between":"ticks"}"#;
+    // SAFETY: 句柄、名称、载荷与输出指针有效。
+    let status = unsafe {
+        shio_insert(
+            a,
+            namespace.as_ptr(),
+            collection.as_ptr(),
+            tick_payload.as_ptr(),
+            tick_payload.len(),
+            tick_id.as_mut_ptr(),
+            &mut meta_ptr,
+            &mut meta_len,
+        )
+    };
+    assert_eq!(
+        status,
+        SHIO_OK,
+        "insert between ticks failed: {}",
+        last_error()
+    );
+    assert!(!take_buffer(meta_ptr, meta_len).is_empty());
+
+    let mut ticks = 1;
+    let mut tick_done = false;
+    while !tick_done {
+        let mut json_ptr = ptr::null_mut();
+        let mut json_len = 0;
+        // SAFETY: 句柄、key ID 与输出指针有效。
+        let status =
+            unsafe { shio_sync_migrate_tick(a, to3.as_ptr(), 1, 4, &mut json_ptr, &mut json_len) };
+        assert_eq!(status, SHIO_OK, "migrate_tick failed: {}", last_error());
+        let tick = parse(take_buffer(json_ptr, json_len));
+        assert!(tick["scanned"].as_u64().unwrap() >= tick["migrated"].as_u64().unwrap());
+        tick_done = tick["done"].as_bool().unwrap();
+        ticks += 1;
+        assert!(ticks < 60, "tick migration did not finish");
+    }
+    assert_eq!(migration_progress(a)["done"], true);
+    assert_eq!(migration_progress(a)["active"], false);
+
+    // tick 参数越界与空 key ID 同样在写事务前被拒绝。
+    let mut json_ptr = ptr::null_mut();
+    let mut json_len = 0;
+    // SAFETY: 句柄、key ID 与输出指针有效。
+    let status =
+        unsafe { shio_sync_migrate_tick(a, to3.as_ptr(), 1_001, 4, &mut json_ptr, &mut json_len) };
+    assert_eq!(status, SHIO_INVALID_ARGUMENT);
+    // SAFETY: 句柄、key ID 与输出指针有效。
+    let status =
+        unsafe { shio_sync_migrate_tick(a, to3.as_ptr(), 10, 257, &mut json_ptr, &mut json_len) };
+    assert_eq!(status, SHIO_INVALID_ARGUMENT);
+    // SAFETY: NULL key ID 应被拒绝。
+    let status =
+        unsafe { shio_sync_migrate_tick(a, ptr::null(), 10, 4, &mut json_ptr, &mut json_len) };
     assert_eq!(status, SHIO_INVALID_ARGUMENT);
 
     // SAFETY: 句柄有效。

@@ -10,7 +10,7 @@
 
 use std::time::Duration;
 
-use shio::{open_with_pairing, Credential, Kernel, OpenOptions};
+use shio::{open_with_pairing, Credential, Error, Kernel, ListOptions, OpenOptions};
 use shio_core::model::RecordId;
 use zeroize::Zeroizing;
 
@@ -80,4 +80,101 @@ async fn facade_sync_and_pairing() {
     assert!(matches!(a.sync(), Err(shio::Error::Closed)));
     assert!(matches!(a.sync_info(), Err(shio::Error::Closed)));
     b.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn facade_maintenance_mode_steps_migration() {
+    let dir = tempfile::tempdir().unwrap();
+    let kernel = Kernel::open(
+        options(&dir.path().join("a.redb")),
+        Credential::password(PASSWORD),
+    )
+    .await
+    .unwrap();
+    let sync = kernel.sync().unwrap();
+    sync.enable_sync(None).unwrap();
+
+    let notes = kernel
+        .namespace("notes")
+        .unwrap()
+        .collection::<String>("note")
+        .unwrap();
+    let mut ids = Vec::new();
+    for index in 0..6 {
+        let id = RecordId::new_v7();
+        notes.put(id, &format!("value-{index}")).await.unwrap();
+        ids.push(id);
+    }
+    let to = sync.begin_rotation().unwrap().to;
+
+    kernel.begin_maintenance().await.unwrap();
+    assert!(matches!(
+        notes.put(RecordId::new_v7(), &"blocked".to_owned()).await,
+        Err(Error::Busy)
+    ));
+    assert_eq!(notes.get(&ids[0]).await.unwrap().unwrap().value, "value-0");
+    assert_eq!(
+        notes
+            .list(ListOptions::default())
+            .await
+            .unwrap()
+            .items
+            .len(),
+        6
+    );
+
+    let mut steps = 0;
+    loop {
+        let step = kernel.migrate_step(to, 2).await.unwrap();
+        assert!(step.scanned <= 2);
+        assert!(step.scanned >= step.migrated);
+        steps += 1;
+        assert!(steps < 10, "step migration did not finish");
+        if step.done {
+            break;
+        }
+    }
+    let outcome = kernel.end_maintenance().await.unwrap();
+    assert!(outcome.done);
+
+    notes
+        .put(RecordId::new_v7(), &"after".to_owned())
+        .await
+        .unwrap();
+    for (index, id) in ids.iter().enumerate() {
+        assert_eq!(
+            notes.get(id).await.unwrap().unwrap().value,
+            format!("value-{index}")
+        );
+    }
+
+    // 合作式调度：不进入维护模式，tick 之间普通写照常。
+    let to = sync.begin_rotation().unwrap().to;
+    let budget = Duration::from_nanos(1);
+    let first = kernel.migrate_tick(to, budget, 2).await.unwrap();
+    assert!(first.scanned >= 1 && first.scanned <= 2);
+    let between = RecordId::new_v7();
+    notes
+        .put(between, &"between-ticks".to_owned())
+        .await
+        .unwrap();
+
+    let mut ticks = 1;
+    loop {
+        let step = kernel.migrate_tick(to, budget, 2).await.unwrap();
+        assert!(step.scanned <= 2);
+        assert!(step.scanned >= step.migrated);
+        ticks += 1;
+        assert!(ticks < 50, "tick migration did not finish");
+        if step.done {
+            break;
+        }
+    }
+    assert_eq!(
+        notes.get(&between).await.unwrap().unwrap().value,
+        "between-ticks"
+    );
+    assert_eq!(notes.get(&ids[0]).await.unwrap().unwrap().value, "value-0");
+
+    kernel.close().await.unwrap();
 }

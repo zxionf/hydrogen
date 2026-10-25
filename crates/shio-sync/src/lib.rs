@@ -19,9 +19,11 @@ use std::time::Duration;
 
 pub use base32::{decode_secret as decode_pairing_secret, encode_secret};
 pub use shio_core::sync::{
-    ApplyReport, ChangeEntry, ChangePage, MigrationOptions, MigrationProgress, OfferPage,
-    PairingOffer, RotationInfo, RotationOffer, SnapshotPage, SnapshotRecord, SyncInfo,
-    DEFAULT_MIGRATION_BATCH_SIZE, MAX_MIGRATION_BATCH_SIZE, MAX_MIGRATION_PAUSE_MS,
+    ApplyReport, ChangeEntry, ChangePage, MaintenanceOutcome, MigrationOptions, MigrationProgress,
+    MigrationStep, OfferPage, PairingOffer, RotationInfo, RotationOffer, SnapshotPage,
+    SnapshotRecord, SyncInfo, DEFAULT_MIGRATION_BATCH_SIZE, DEFAULT_TICK_BATCH_SIZE,
+    DEFAULT_TICK_BUDGET_MS, MAX_MIGRATION_BATCH_SIZE, MAX_MIGRATION_PAUSE_MS, MAX_TICK_BATCH_SIZE,
+    MAX_TICK_BUDGET_MS,
 };
 pub use shio_core::{DeviceId, Engine, EngineOptions, Error, KeyId, Result};
 
@@ -397,6 +399,37 @@ impl SyncHandle {
     /// 带批次与暂停参数的迁移；取消在批次边界生效。
     pub fn migrate_all_with_options(&self, to: KeyId, options: MigrationOptions) -> Result<u64> {
         self.sync().migrate_all_with_options(to, options)
+    }
+
+    /// 进入维护模式：窗口内普通写返回 `Busy`，读操作不受影响。
+    pub fn begin_maintenance(&self) -> Result<()> {
+        self.engine.begin_maintenance()
+    }
+
+    /// 退出维护模式；`done` 表示当前已无待续跑的迁移游标。
+    pub fn end_maintenance(&self) -> Result<MaintenanceOutcome> {
+        self.engine.end_maintenance()
+    }
+
+    /// 单步迁移；`max_records` 为 0 时使用默认 256，上限 1024。
+    pub fn migrate_step(&self, to: KeyId, max_records: usize) -> Result<MigrationStep> {
+        self.engine.migrate_step(to, max_records)
+    }
+
+    /// 合作式调度：在时间预算内推进若干小批次；`budget` 为零取默认 10ms，
+    /// `max_records` 为零取默认 32。
+    pub fn migrate_tick(
+        &self,
+        to: KeyId,
+        budget: Duration,
+        max_records: usize,
+    ) -> Result<MigrationStep> {
+        self.engine.migrate_tick(to, budget, max_records)
+    }
+
+    /// 维护模式是否处于激活状态。
+    pub fn maintenance_active(&self) -> bool {
+        self.engine.maintenance_active()
     }
 
     /// 迁移进度；不获取会话锁。

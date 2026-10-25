@@ -431,6 +431,7 @@ password (UTF-8 bytes)
 | `b"migration"` | `to16` + `u16 cursor_len` + `cursor` | 进行中的 format=2 迁移持久游标；完成、目标 key 变化或应用远端记录后重写/删除 |
 
 - `log_end` 不单独存储：等于 `shio.changes` 的最大键，空表为 0。
+- 克隆（`clone_backup`）保留 `db`、`rot/`、`ack/`、`mig/`、`upgrade` 与 `upgrade/key/`、全部记录与密钥；重写 `dev`（新随机设备 ID）、`enabled_at`、`baseline_done`、`log_start=1`，删除 `baseline_key`、`peer/`、`cur/`、`heard/`、`migration` 与全部 `shio.changes`，随后由基线流程按记录键序重写记录条目与 `CurrentKey`。
 - `upgrade.phase`：1 = meta 已切到 2；2 = 正在迁移；3 = 清理旧表。`cursor` 是最后迁移的记录键，空表示从起点开始。
 - `rot/` 不随日志压缩消失；清理只走 `prune_rotation_offers`。
 - `ack/` 与 `mig/` 是幂等标记；重复写入同值不改变语义。

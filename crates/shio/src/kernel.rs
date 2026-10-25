@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use secrecy::{ExposeSecret, SecretString};
 use shio_core::model::{validate_name, NameKind, DEFAULT_MAX_VALUE_SIZE};
-use shio_core::store::{BackupInfo, CompactReport, Engine, EngineOptions, Stats};
+use shio_core::store::{BackupInfo, CloneInfo, CompactReport, Engine, EngineOptions, Stats};
 #[cfg(feature = "sync")]
 use shio_core::{DeviceId, KeyId, MaintenanceOutcome, MigrationStep};
 #[cfg(feature = "sync")]
@@ -466,6 +466,38 @@ pub async fn open_with_pairing(
     Ok(Kernel {
         inner: Arc::new(Inner::new(engine, false, data_lock)),
     })
+}
+
+/// 从备份克隆到新设备；目标必须不存在或为空。
+///
+/// 保留同一逻辑库（`db_id`）、key 链与记录，生成新的 `device_id` 并重建完整日志；
+/// 未启用同步的库只做普通复制。`options.create` 与 `read_only` 被忽略：克隆必须
+/// 写入目标并返回可写句柄。目标旁路锁在整个克隆期间独占持有。
+pub async fn clone_backup(
+    options: OpenOptions,
+    credential: Credential,
+    backup: PathBuf,
+) -> Result<(Kernel, CloneInfo)> {
+    let mut options = options;
+    options.create = false;
+    options.read_only = false;
+    options.validate()?;
+    let data_lock = DataFileLock::acquire(&options.path, false)?;
+    let engine_options = engine_options(&options);
+    let password = password_bytes(credential);
+
+    let (engine, info) = tokio::task::spawn_blocking(move || {
+        Engine::clone_backup(&backup, engine_options, password.as_slice())
+    })
+    .await
+    .map_err(|_| Error::Internal("blocking task panicked"))??;
+
+    Ok((
+        Kernel {
+            inner: Arc::new(Inner::new(engine, false, data_lock)),
+        },
+        info,
+    ))
 }
 
 /// 离线压缩数据库文件：整理空闲页并收缩文件。

@@ -284,3 +284,8 @@ Change: 20261025-auto-log-compaction
 Context: 自动日志裁剪需要知道每个拉取方读到了本机日志的哪一条，但既有协议只有 peer/<device>（我们读对方）与 cur/<device>（对方当前写 key），没有任何「对方读我们」的信息；直接按时间或条数裁剪会静默丢掉对端还没读到的变更。
 Decision: 新增 SHY2 kind=3 进度帧（无条目，sender=报告方，next=报告方在接收方日志中的已消费游标）；接收方校验 db_id 后写入 shio.sync 的 heard/<device>（8 字节大端、单调、按 log_end 截断）。新增 compact_changes_auto：已知对端取 cur/ 与 heard/ 的并集并排除本机，任一 cur/ 对端缺 heard 时返回 0；全部报告后裁剪到 min(heard)+1，且最多删到 log_end 之前，保留最新一条。变更以增量符号暴露：Engine::peer_cursor/apply_peer_progress/compact_changes_auto、Sync 与 SyncHandle 同名方法、Kernel 三个 async 方法、shio_sync_progress_frame/apply_progress/compact_auto；ABI 保持 1。
 Consequences: 对端能明确告诉持有方进度，裁剪前有正向确认；落后于裁剪点的拉取返回 SyncResyncRequired，走快照重同步而不是静默丢数据。保留最新一条保证 log_end 不回落、序列号继续递增。已知限制：cur/ 中未上报的对端会一直阻止裁剪；retire_key 不清理 heard/，退场设备仍会限制裁剪点，需要时另做解绑。
+## [58] 2026-10-25 10:57:14 UTC
+Change: 20261025-multi-device-clone
+Context: S2 的 restore 保留 db_id/device_id/key 链与游标，语义是同一台设备的灾难恢复；把同一备份恢复到第二台设备并同时启用同步会出现两个实体共享 device_id，cur/、heard/、peer/ 与日志 writer 全部重叠
+Decision: 新增 clone_backup：保留 db_id、key 链、记录与口令，生成新的随机非零 device_id，清理 peer/、cur/、heard/、migration、baseline_key 与全部 shio.changes，把 log_start 置 1、刷新 enabled_at，再复用 run_baseline 按记录键序重发全部记录与 CurrentKey 并写 cur/<新设备>；保留 rot/、ack/、mig/、upgrade 与 upgrade/key/（key 事实而非本设备进度）。未启用同步的库只做复制；create/read_only 被忽略，返回可写句柄。以增量符号暴露 Engine::clone_backup、shio::clone_backup 与 shio_clone_backup，ABI 保持 1
+Consequences: 同一 db_id 的两台设备可同时同步，克隆本身是完整同步源（配对包不带记录，日志必须重基线）；代价是克隆一次性写 记录数+1 条日志。清空 peer/ 后对端日志若已裁剪，首次拉取会收到 SyncResyncRequired，走快照重同步；清空 cur/ 会让自动日志裁剪等对端重新上报。已知限制：克隆时若轮换仍在进行，依赖保留下来的 rot/ 提供 offer

@@ -149,6 +149,25 @@ pub struct CompactReport {
     pub compacted: bool,
 }
 
+/// 多设备克隆摘要；未启用同步时同步字段为空。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CloneInfo {
+    /// 源库格式版本。
+    pub format_version: u16,
+    /// 克隆文件字节数。
+    pub db_bytes: u64,
+    /// 逻辑库 ID；未启用同步时为 `None`。
+    pub db_id: Option<[u8; 16]>,
+    /// 源设备 ID；未启用同步时为 `None`。
+    pub previous_device_id: Option<DeviceId>,
+    /// 克隆的新设备 ID；未启用同步时为 `None`。
+    pub device_id: Option<DeviceId>,
+    /// 被清理的 `peer/` 数量。
+    pub peer_count: u64,
+    /// 重建后的日志条数；未重置日志时为 0。
+    pub log_entries: u64,
+}
+
 /// 批量写操作，载荷为已序列化的明文。
 #[derive(Debug, Clone, Copy)]
 pub enum RawWriteOp<'a> {

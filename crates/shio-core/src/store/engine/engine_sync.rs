@@ -220,7 +220,7 @@ impl Engine {
         self.compact_changes(before)
     }
 
-    fn changes_log_end(&self) -> Result<u64> {
+    pub(super) fn changes_log_end(&self) -> Result<u64> {
         let txn = self.handle.begin_read()?;
         let table = txn.open_table(changes::TABLE)?;
         let last = table.last()?.map(|(key, _)| key.value()).unwrap_or(0);
@@ -642,7 +642,7 @@ impl Engine {
         Ok(())
     }
 
-    fn run_baseline(&self, session: &mut Session, device: DeviceId) -> Result<()> {
+    pub(super) fn run_baseline(&self, session: &mut Session, device: DeviceId) -> Result<()> {
         let mut after: Vec<u8> = {
             let txn = self.handle.begin_read()?;
             let table = txn.open_table(sync_state::TABLE)?;

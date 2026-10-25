@@ -1054,3 +1054,101 @@ fn progress_report_drives_auto_log_compaction() {
     // SAFETY: 同上。
     unsafe { shio_kernel_destroy(b) };
 }
+
+#[test]
+fn clone_backup_rotates_device_identity() {
+    let directory = tempfile::tempdir().unwrap();
+    let source_path = directory.path().join("source.db");
+    let backup_path = directory.path().join("backup.db");
+    let clone_path = directory.path().join("clone.db");
+    let occupied_path = directory.path().join("occupied.db");
+    let create = br#"{"create":true}"#;
+
+    let source = open(&source_path, b"clone-password", create);
+    enable_sync(source);
+    let namespace = CString::new("vault").unwrap();
+    let collection = CString::new("entries").unwrap();
+    let id = insert(source, &namespace, &collection, br#"{"name":"clone"}"#);
+    let id_text = id["id"].as_str().unwrap().to_owned();
+    let before = sync_info(source);
+
+    let backup_c = CString::new(backup_path.to_str().unwrap()).unwrap();
+    let mut json_pointer = ptr::null_mut();
+    let mut json_len = 0;
+    // SAFETY: 句柄、路径与输出指针有效。
+    let status =
+        unsafe { shio_backup(source, backup_c.as_ptr(), &mut json_pointer, &mut json_len) };
+    assert_eq!(status, SHIO_OK, "backup failed: {}", last_error());
+    take_buffer(json_pointer, json_len);
+
+    let clone_c = CString::new(clone_path.to_str().unwrap()).unwrap();
+    let mut clone = ptr::null_mut();
+    let mut clone_json = ptr::null_mut();
+    let mut clone_json_len = 0;
+    // SAFETY: 路径、口令、options 与输出指针有效。
+    let status = unsafe {
+        shio_clone_backup(
+            backup_c.as_ptr(),
+            clone_c.as_ptr(),
+            b"clone-password".as_ptr(),
+            b"clone-password".len(),
+            ptr::null(),
+            0,
+            &mut clone,
+            &mut clone_json,
+            &mut clone_json_len,
+        )
+    };
+    assert_eq!(status, SHIO_OK, "clone failed: {}", last_error());
+    assert!(!clone.is_null());
+    let summary = parse(take_buffer(clone_json, clone_json_len));
+    assert_eq!(summary["format_version"], 2);
+    assert_eq!(summary["db_id"], before["db_id"]);
+    assert_eq!(summary["previous_device_id"], before["device_id"]);
+    assert_ne!(summary["device_id"], before["device_id"]);
+    assert_eq!(summary["peer_count"], 0);
+    assert_eq!(summary["log_entries"], 2);
+
+    let after = sync_info(clone);
+    assert_eq!(after["db_id"], before["db_id"]);
+    assert_eq!(after["device_id"], summary["device_id"]);
+    assert_eq!(after["current_key_id"], before["current_key_id"]);
+    assert_eq!(after["log_start"], 1);
+    assert_eq!(after["log_end"], 2);
+    assert_eq!(after["baseline_done"], true);
+    let value = get(clone, &namespace, &collection, &id_text);
+    assert_eq!(value["value"]["name"], "clone");
+
+    // 目标非空时拒绝，且不发布句柄或摘要。
+    std::fs::write(&occupied_path, b"occupied").unwrap();
+    let occupied_c = CString::new(occupied_path.to_str().unwrap()).unwrap();
+    let mut ignored = ptr::null_mut();
+    let mut ignored_json = ptr::null_mut();
+    let mut ignored_len = 0;
+    // SAFETY: 路径、口令、options 与输出指针有效。
+    let status = unsafe {
+        shio_clone_backup(
+            backup_c.as_ptr(),
+            occupied_c.as_ptr(),
+            b"clone-password".as_ptr(),
+            b"clone-password".len(),
+            ptr::null(),
+            0,
+            &mut ignored,
+            &mut ignored_json,
+            &mut ignored_len,
+        )
+    };
+    assert_eq!(status, SHIO_INVALID_ARGUMENT);
+    assert!(ignored.is_null());
+    assert!(ignored_json.is_null());
+
+    // SAFETY: 句柄有效。
+    unsafe { shio_close(source) };
+    // SAFETY: 句柄有效。
+    unsafe { shio_close(clone) };
+    // SAFETY: 关闭后 destroy，且没有其它线程继续使用。
+    unsafe { shio_kernel_destroy(source) };
+    // SAFETY: 关闭后 destroy，且没有其它线程继续使用。
+    unsafe { shio_kernel_destroy(clone) };
+}

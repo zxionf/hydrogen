@@ -126,6 +126,24 @@ int32_t shio_restore(const char *backup_path,
                      shio_kernel **out_handle);
 
 /*
+ * 从备份克隆到新设备：保留 db_id/key 链/记录，换新 device_id 并重建完整日志。
+ * 目标必须不存在或为空；options_json 同 shio_open，create/read_only 被忽略。
+ * 成功返回已打开的目标句柄与摘要 JSON：
+ *   {"format_version":N,"db_bytes":N,"db_id":"…","previous_device_id":"…",
+ *    "device_id":"…","peer_count":N,"log_entries":N}
+ * 未启用同步时后四项为 null / 0。
+ */
+int32_t shio_clone_backup(const char *backup_path,
+                          const char *target_path,
+                          const uint8_t *password,
+                          size_t password_len,
+                          const uint8_t *options_json,
+                          size_t options_len,
+                          shio_kernel **out_handle,
+                          uint8_t **out_json,
+                          size_t *out_json_len);
+
+/*
  * 离线物理压缩：整理空闲页并收缩文件；要求没有其它打开的句柄。
  * 返回 {"before_bytes":N,"after_bytes":N,"compacted":bool}；
  * 句柄未关闭返回 SHIO_LOCKED，路径不存在返回 SHIO_NOT_FOUND。

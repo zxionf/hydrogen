@@ -1147,3 +1147,157 @@ fn auto_compaction_requires_sync() {
         Err(Error::SyncDisabled)
     ));
 }
+
+#[test]
+fn clone_backup_assigns_new_device_and_rebuilds_log() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = create(&dir.path().join("a.redb"));
+    let info_a = enable(&a);
+    let mut ids = Vec::new();
+    for index in 0..4 {
+        let id = RecordId::new_v7();
+        a.put("notes", "note", id, &index, 1).unwrap();
+        ids.push(id);
+    }
+
+    // 让源库带上 peer 状态：配对 B，B 写一条，A 应用 B 的页。
+    let b = pair(&a, &dir.path().join("b.redb"));
+    let info_b = b.sync_info().unwrap();
+    let b_id = RecordId::new_v7();
+    b.put("notes", "note", b_id, &"from-b", 1).unwrap();
+    let page = b.changes_since(0, 1000).unwrap();
+    a.apply_page(&page).unwrap();
+    assert!(a.peer_cursor(info_b.device_id).unwrap().is_some());
+
+    let backup = dir.path().join("a.backup");
+    let backup_info = a.backup(&backup).unwrap();
+    assert_eq!(backup_info.format_version, 2);
+
+    let (clone, info) =
+        Engine::clone_backup(&backup, options(&dir.path().join("clone.redb")), PASSWORD).unwrap();
+    assert_eq!(info.format_version, 2);
+    assert_eq!(info.db_id, Some(info_a.db_id));
+    assert_eq!(info.previous_device_id, Some(info_a.device_id));
+    let clone_device = info.device_id.expect("clone device id");
+    assert_ne!(clone_device, info_a.device_id);
+    assert_eq!(info.peer_count, 1);
+    assert!(info.db_bytes > 0);
+
+    let clone_info = clone.sync_info().unwrap();
+    assert_eq!(clone_info.db_id, info_a.db_id);
+    assert_eq!(clone_info.device_id, clone_device);
+    assert_eq!(clone_info.current_key_id, info_a.current_key_id);
+    assert_eq!(clone_info.log_start, 1);
+    assert!(clone_info.baseline_done);
+    assert_eq!(info.log_entries, clone_info.log_end);
+    assert_eq!(clone.peer_cursor(info_b.device_id).unwrap(), None);
+
+    // 记录完整。
+    for (index, id) in ids.iter().enumerate() {
+        let stored = clone.get::<i32>("notes", "note", id).unwrap().unwrap();
+        assert_eq!(stored.value, index as i32);
+    }
+    assert_eq!(
+        clone
+            .get::<String>("notes", "note", &b_id)
+            .unwrap()
+            .unwrap()
+            .value,
+        "from-b"
+    );
+
+    // 新配对设备只拉克隆的日志就能拿到全量记录。
+    let c = pair(&clone, &dir.path().join("c.redb"));
+    let page = clone.changes_since(0, 1000).unwrap();
+    assert_eq!(c.apply_page(&page).unwrap().applied, 5);
+    assert_eq!(
+        c.get::<String>("notes", "note", &b_id)
+            .unwrap()
+            .unwrap()
+            .value,
+        "from-b"
+    );
+
+    // 旧设备 B 用新设备身份拉克隆日志：补上它缺的记录，已相同的被 LWW 跳过。
+    let page = clone.changes_since(0, 1000).unwrap();
+    assert_eq!(b.apply_page(&page).unwrap().applied, 4);
+
+    // 克隆后续写入能被 B 增量拉到。
+    let after = b.peer_cursor(clone_device).unwrap().unwrap();
+    let new_id = RecordId::new_v7();
+    clone
+        .put("notes", "note", new_id, &"after-clone", 1)
+        .unwrap();
+    let page = clone.changes_since(after, 1000).unwrap();
+    assert_eq!(page.entries.len(), 1);
+    assert_eq!(b.apply_page(&page).unwrap().applied, 1);
+    assert_eq!(
+        b.get::<String>("notes", "note", &new_id)
+            .unwrap()
+            .unwrap()
+            .value,
+        "after-clone"
+    );
+}
+
+#[test]
+fn clone_backup_without_sync_copies_records() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = create(&dir.path().join("plain.redb"));
+    let id = RecordId::new_v7();
+    a.put("notes", "note", id, &"plain", 1).unwrap();
+
+    let backup = dir.path().join("plain.backup");
+    a.backup(&backup).unwrap();
+    let (clone, info) = Engine::clone_backup(
+        &backup,
+        options(&dir.path().join("plain-clone.redb")),
+        PASSWORD,
+    )
+    .unwrap();
+    assert_eq!(info.format_version, 1);
+    assert_eq!(info.db_id, None);
+    assert_eq!(info.previous_device_id, None);
+    assert_eq!(info.device_id, None);
+    assert_eq!(info.peer_count, 0);
+    assert_eq!(info.log_entries, 0);
+    assert!(matches!(clone.sync_info(), Err(Error::SyncDisabled)));
+    assert_eq!(
+        clone
+            .get::<String>("notes", "note", &id)
+            .unwrap()
+            .unwrap()
+            .value,
+        "plain"
+    );
+}
+
+#[test]
+fn clone_backup_rejects_bad_targets() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = create(&dir.path().join("a.redb"));
+    enable(&a);
+    a.put("notes", "note", RecordId::new_v7(), &1, 1).unwrap();
+    let backup = dir.path().join("a.backup");
+    a.backup(&backup).unwrap();
+
+    assert!(matches!(
+        Engine::clone_backup(
+            &dir.path().join("missing.backup"),
+            options(&dir.path().join("x.redb")),
+            PASSWORD,
+        ),
+        Err(Error::NotFound)
+    ));
+
+    let occupied = dir.path().join("occupied.redb");
+    std::fs::write(&occupied, b"not empty").unwrap();
+    assert!(matches!(
+        Engine::clone_backup(&backup, options(&occupied), PASSWORD),
+        Err(Error::InvalidArgument(_))
+    ));
+
+    let wrong = dir.path().join("wrong.redb");
+    assert!(Engine::clone_backup(&backup, options(&wrong), b"wrong password").is_err());
+    assert!(!wrong.exists());
+}

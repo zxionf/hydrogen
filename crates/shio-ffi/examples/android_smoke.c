@@ -1075,6 +1075,118 @@ static int auto_compact_mode(const char *path)
     return 0;
 }
 
+static int clone_mode(const char *path)
+{
+    const char *options = "{\"create\":true}";
+    char backup_path[1024];
+    char clone_path[1024];
+    shio_kernel *source = NULL;
+    shio_kernel *clone = NULL;
+    uint8_t *buf = NULL;
+    size_t len = 0;
+    uint8_t *json = NULL;
+    size_t json_len = 0;
+    uint8_t id[16];
+    char id_text[37];
+    char *text = NULL;
+    char *source_device = NULL;
+    char *source_db = NULL;
+    char *clone_device = NULL;
+    char *clone_db = NULL;
+    uint64_t log_start = 0;
+    uint64_t log_end = 0;
+    int index = 0;
+
+    snprintf(backup_path, sizeof(backup_path), "%s.backup", path);
+    snprintf(clone_path, sizeof(clone_path), "%s.clone", path);
+    remove(path);
+    remove(backup_path);
+    remove(clone_path);
+
+    expect(shio_open(path, (const uint8_t *)PASSWORD, strlen(PASSWORD),
+                     (const uint8_t *)options, strlen(options), &source),
+           "clone open(source)");
+    expect(shio_sync_enable(source, NULL, &buf, &len), "clone enable(source)");
+    text = take_text(buf, len, "clone enable(source)");
+    source_device = json_string(text, "device_id", "clone enable(source)");
+    source_db = json_string(text, "db_id", "clone enable(source)");
+    free(text);
+
+    for (index = 0; index < 3; index++) {
+        char payload[48];
+        snprintf(payload, sizeof(payload), "{\"n\":%d}", index);
+        record_id(index, id);
+        expect(shio_put(source, "vault", "entries", id,
+                        (const uint8_t *)payload, strlen(payload), &buf, &len),
+               "clone put(source)");
+        shio_free(buf, len);
+        buf = NULL;
+        len = 0;
+    }
+
+    expect(shio_backup(source, backup_path, &json, &json_len),
+           "clone backup(source)");
+    free(take_text(json, json_len, "clone backup(source)"));
+    json = NULL;
+    json_len = 0;
+
+    expect(shio_clone_backup(backup_path, clone_path,
+                             (const uint8_t *)PASSWORD, strlen(PASSWORD),
+                             (const uint8_t *)options, strlen(options),
+                             &clone, &json, &json_len),
+           "clone_backup");
+    text = take_text(json, json_len, "clone_backup");
+    json = NULL;
+    json_len = 0;
+    clone_device = json_string(text, "device_id", "clone_backup");
+    clone_db = json_string(text, "db_id", "clone_backup");
+    free(text);
+
+    if (strcmp(clone_device, source_device) == 0) {
+        fprintf(stderr, "clone kept the source device id: %s\n", clone_device);
+        return 1;
+    }
+    if (strcmp(clone_db, source_db) != 0) {
+        fprintf(stderr, "clone changed db id: %s != %s\n", clone_db, source_db);
+        return 1;
+    }
+
+    text = sync_info_text(clone, "clone sync_info");
+    log_start = json_u64(text, "log_start", "clone sync_info");
+    log_end = json_u64(text, "log_end", "clone sync_info");
+    free(text);
+    if (log_start != 1 || log_end != 4) {
+        fprintf(stderr, "clone log range %llu..%llu, expected 1..4\n",
+                (unsigned long long)log_start, (unsigned long long)log_end);
+        return 1;
+    }
+
+    record_id(1, id);
+    uuid_text(id, id_text);
+    expect(shio_get(clone, "vault", "entries", id, &buf, &len),
+           "clone get(clone)");
+    text = take_text(buf, len, "clone get(clone)");
+    contains(text, "\"n\":1", "clone get(clone)");
+    free(text);
+
+    printf("clone device: %s log: %llu..%llu\n", clone_device,
+           (unsigned long long)log_start, (unsigned long long)log_end);
+    printf("CLONE_OK\n");
+
+    free(source_device);
+    free(source_db);
+    free(clone_device);
+    free(clone_db);
+    expect(shio_close(source), "clone close(source)");
+    shio_kernel_destroy(source);
+    expect(shio_close(clone), "clone close(clone)");
+    shio_kernel_destroy(clone);
+    remove(path);
+    remove(backup_path);
+    remove(clone_path);
+    return 0;
+}
+
 static int backup_restore_mode(const char *path)
 {
     shio_kernel *source = NULL;
@@ -1410,7 +1522,7 @@ int main(int argc, char **argv)
                 "usage: %s <database-path> "
                 "[smoke|sync|hold|probe|check|read-hold|read-probe|read-locked|"
                 "rotate-many|resume-rotation|migration-progress|maintenance|"
-                "cooperative|compact|auto-compact|backup-restore]\n",
+                "cooperative|compact|auto-compact|clone|backup-restore]\n",
                 argv[0]);
         return 2;
     }
@@ -1491,6 +1603,10 @@ int main(int argc, char **argv)
 
     if (strcmp(mode, "auto-compact") == 0) {
         return auto_compact_mode(path);
+    }
+
+    if (strcmp(mode, "clone") == 0) {
+        return clone_mode(path);
     }
 
     if (strcmp(mode, "backup-restore") == 0) {

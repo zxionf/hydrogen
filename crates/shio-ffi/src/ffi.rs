@@ -608,6 +608,73 @@ pub unsafe extern "C" fn shio_restore(
     })
 }
 
+/// 从备份克隆到新设备，并返回已打开的目标句柄与摘要 JSON。
+///
+/// 目标必须不存在或为空；保留 `db_id`/key 链/记录，生成新 `device_id` 并重建日志。
+///
+/// # Safety
+///
+/// 路径、口令、可选的 options JSON 与输出指针必须按 `include/shio.h` 的契约有效。
+#[no_mangle]
+pub unsafe extern "C" fn shio_clone_backup(
+    backup_path: *const c_char,
+    target_path: *const c_char,
+    password: *const u8,
+    password_len: usize,
+    options_json: *const u8,
+    options_len: usize,
+    out_handle: *mut *mut ShioKernel,
+    out_json: *mut *mut u8,
+    out_json_len: *mut usize,
+) -> i32 {
+    ffi_guard(|| {
+        reset_output(out_json, out_json_len)?;
+        if out_handle.is_null() {
+            return Err(Error::InvalidArgument("output handle is null"));
+        }
+        // SAFETY: 调用方提供了非空输出指针。
+        unsafe {
+            *out_handle = ptr::null_mut();
+        }
+
+        // SAFETY: 由调用方契约保证路径指针有效。
+        let backup_path = unsafe { input_str(backup_path)? };
+        // SAFETY: 由调用方契约保证路径指针有效。
+        let target_path = unsafe { input_str(target_path)? };
+        let password = input_password(password, password_len)?;
+        // SAFETY: 由调用方契约保证 options 指针有效。
+        let options_bytes = unsafe { input_bytes(options_json, options_len)? };
+        let options = parse_open_options(target_path, options_bytes)?;
+
+        let runtime = new_runtime()?;
+        let (kernel, info) = runtime.block_on(shio::clone_backup(
+            options,
+            Credential::password(password),
+            PathBuf::from(backup_path),
+        ))?;
+        let value = json!({
+            "format_version": info.format_version,
+            "db_bytes": info.db_bytes,
+            "db_id": info.db_id.map(|id| hex(&id)),
+            "previous_device_id": info.previous_device_id.map(|id| id.to_string()),
+            "device_id": info.device_id.map(|id| id.to_string()),
+            "peer_count": info.peer_count,
+            "log_entries": info.log_entries,
+        });
+        set_output(value_to_bytes(&value)?, out_json, out_json_len)?;
+
+        let boxed = Box::new(ShioKernel {
+            runtime,
+            kernel: Mutex::new(Some(kernel)),
+        });
+        // SAFETY: 调用方提供了非空输出指针。
+        unsafe {
+            *out_handle = Box::into_raw(boxed);
+        }
+        Ok(())
+    })
+}
+
 /// 关闭句柄并等待在途操作；不释放句柄本身。可重复调用。
 ///
 /// # Safety

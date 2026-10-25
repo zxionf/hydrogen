@@ -14,7 +14,7 @@ pub mod meta2;
 pub mod records;
 pub mod sync_state;
 
-pub use engine::{BackupInfo, CompactReport, Engine, EngineOptions, RawWriteOp, Stats};
+pub use engine::{BackupInfo, CloneInfo, CompactReport, Engine, EngineOptions, RawWriteOp, Stats};
 
 /// 当前默认写出的数据库格式版本。
 pub const FORMAT: u16 = 1;

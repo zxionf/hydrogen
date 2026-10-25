@@ -239,3 +239,54 @@ async fn facade_auto_compaction_follows_reported_progress() {
     a.close().await.unwrap();
     b.close().await.unwrap();
 }
+
+#[tokio::test]
+async fn facade_clone_backup_changes_device_identity() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = Kernel::open(
+        options(&dir.path().join("a.redb")),
+        Credential::password(PASSWORD),
+    )
+    .await
+    .unwrap();
+    let info_a = a.sync().unwrap().enable_sync(None).unwrap();
+    let notes = a
+        .namespace("notes")
+        .unwrap()
+        .collection::<String>("note")
+        .unwrap();
+    let id = RecordId::new_v7();
+    notes.put(id, &"hello".to_owned()).await.unwrap();
+
+    let backup = dir.path().join("a.backup");
+    a.backup(backup.clone()).await.unwrap();
+
+    let (clone, info) = shio::clone_backup(
+        options(&dir.path().join("clone.redb")),
+        Credential::password(PASSWORD),
+        backup,
+    )
+    .await
+    .unwrap();
+    assert_eq!(info.db_id, Some(info_a.db_id));
+    assert_eq!(info.previous_device_id, Some(info_a.device_id));
+    let device = info.device_id.expect("clone device id");
+    assert_ne!(device, info_a.device_id);
+    let clone_info = clone.sync_info().unwrap();
+    assert_eq!(clone_info.device_id, device);
+    assert_eq!(clone_info.db_id, info_a.db_id);
+    assert_eq!(clone_info.log_start, 1);
+
+    let notes_clone = clone
+        .namespace("notes")
+        .unwrap()
+        .collection::<String>("note")
+        .unwrap();
+    assert_eq!(
+        notes_clone.get(&id).await.unwrap().unwrap().value,
+        "hello".to_owned()
+    );
+
+    a.close().await.unwrap();
+    clone.close().await.unwrap();
+}

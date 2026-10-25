@@ -332,4 +332,161 @@ impl Engine {
             }
         }
     }
+
+    /// 从 `backup` 克隆到新设备；目标必须不存在或为空。
+    ///
+    /// 保留 `db_id`、key 链与记录，生成新的 `device_id`，清理设备级同步状态，
+    /// 并以新身份重建完整日志。未启用同步的库只做普通复制。
+    pub fn clone_backup(
+        backup: &Path,
+        options: EngineOptions,
+        password: &[u8],
+    ) -> Result<(Self, CloneInfo)> {
+        validate_open_options(&options)?;
+        let backup_meta = std::fs::metadata(backup).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                Error::NotFound
+            } else {
+                Error::Io(error)
+            }
+        })?;
+        if !backup_meta.is_file() {
+            return Err(Error::InvalidArgument("backup path is not a file"));
+        }
+
+        let target = options.path.clone();
+        match std::fs::metadata(&target) {
+            Ok(metadata) => {
+                if !metadata.is_file() || metadata.len() != 0 {
+                    return Err(Error::InvalidArgument("clone target is not empty"));
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+
+        let temp = TempPath::sibling(&target)?;
+        std::fs::copy(backup, temp.path())?;
+
+        let mut clone_options = options.clone();
+        clone_options.path = temp.path().to_path_buf();
+        clone_options.create = false;
+        clone_options.read_only = false;
+
+        let mut info = {
+            let clone = Self::open(clone_options, password)?;
+            clone.reset_clone_identity()?
+        };
+
+        if path_exists(&target)? {
+            std::fs::remove_file(&target)?;
+        }
+        std::fs::rename(temp.path(), &target)?;
+        info.db_bytes = std::fs::metadata(&target)?.len();
+
+        let mut open_options = options;
+        open_options.create = false;
+        match Self::open(open_options, password) {
+            Ok(engine) => Ok((engine, info)),
+            Err(error) => {
+                let _ = std::fs::remove_file(&target);
+                Err(error)
+            }
+        }
+    }
+
+    /// 在克隆副本上换设备身份并重建日志；未启用同步时不做改动。
+    fn reset_clone_identity(&self) -> Result<CloneInfo> {
+        self.require_writable()?;
+        let mut session = self.write_session()?;
+        let format = session.format;
+        let Some(state) = self.read_sync_state()? else {
+            return Ok(CloneInfo {
+                format_version: format,
+                db_bytes: 0,
+                db_id: None,
+                previous_device_id: None,
+                device_id: None,
+                peer_count: 0,
+                log_entries: 0,
+            });
+        };
+
+        let device = new_device_id()?;
+        let now = Timestamp::now().as_millis();
+
+        let peer_count = {
+            let txn = self.handle.begin_write()?;
+            let peer_count = {
+                let mut table = txn.open_table(sync_state::TABLE)?;
+                let mut stale: Vec<Vec<u8>> = Vec::new();
+                for item in table.iter()? {
+                    let (key, _) = item?;
+                    let key = key.value();
+                    if key.starts_with(sync_state::peer_prefix())
+                        || key.starts_with(sync_state::current_prefix())
+                        || key.starts_with(sync_state::heard_prefix())
+                    {
+                        stale.push(key.to_vec());
+                    }
+                }
+                let peer_count = stale
+                    .iter()
+                    .filter(|key| key.starts_with(sync_state::peer_prefix()))
+                    .count() as u64;
+                for key in &stale {
+                    table.remove(key.as_slice())?;
+                }
+                table.remove(sync_state::KEY_MIGRATION)?;
+                table.remove(sync_state::KEY_BASELINE_KEY)?;
+                table.insert(
+                    sync_state::KEY_VERSION,
+                    sync_state::VERSION.to_be_bytes().as_slice(),
+                )?;
+                table.insert(sync_state::KEY_DB, state.db_id.as_slice())?;
+                table.insert(sync_state::KEY_DEVICE, device.as_bytes().as_slice())?;
+                table.insert(sync_state::KEY_ENABLED_AT, now.to_be_bytes().as_slice())?;
+                table.insert(sync_state::KEY_BASELINE_DONE, [0u8].as_slice())?;
+                table.insert(sync_state::KEY_LOG_START, 1u64.to_be_bytes().as_slice())?;
+                peer_count
+            };
+            {
+                let mut table = txn.open_table(changes::TABLE)?;
+                let keys: Vec<u64> = table
+                    .iter()?
+                    .map(|item| item.map(|(key, _)| key.value()))
+                    .collect::<std::result::Result<_, _>>()?;
+                for key in keys {
+                    table.remove(key)?;
+                }
+            }
+            txn.commit()?;
+            peer_count
+        };
+
+        session.sync = Some(device);
+        self.run_baseline(&mut session, device)?;
+        let log_entries = self.changes_log_end()?;
+
+        Ok(CloneInfo {
+            format_version: format,
+            db_bytes: 0,
+            db_id: Some(state.db_id),
+            previous_device_id: Some(state.device),
+            device_id: Some(device),
+            peer_count,
+            log_entries,
+        })
+    }
+}
+
+fn new_device_id() -> Result<DeviceId> {
+    let mut bytes = [0u8; 16];
+    loop {
+        getrandom::fill(&mut bytes)
+            .map_err(|_| Error::Internal("operating system CSPRNG unavailable"))?;
+        if bytes != [0u8; 16] {
+            return Ok(DeviceId::from_bytes(bytes));
+        }
+    }
 }

@@ -81,6 +81,12 @@ typedef struct shio_kernel shio_kernel;
 uint32_t shio_abi_version(void);
 
 /*
+ * 返回内核版本（编译期包版本），NUL 结尾 UTF-8。
+ * 指向进程级静态存储，调用方不得释放；不需要句柄和数据库。
+ */
+const char *shio_version(void);
+
+/*
  * 取当前线程最近一次错误。返回包含 NUL 的所需字节数。
  * handle 可为 NULL；buf 为 NULL 或 len 为 0 时只查询长度。
  */

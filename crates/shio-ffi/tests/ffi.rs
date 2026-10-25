@@ -67,6 +67,9 @@ fn crud_batch_rotation_and_password_change() {
     let handle = open(&path, b"first-password", create);
 
     assert_eq!(shio_abi_version(), SHIO_ABI_VERSION);
+    // SAFETY: shio_version 返回进程级静态的 NUL 结尾字符串。
+    let kernel_version = unsafe { CStr::from_ptr(shio_version()) };
+    assert_eq!(kernel_version.to_str().unwrap(), shio::version());
 
     let namespace = CString::new("notes").unwrap();
     let collection = CString::new("items").unwrap();

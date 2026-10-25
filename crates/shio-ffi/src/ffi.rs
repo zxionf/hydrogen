@@ -7,7 +7,7 @@ use std::cell::RefCell;
 use std::ffi::{c_char, CStr, CString};
 use std::path::PathBuf;
 use std::ptr;
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use serde::Deserialize;
@@ -130,6 +130,18 @@ pub unsafe extern "C" fn shio_last_error(
 #[no_mangle]
 pub extern "C" fn shio_abi_version() -> u32 {
     SHIO_ABI_VERSION
+}
+
+/// 内核版本查询；返回编译期包版本（NUL 结尾 UTF-8）。
+///
+/// 指针指向进程级静态存储，调用方不得释放，也不需要句柄；
+/// 不需要打开数据库，句柄关闭后仍可调用。
+#[no_mangle]
+pub extern "C" fn shio_version() -> *const c_char {
+    static VERSION: OnceLock<CString> = OnceLock::new();
+    VERSION
+        .get_or_init(|| CString::new(shio::version()).unwrap_or_default())
+        .as_ptr()
 }
 
 /// 不透明内核句柄。
@@ -1607,6 +1619,14 @@ mod tests {
     #[test]
     fn abi_version_is_positive() {
         assert!(shio_abi_version() > 0);
+    }
+
+    #[test]
+    fn kernel_version_matches_facade() {
+        // SAFETY: shio_version 返回进程级静态的 NUL 结尾字符串。
+        let text = unsafe { CStr::from_ptr(shio_version()) };
+        assert_eq!(text.to_str().unwrap(), shio::version());
+        assert!(!text.to_bytes().is_empty());
     }
 
     #[test]

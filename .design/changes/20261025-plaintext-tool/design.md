@@ -14,7 +14,7 @@
 这属于危险能力：一旦落盘就是明文。因此做成**独立二进制**，不链接 `shio-ffi`，不进入 Android
 构建，也不扩大内核的默认 API 面。
 
-## 目标
+## 本阶段范围
 
 - 新 crate `crates/shio-tool`，二进制名 `shio-tool`。
 - 子命令：`export`、`import`、`verify`、`stats`。

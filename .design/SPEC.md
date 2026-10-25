@@ -205,3 +205,317 @@ DK ──HKDF-SHA256(info 区分用途)──▶ 记录密钥 / 元数据密钥 
 - Android 类型检查：`cargo check -p shio-core -p shio -p shio-ffi --target aarch64-linux-android` 与 `x86_64-linux-android`；链接 `.so` 时把 `CARGO_TARGET_<TARGET>_LINKER` 指向 NDK r29 的 `<triple>24-clang.cmd`，并设置 `RUSTFLAGS="-C link-arg=--target=<triple>24"`（内核 `.so` 的 API 24 构建基线；应用 minSdk 为 29）。
 - `cargo clippy --workspace --all-targets -- -D warnings`、`cargo clippy -p shio --features sync --all-targets -- -D warnings` 与 `cargo fmt --all -- --check` 是合并前的必过项。
 - 依赖版本由 `Cargo.lock` 锁定并随仓库提交；升级依赖需重新跑上述三项检查。
+
+## 背景
+自动日志裁剪的「已知对端」是 `cur/` 与 `heard/` 的并集（排除本机）；只要其中一个设备没有
+上报 `heard/`，`compact_changes_auto` 就返回 0。轮换退役与 offer 清理也依赖「所有已知设备
+都有 `ack/` / `mig/`」。
+
+已经不再同步的设备（换机、卸载、退场）不会自己消失：
+
+- `cur/<device>`、`heard/<device>` 永久占住裁剪门控；
+- `ack/<to>/<device>`、`mig/<key>/<device>` 让 `retire_key` / `prune_rotation_offers` 一直等待；
+- `peer/<device>` 保留着一个可能早已过期、甚至低于 `log_start` 的游标。
+
+决策 #57 明确记录了这一点（「当前没有解绑 API，需要时可另开变更」）。本次补上显式解绑。
+
+## 本阶段范围
+- `Engine::forget_device(device)`：在一个写事务里删除该设备的全部设备级同步状态。
+- 拒绝解绑本机；对未知设备幂等（返回全零报告）。
+- 不影响记录、密钥、`rot/`、`upgrade`、变更日志。
+- 解绑后自动裁剪与轮换退役不再等待该设备。
+- facade + C ABI + Android harness。
+
+不在本次范围：设备黑名单/撤销、强制删除该设备写入的记录、解绑时的网络通知、自动判断
+「设备已退场」。
+
+## 语义
+删除的键（全部幂等）：
+
+| 键 | 含义 |
+|---|---|
+| `peer/<device>` | 本机在该设备日志中的消费游标 |
+| `cur/<device>` | 该设备公告的当前写 key |
+| `heard/<device>` | 该设备上报的「已读到本机日志哪一条」 |
+| `ack/<to>/<device>` | 该设备对某个轮换 key 的确认（扫描全部 `to`） |
+| `mig/<key>/<device>` | 该设备已完成某个 key 的迁移（扫描全部 `key`） |
+
+保留：记录与墓碑、`shio.keys2`、`meta`、`rot/`、`ack/*/<其它设备>`、`mig/*/<其它设备>`、
+`upgrade`、`shio.changes`。
+
+错误与顺序：
+
+- 只读句柄 → `ReadOnly`；维护窗口 → `Busy`；未启用同步 → `SyncDisabled`；
+- `device == 本机` → `InvalidArgument`（不能把自己从自己的裁剪门控里删掉）；
+- 未知设备 → 成功，报告全为 `false` / 0（便于重试）。
+
+## 为什么保留 key 相关状态
+`rot/` 是仍未剪掉的轮换 offer，`ack/` 是「某设备已安装某个 key」，`mig/` 是
+「某设备已无某个 key 的记录」。这些描述的是**库与 key 的事实**，不是本设备的同步进度：
+
+- 清掉 `rot/` 后，缺新 key 的对端会收到 `RotationRequired`，却无法再从这里取 offer；
+- 清掉 `ack/` 会让 `prune_rotation_offers` 失去依据；
+- `mig/` 影响 `retire_key` 的安全判断。
+
+`upgrade`（format 1→2 的数据库级迁移游标）同理保留。
+
+相反，`cur/` 虽然是「某设备公告的当前 key」，但它同时是 `known_devices` 的来源，
+会参与自动日志裁剪的门控。克隆清掉后只剩自己，等对端重新上报，符合「新设备刚开始
+同步」的事实。
+
+## 为什么重建完整日志
+配对包只携带身份与 key，不携带记录；新设备拿到数据靠拉日志或快照。如果克隆的日志
+只有一条 `CurrentKey`，新配对设备拉完日志仍没有记录，会静默得到空库。沿用
+`run_baseline` 的全部记录条目可以保证：
+
+- 新设备只靠日志就能拿到全量数据；
+- 老设备拉克隆日志时，相同记录按 LWW `(updated_at, rev, blob)` 被判为旧版本而跳过。
+
+记录 blob 的 header 不含 `writer`，日志条目的 `writer` 只表示发布者，因此重基线
+不会改变任何冲突结果。
+
+代价是克隆会写 `记录数 + 1` 条日志，大库有一次性 O(记录数) 写入；这与首次
+`enable_sync` 的成本相同。
+
+## 阶段 API
+```rust
+pub struct ForgetReport {
+    pub device: DeviceId,
+    pub removed_peer_cursor: bool,
+    pub removed_current_key: bool,
+    pub removed_progress: bool,
+    pub removed_acks: u64,
+    pub removed_migrations: u64,
+}
+
+impl Engine {
+    pub fn forget_device(&self, device: DeviceId) -> Result<ForgetReport>;
+}
+
+// facade（`sync` feature）
+impl Kernel {
+    pub async fn forget_device(&self, device: DeviceId) -> Result<ForgetReport>;
+}
+```
+
+```c
+int32_t shio_sync_forget_device(shio_kernel *handle,
+                                const uint8_t *device_id,
+                                uint8_t **out_json,
+                                size_t *out_json_len);
+```
+
+摘要 JSON：
+
+```json
+{"device":"32hex","peer_cursor":true,"current_key":true,"progress":true,"acks":1,"migrations":2}
+```
+
+增量符号，`SHIO_ABI_VERSION` 保持 1。
+
+## 验收
+- 三设备（A、B、C）：B 上报进度、C 不上报时 `compact_changes_auto() == 0`；`forget_device(C)`
+  后返回报告包含 `current_key`/`progress`，再次裁剪返回非 0。
+- 解绑本机返回 `InvalidArgument`；未知设备返回全零报告；连续解绑幂等。
+- 轮换场景：B 安装 offer 并 ack 后，A 的 `ack/<to>/B` 存在；`forget_device(B)` 清掉它，
+  `removed_acks >= 1`；迁移公告同理清掉 `mig/`。
+- 未启用同步返回 `SyncDisabled`；只读返回 `ReadOnly`；维护窗口返回 `Busy`。
+- FFI：符号往返、摘要 JSON、错误码；facade：async 包装与 `compact_changes_auto` 联动。
+- Android harness：`forget` 模式（A/B/C 三库，裁剪先 0 后非 0，报告字段正确），
+  x86_64 模拟器与 arm64 真机；同轮回归既有模式。
+- `cargo test --workspace --all-features`、`fmt --check`、`clippy -D warnings`、`cc -fsyntax-only` 通过。
+- 文档：`api.md` §4/§8/§9/§12、`data.md` §15.5、`notes.md`（用法与「不是拉黑」的边界）、
+  `阶段计划.md`、`STATE.md`、决策 1 条。
+
+## 文件格式 v1：`.shio.jsonl`
+UTF-8、逐行 JSON、流式读写。首行 `head`，尾行 `end`，中间只有 `col` 与 `rec`。
+
+```json
+{"t":"head","v":1,"fmt":2,"at":1761350400000,"deleted":false}
+{"t":"col","ns":"vault","col":"entries","at":1758758400000}
+{"t":"rec","ns":"vault","col":"entries","id":"018f3c1e-9f0a-7c3e-8f5d-2b1a0c9d8e7f","rev":3,"created":1758758400000,"updated":1758758500123,"dv":1,"del":false,"v64":"eyJuYW1lIjoi5byg5LiJIn0="}
+{"t":"rec","ns":"vault","col":"entries","id":"018f3c1e-9f0a-7c3e-8f5d-2b1a0c9d8e80","rev":4,"created":1758758400000,"updated":1758758600000,"dv":1,"del":true}
+{"t":"end","rec":2,"col":1,"sha":"<64 位小写 hex>"}
+```
+
+规则：
+
+- `head.v` 当前为 1；`head.fmt` 是源库格式版本（1 或 2），只作来源提示，导入不依赖。
+- `head.at` 是导出时间，`head.deleted` 记录本次是否包含墓碑。
+- 值二选一、逐行自描述：`v64`（标准 base64，默认）或 `v`（合法 UTF-8 字符串，工具可读模式）。
+  非墓碑记录必须且只能有一个；`del=true` 不带值。
+- `sha` 覆盖 `head` 之后、`end` 之前的每条体行字节加一个 `\n`（行内容不含换行），因此 CRLF
+  文件也能校验通过；`rec`/`col` 是精确行数。允许空行（导入时跳过，不参与计数与哈希）。
+- 不写 `db_id`、key、口令、日志、游标或密码学参数；`db_id` 是稳定指纹，写进明文文件会造成
+  跨导出关联，默认排除。
+- 记录按编码键序（namespace, collection, id）输出，同一库同样参数导出除 `head.at` 外字节级可复现。
+- 未知字段忽略（向前兼容），未知 `t`、未知 `head.v` 直接拒绝。
+
+## 导出
+```rust
+pub struct ExportOptions {
+    pub namespace: Option<String>,
+    pub collection: Option<String>,
+    pub include_deleted: bool,
+    pub overwrite: bool,
+}
+pub struct ExportInfo {
+    pub format_version: u16,
+    pub records: u64,
+    pub deleted: u64,
+    pub collections: u64,
+    pub bytes: u64,
+}
+```
+
+- `collection` 必须与 `namespace` 同时给出；否则 `InvalidArgument`。
+- 整个导出在单个 redb 读事务里完成（与 `backup` 一致，快照一致；代价是延迟页回收）。
+- 先写目标同目录临时文件，成功 `flush` 后原子改名；目标已存在且 `overwrite=false` 返回
+  `InvalidArgument`，失败不留半成品。
+- 只读句柄可导出（`read_only=true` 也可用）。
+- `col` 行来自 `shio.catalog`，空集合也输出，保留原始 `created_at`。
+- 墓碑默认不导出（`include_deleted=false`），此时 `ExportInfo.deleted = 0`。
+
+## 导入
+```rust
+pub enum ImportMode { Merge, Replace }
+pub struct ImportOptions { pub mode: ImportMode, pub dry_run: bool, pub batch_size: usize }
+pub struct ImportReport {
+    pub records: u64, pub applied: u64, pub skipped: u64, pub deleted: u64,
+    pub collections: u64, pub bytes: u64, pub dry_run: bool,
+}
+```
+
+**两遍处理**：第一遍只校验（`head`、逐行 JSON、名称、UUID、`rev`/时间戳、值编码、值长度、
+精确计数、SHA-256、`end` 之后无内容），任何问题在写入前失败；第二遍按批导入。
+`dry_run=true` 只跑第一遍，报告里的 `applied`/`skipped` 按校验结果推算，不写库。
+
+**Merge（默认，与同步 LWW 对齐）**：
+
+1. 本地不存在 → 写入（墓碑行跳过并计入 `skipped`）。
+2. 本地存在且 `(updated_at, rev)` 更大 → 跳过。
+3. 相等 → 解密本地比较明文：相同则跳过（**重跑幂等**）；不同则按明文字节序决定，规则固定可复现。
+4. 墓碑行且本地存在：按上面的 LWW 判断后写墓碑（保留源 `rev`/`updated_at`），明文沿用本地值；
+   相等时墓碑优先。
+5. 墓碑行且本地不存在：跳过（新库不需要墓碑）。
+
+**Replace**：本地优先覆盖，但只保证压过本地副本：
+
+- `rev = max(local.rev + 1, src.rev)`（本地不存在时 `max(1, src.rev)`），避免 rev 回退；
+- `updated_at = max(src.updated_at, local.updated_at + 1)`（本地不存在时用源值）；
+- `created_at` 沿用本地已有值（覆盖不改变首次创建时间）；
+- 对端若存在更新的版本，仍按 LWW 胜出，不做“全局强制”。
+
+写入细节：
+
+- 用目标库当前 key 重新加密；format=1 用 v1 记录格式，format=2 用 v2，与 `stage_put` 同路径。
+- 保留源 `created_at`/`updated_at`/`rev`/`data_version`/墓碑标志。
+- 同步启用时按本机 `device_id` 追加 `shio.changes` 条目，对端能正常拉到；format=1 不写日志。
+- 每批（默认 256，上限 4096，0 取默认）一个写事务，批内原子、整体非原子；失败后重跑靠幂等收敛。
+- `col` 行只补登记缺失的集合，保留源 `created_at`。
+- 普通写入路径：维护窗口返回 `Busy`，只读返回 `ReadOnly`，超 `max_value_size` 返回 `ValueTooLarge`。
+- 不校验业务类型（内核不知道值的 schema），只校验名称、ID、长度与格式；应用需自行校验。
+
+## 危险性与边界
+- 导出文件是**明文**：文档、CLI、函数文档都要标注；不默认写当前目录，不自动上传。
+- 导出不是备份：不含 key 链、`db_id`、日志、游标，不能恢复同步身份；跨设备仍用 `clone_backup` 或配对。
+- 导入会在同步库中表现为一次大规模本机写入，日志会持续增长，之后由正常裁剪处理。
+- 导入不清理任何既有数据；`Replace` 只覆盖同 ID 记录。
+
+## API 面
+```rust
+impl Engine {
+    pub fn export_records(&self, target: &Path, options: &ExportOptions) -> Result<ExportInfo>;
+    pub fn import_records(&self, source: &Path, options: &ImportOptions) -> Result<ImportReport>;
+}
+
+// facade
+impl Kernel {
+    pub async fn export_records(&self, target: PathBuf, options: ExportOptions) -> Result<ExportInfo>;
+    pub async fn import_records(&self, source: PathBuf, options: ImportOptions) -> Result<ImportReport>;
+}
+```
+
+C ABI（增量符号，`SHIO_ABI_VERSION` 保持 1）：
+
+```c
+int32_t shio_export(shio_kernel *kernel, const char *target_path,
+                    const uint8_t *options_json, size_t options_len,
+                    uint8_t **out_json, size_t *out_json_len);
+int32_t shio_import(shio_kernel *kernel, const char *source_path,
+                    const uint8_t *options_json, size_t options_len,
+                    uint8_t **out_json, size_t *out_json_len);
+```
+
+- export options：`{"namespace":"…","collection":"…","include_deleted":false,"overwrite":false}`；
+  未知字段拒绝（与 `shio_open` 一致）。
+- import options：`{"mode":"merge"|"replace","dry_run":false,"batch_size":256}`。
+- 报告 JSON：export `{"format_version":N,"records":N,"deleted":N,"collections":N,"bytes":N}`；
+  import `{"records":N,"applied":N,"skipped":N,"deleted":N,"collections":N,"bytes":N,"dry_run":bool}`。
+- 格式错误映射 `SHIO_CORRUPTED`，参数错误 `SHIO_INVALID_ARGUMENT`，其余沿用既有映射。
+
+## 实现落点
+- 类型 `ForgetReport` 放 `shio-core/src/sync.rs`（与 `ApplyReport` 同处），核心根重导出。
+- 实现放 `engine_sync.rs`，紧邻 `apply_peer_progress` / `compact_changes_auto`；单个写事务，
+  `ack/` 与 `mig/` 按键前缀扫描后按尾部 16 字节匹配设备 ID。
+- facade 在 `kernel.rs`（`#[cfg(feature = "sync")]`），C ABI 在 `ffi.rs` + `shio.h`。
+- harness 增加 `forget` 模式。
+
+## 命令
+```
+shio-tool export <db> --out <file> [--namespace N] [--collection C] [--with-deleted] [--force]
+shio-tool import <db> <file> [--dry-run] [--replace] [--batch N] [--yes]
+shio-tool verify <file>
+shio-tool stats  <file>
+```
+
+- `export` 以只读方式打开库（`read_only=true`），输出走内核的临时文件 + 原子改名；目标已存在
+  且没有 `--force` 时返回错误，不覆盖。
+- `import` 以读写方式打开库；`--batch` 映射到 `ImportOptions::batch_size`；`--replace` 映射到
+  `ImportMode::Replace`，默认 `Merge`。
+- `verify` 输出 `format=<n> records=<n> deleted=<n> collections=<n> bytes=<n>`；失败时退出码 1。
+- `stats` 先完整校验，再按 `(namespace, collection)` 汇总记录数与墓碑数。
+- 退出码：`0` 成功，`1` 运行失败（错误/校验失败/口令错误），`2` 用法错误。
+- `-h/--help` 与 `-V/--version` 顶层可用；内核版本与工具版本一起打印。
+
+## 口令
+按优先级：
+
+1. `--password-stdin`：从标准输入读一行，去掉行尾换行；空口令拒绝。
+2. `SHIO_PASSWORD` 环境变量。
+3. 终端交互：不回显输入（工具级依赖 `rpassword`）。
+4. 都没有（stdin 是管道且未加 `--password-stdin`）→ 用法错误，提示可用的两种方式。
+
+口令在进程内用 `Zeroizing<String>` 搬运，读完即清零副本；不写日志、不回显。
+
+## 危险闸门
+- 导出：stderr 先打印「导出文件是明文，包含全部记录值；用完请自行清理」，再写文件。
+- 导入：没有 `--yes` 时退出码 2，提示先 `--dry-run` 预览；`--dry-run` 不写库。
+- 不提供「删除文件」「上传」「自动清理」等隐式行为；工具只做用户明确要求的那一步。
+
+## 新增内核 API
+`verify` / `stats` 需要在不打开数据库的情况下校验文件。为此把导出文件扫描从 `Engine` 方法提炼为
+free function，并复用同一个校验实现：
+
+```rust
+// shio-core::store（shio 根重导出）
+pub fn verify_export(source: &Path, max_value_size: usize) -> Result<ExportInfo>;
+```
+
+- 返回的 `ExportInfo` 含 `format_version`、`records`、`deleted`、`collections`、`bytes`。
+- 校验规则与 `import_records` 第一遍完全一致（结构、名称、UUID、值编码与长度、计数、SHA-256、
+  尾后数据）。
+- 不引入新类型、新错误码；`max_value_size` 传 `DEFAULT_MAX_VALUE_SIZE` 即可。
+
+## 依赖
+- `shio`（默认 feature，不含 `sync`；format=2 的读写由 core 支持，不需要同步 feature）。
+- `serde_json`（`stats` 汇总）、`tokio`（复用 facade 的异步入口）、`zeroize`（口令）。
+- `rpassword`（仅工具用于不回显输入；不进入库与 Android 构建）。
+
+## 设备回来后
+没有黑名单，也不阻止重新配对：该设备的变更页会重新写入 `cur/`，进度帧会重新写入 `heard/`。
+因为 `peer/` 已删除，本机会从 0 拉取；如果本机日志已经裁剪过，就会收到
+`SyncResyncRequired`，走 `snapshot_start`/`snapshot_page`/`apply_snapshot` 重同步。
+
+也就是说：解绑是「本机不再关心这个对端」的显式声明，不是永久拉黑；重新上线会按新对端
+（或需要快照的老对端）处理。文档必须写清这一点，避免被当成远程撤销。

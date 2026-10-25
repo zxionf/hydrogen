@@ -18,7 +18,7 @@
 core 内部直接扫 `shio.records` 与 `shio.catalog`（编码键天然按 ns/col/id 排序），不为此新增
 公开枚举接口。
 
-## 目标
+## 本阶段范围
 
 - 新增 `Engine::export_records` / `Engine::import_records` 与稳定、可人工检查的文件格式。
 - 导出保留每条记录的全部元信息（`rev`、`created_at`、`updated_at`、`data_version`、墓碑）。

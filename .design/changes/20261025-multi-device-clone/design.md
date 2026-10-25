@@ -14,7 +14,7 @@ S2 的 `backup`/`restore` 保留 `db_id`、`device_id`、key 链与全部同步�
 多设备克隆要解决的是另一个问题：**同一个逻辑库，另一台设备**。所以它不能复用
 `restore` 的身份，必须在副本上生成新身份并重建日志。
 
-## 目标
+## 本阶段范围
 
 - 新增 `Engine::clone_backup`：从备份文件恢复出一个新设备身份的库。
 - 保留：`db_id`、key 链、记录、目录、`meta`（含口令）。
@@ -75,7 +75,7 @@ S2 的 `backup`/`restore` 保留 `db_id`、`device_id`、key 链与全部同步�
 代价是克隆会写 `记录数 + 1` 条日志，大库有一次性 O(记录数) 写入；这与首次
 `enable_sync` 的成本相同。
 
-## API
+## 阶段 API
 
 ```rust
 // shio-core

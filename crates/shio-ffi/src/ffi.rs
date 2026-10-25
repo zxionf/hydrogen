@@ -2013,6 +2013,39 @@ pub unsafe extern "C" fn shio_sync_compact_auto(
     })
 }
 
+/// 解绑一个对端：删除它的游标、当前 key、进度与轮换确认。
+///
+/// # Safety
+///
+/// 句柄、设备 ID 指针与输出指针必须按 `include/shio.h` 的契约有效。
+#[no_mangle]
+pub unsafe extern "C" fn shio_sync_forget_device(
+    handle: *mut ShioKernel,
+    device_id: *const u8,
+    out_json: *mut *mut u8,
+    out_json_len: *mut usize,
+) -> i32 {
+    ffi_guard(|| {
+        reset_output(out_json, out_json_len)?;
+        let record = input_id(device_id)?;
+        let device = DeviceId::from_bytes(*record.as_bytes());
+        // SAFETY: 调用方保证句柄来自 `shio_open` 且未 destroy。
+        let handle =
+            unsafe { handle.as_ref() }.ok_or(Error::InvalidArgument("kernel handle is null"))?;
+        let kernel = handle.kernel()?;
+        let report = handle.block_on(kernel.forget_device(device))?;
+        let value = json!({
+            "device": device.to_string(),
+            "peer_cursor": report.removed_peer_cursor,
+            "current_key": report.removed_current_key,
+            "progress": report.removed_progress,
+            "acks": report.removed_acks,
+            "migrations": report.removed_migrations,
+        });
+        set_output(value_to_bytes(&value)?, out_json, out_json_len)
+    })
+}
+
 /// 生成配对包。
 ///
 /// # Safety

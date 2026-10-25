@@ -19,7 +19,7 @@ use shio_core::store::{
     ImportOptions, ImportReport, Stats,
 };
 #[cfg(feature = "sync")]
-use shio_core::{DeviceId, KeyId, MaintenanceOutcome, MigrationStep};
+use shio_core::{DeviceId, ForgetReport, KeyId, MaintenanceOutcome, MigrationStep};
 #[cfg(feature = "sync")]
 use shio_sync::{PairingOffer, Sync as SyncApi, SyncHandle, SyncInfo};
 use tokio::sync::Notify;
@@ -465,6 +465,16 @@ impl Kernel {
     pub async fn compact_changes_auto(&self) -> Result<u64> {
         self.inner
             .run_write(|engine| SyncApi::new(engine).compact_changes_auto())
+            .await
+    }
+
+    /// 解绑一个对端：删除它的游标、当前 key、进度与轮换确认。
+    ///
+    /// 不删除记录与密钥，也不阻止它重新上线；重新上线后可能需要快照重同步。
+    #[cfg(feature = "sync")]
+    pub async fn forget_device(&self, device: DeviceId) -> Result<ForgetReport> {
+        self.inner
+            .run_write(move |engine| engine.forget_device(device))
             .await
     }
 }

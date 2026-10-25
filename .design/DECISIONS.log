@@ -299,3 +299,8 @@ Change: 20261025-plaintext-tool
 Context: 导出/导入能力只有 Rust 调用方可用；运维与普通用户需要不写代码地导出、校验、预览与统计，而明文落盘是危险操作，不能进入内核默认 API、C ABI 或 Android 包
 Decision: 新增独立 crate/crates/shio-tool 二进制（export/import/verify/stats）：口令只从 --password-stdin、SHIO_PASSWORD 或终端不回显读取，导入必须 --yes（--dry-run 除外），导出覆盖必须 --force 且 stderr 提示明文；verify/stats 复用新增的 shio::verify_export(path, max_value_size)（与导入第一遍同一校验，不打开数据库），退出码 0/1/2；工具不链接 shio-ffi、不进入 Android 构建、不新增 ABI 符号
 Consequences: 用户可以脚本化导出/校验/导入，先 dry-run 再确认；明文工具与内核 API/ABI 解耦，Android 侧若要导出仍需后续单独加 C ABI 或 JNI；rpassword 只作为工具依赖；CLI 测试直接跑真实二进制，每库默认 Argon2id 约 20 秒
+## [61] 2026-10-25 12:49:36 UTC
+Change: 20261025-forget-device
+Context: 自动日志裁剪的已知对端是 cur/ 与 heard/ 的并集，轮换退役与 offer 清理还依赖所有已知设备的 ack/mig；已经退场或卸载的设备不会自己消失，会永久阻止裁剪与退 key，而此前没有解绑入口
+Decision: 新增 forget_device(device)：单个写事务删除 peer/、cur/、heard/，并扫描 ack/ 与 mig/ 按键尾 16 字节匹配删除该设备的全部确认；拒绝解绑本机，未知设备幂等返回全零报告；要求可写且已启用同步（否则 ReadOnly/Busy/SyncDisabled）。不删除记录、密钥、rot/ 或日志，也不阻止设备重新上线：设备回来会重新写 cur/heard，peer 从 0 开始，日志已裁剪时按 SyncResyncRequired 走快照。以增量符号暴露 Engine/Kernel 与 shio_sync_forget_device，ABI 保持 1
+Consequences: 僵尸设备不再永久卡住自动裁剪与 retire_key；解绑是本机单方面遗忘，不通知对端也不是远程撤销，误用于还会回来的设备会让它多做一次全量拉取/快照；解绑后 ack/mig 不再等待该设备，确认它真的不会回来再用；不删除任何记录，数据仍在本地

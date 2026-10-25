@@ -15,7 +15,7 @@
 ## 目标
 - 可嵌入的加密持久化内核：命名空间 → 集合 → 记录，单文件 redb，记录级 AEAD。
 - 内核同步、facade async；两者禁止 unsafe，可恢复失败一律以 `Result` 返回。
-- 当前形态：core 与 facade 均已可用——Argon2id/HKDF/AEAD、redb 表、同步 CRUD、异步句柄、改口令、数据密钥轮换、真正的只读打开；多端同步（format 2、设备配对、变更日志、快照、轮换）已可用；`format=2` 迁移支持批次大小、批次间暂停、旁路进度与批次边界取消；C ABI v1 已可用，覆盖 open/close、CRUD、batch、改口令、轮换、迁移进度/取消、stats、flush 与 P4 同步/配对面。包版本为 `0.2.0`。
+- 当前形态：core 与 facade 均已可用——Argon2id/HKDF/AEAD、redb 表、同步 CRUD、异步句柄、改口令、数据密钥轮换、真正的只读打开；多端同步（format 2、设备配对、变更日志、快照、轮换）已可用；`format=2` 迁移支持批次大小、批次间暂停、旁路进度与批次边界取消；C ABI v1 已可用，覆盖 open/close、CRUD、batch、改口令、轮换、迁移进度/取消、stats、flush 与 P4 同步/配对面。包版本为 `0.3.0`。
 - 记录格式 `format=1` 从首个实现起保持向后兼容；同步库使用不可回退的 `format=2`；API 在 1.0 前允许调整。
 
 ## 约束

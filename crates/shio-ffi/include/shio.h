@@ -452,6 +452,17 @@ int32_t shio_sync_apply_progress(shio_kernel *handle,
 int32_t shio_sync_compact_auto(shio_kernel *handle, uint64_t *out_count);
 
 /*
+ * 解绑一个对端：删除 peer/cur/heard 与 ack/mig 中属于该设备的状态。
+ * 不删除记录、密钥或日志，也不阻止它重新上线；再次上线可能需要快照重同步。
+ * 返回 {"device":"32hex","peer_cursor":bool,"current_key":bool,"progress":bool,
+ *       "acks":N,"migrations":N}。
+ */
+int32_t shio_sync_forget_device(shio_kernel *handle,
+                                const uint8_t *device_id,
+                                uint8_t **out_json,
+                                size_t *out_json_len);
+
+/*
  * 生成配对包；ttl_seconds 仅用于调用方展示/过期控制，0 使用 600 秒；
  * 接收端固定按 10 分钟窗口校验 created_at。
  * out_frame 为 SHW2 外层帧，out_json 为 {"secret":"...","fingerprint":"..."}。

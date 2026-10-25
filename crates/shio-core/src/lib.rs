@@ -32,11 +32,11 @@ pub use store::engine::{
     DEFAULT_IMPORT_BATCH, MAX_IMPORT_BATCH,
 };
 pub use sync::{
-    ApplyReport, ChangeEntry, ChangePage, MaintenanceOutcome, MigrationOptions, MigrationProgress,
-    MigrationStep, OfferPage, PairingOffer, RecordChange, RotationInfo, RotationOffer,
-    SnapshotPage, SnapshotRecord, SyncInfo, DEFAULT_MIGRATION_BATCH_SIZE, DEFAULT_TICK_BATCH_SIZE,
-    DEFAULT_TICK_BUDGET_MS, MAX_MIGRATION_BATCH_SIZE, MAX_MIGRATION_PAUSE_MS, MAX_TICK_BATCH_SIZE,
-    MAX_TICK_BUDGET_MS,
+    ApplyReport, ChangeEntry, ChangePage, ForgetReport, MaintenanceOutcome, MigrationOptions,
+    MigrationProgress, MigrationStep, OfferPage, PairingOffer, RecordChange, RotationInfo,
+    RotationOffer, SnapshotPage, SnapshotRecord, SyncInfo, DEFAULT_MIGRATION_BATCH_SIZE,
+    DEFAULT_TICK_BATCH_SIZE, DEFAULT_TICK_BUDGET_MS, MAX_MIGRATION_BATCH_SIZE,
+    MAX_MIGRATION_PAUSE_MS, MAX_TICK_BATCH_SIZE, MAX_TICK_BUDGET_MS,
 };
 
 /// 内核版本，与 crate 包版本一致（编译期常量）。

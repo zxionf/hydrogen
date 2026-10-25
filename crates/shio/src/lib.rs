@@ -33,7 +33,7 @@ pub use shio_core::store::{
 #[cfg(feature = "sync")]
 pub use shio_core::sync::pairing_fingerprint;
 #[cfg(feature = "sync")]
-pub use shio_core::{DeviceId, KeyId};
+pub use shio_core::{DeviceId, ForgetReport, KeyId};
 #[cfg(feature = "sync")]
 pub use shio_sync::{
     ApplyReport, ChangeEntry, ChangePage, MaintenanceOutcome, MigrationOptions, MigrationProgress,

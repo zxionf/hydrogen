@@ -1333,6 +1333,177 @@ static int transfer_mode(const char *path)
     return 0;
 }
 
+static int forget_mode(const char *path)
+{
+    static const char *PEER_B_PASSWORD = "android-forget-b";
+    static const char *PEER_C_PASSWORD = "android-forget-c";
+    const char *options = "{\"create\":true}";
+    char b_path[1024];
+    char c_path[1024];
+    shio_kernel *a = NULL;
+    shio_kernel *b = NULL;
+    shio_kernel *c = NULL;
+    uint8_t *buf = NULL;
+    size_t len = 0;
+    uint8_t *frame = NULL;
+    size_t frame_len = 0;
+    uint8_t *json = NULL;
+    size_t json_len = 0;
+    uint8_t device_a[16];
+    uint8_t device_c[16];
+    uint64_t cursor = 0;
+    uint64_t removed = 0;
+    int32_t status;
+    char *text = NULL;
+    char *secret = NULL;
+    int i = 0;
+
+    snprintf(b_path, sizeof(b_path), "%s.b", path);
+    snprintf(c_path, sizeof(c_path), "%s.c", path);
+    remove(path);
+    remove(b_path);
+    remove(c_path);
+
+    expect(shio_open(path, (const uint8_t *)PASSWORD, strlen(PASSWORD),
+                     (const uint8_t *)options, strlen(options), &a),
+           "forget open(a)");
+    expect(shio_sync_enable(a, NULL, &buf, &len), "forget enable(a)");
+    text = take_text(buf, len, "forget enable(a)");
+    {
+        char *device = json_string(text, "device_id", "forget enable(a)");
+        uuid_parse(device, device_a, "forget enable(a)");
+        free(device);
+    }
+    free(text);
+
+    for (i = 0; i < 3; i++) {
+        char payload[48];
+        uint8_t id[16];
+        memset(id, 0, sizeof(id));
+        id[0] = 0xd1;
+        id[15] = (uint8_t)i;
+        snprintf(payload, sizeof(payload), "{\"n\":%d}", i);
+        expect(shio_put(a, "vault", "entries", id,
+                        (const uint8_t *)payload, strlen(payload), &buf, &len),
+               "forget put(a)");
+        shio_free(buf, len);
+        buf = NULL;
+        len = 0;
+    }
+
+    /* 配对 B：同一 offer 只用于一次。 */
+    expect(shio_sync_create_pairing(a, 600, &frame, &frame_len, &json, &json_len),
+           "forget pairing(b)");
+    text = take_text(json, json_len, "forget pairing(b)");
+    secret = json_string(text, "secret", "forget pairing(b)");
+    free(text);
+    expect(shio_open_with_pairing(b_path,
+                                  (const uint8_t *)PEER_B_PASSWORD,
+                                  strlen(PEER_B_PASSWORD),
+                                  (const uint8_t *)options, strlen(options),
+                                  frame, frame_len,
+                                  (const uint8_t *)secret, strlen(secret), &b),
+           "forget open(b)");
+    shio_free(frame, frame_len);
+    frame = NULL;
+    frame_len = 0;
+    free(secret);
+    secret = NULL;
+
+    /* 配对 C。 */
+    expect(shio_sync_create_pairing(a, 600, &frame, &frame_len, &json, &json_len),
+           "forget pairing(c)");
+    text = take_text(json, json_len, "forget pairing(c)");
+    secret = json_string(text, "secret", "forget pairing(c)");
+    free(text);
+    expect(shio_open_with_pairing(c_path,
+                                  (const uint8_t *)PEER_C_PASSWORD,
+                                  strlen(PEER_C_PASSWORD),
+                                  (const uint8_t *)options, strlen(options),
+                                  frame, frame_len,
+                                  (const uint8_t *)secret, strlen(secret), &c),
+           "forget open(c)");
+    shio_free(frame, frame_len);
+    frame = NULL;
+    frame_len = 0;
+    free(secret);
+    secret = NULL;
+
+    text = sync_info_text(c, "forget info(c)");
+    {
+        char *device = json_string(text, "device_id", "forget info(c)");
+        uuid_parse(device, device_c, "forget info(c)");
+        free(device);
+    }
+    free(text);
+
+    /* A 应用 B/C 的基线，认识它们的 cur/；B 拉 A 的日志并上报。 */
+    pull_changes(b, a, "forget changes(b->a)");
+    pull_changes(c, a, "forget changes(c->a)");
+    pull_changes(a, b, "forget changes(a->b)");
+    expect(shio_sync_progress_frame(b, device_a, &frame, &frame_len),
+           "forget progress(b)");
+    expect(shio_sync_apply_progress(a, frame, frame_len, &cursor),
+           "forget apply_progress(a)");
+    shio_free(frame, frame_len);
+    frame = NULL;
+    frame_len = 0;
+
+    expect(shio_sync_compact_auto(a, &removed), "forget compact(before)");
+    if (removed != 0) {
+        fprintf(stderr, "forget compact removed %llu before unbind\n",
+                (unsigned long long)removed);
+        return 1;
+    }
+
+    expect(shio_sync_forget_device(a, device_c, &json, &json_len),
+           "forget_device(c)");
+    text = take_text(json, json_len, "forget_device(c)");
+    json = NULL;
+    json_len = 0;
+    contains(text, "\"peer_cursor\":true", "forget_device(c)");
+    contains(text, "\"current_key\":true", "forget_device(c)");
+    contains(text, "\"progress\":false", "forget_device(c)");
+    free(text);
+
+    expect(shio_sync_compact_auto(a, &removed), "forget compact(after)");
+    if (removed == 0) {
+        fprintf(stderr, "forget compact did not advance after unbind\n");
+        return 1;
+    }
+
+    /* 再解绑是幂等成功。 */
+    expect(shio_sync_forget_device(a, device_c, &json, &json_len),
+           "forget_device(c again)");
+    text = take_text(json, json_len, "forget_device(c again)");
+    json = NULL;
+    json_len = 0;
+    contains(text, "\"peer_cursor\":false", "forget_device(c again)");
+    free(text);
+
+    /* 解绑本机被拒绝。 */
+    status = shio_sync_forget_device(a, device_a, &json, &json_len);
+    if (status != SHIO_INVALID_ARGUMENT || json != NULL) {
+        fprintf(stderr, "forget self returned %d\n", (int)status);
+        return 1;
+    }
+
+    printf("forget compact removed: %llu\n",
+           (unsigned long long)removed);
+    printf("FORGET_OK\n");
+
+    expect(shio_close(a), "forget close(a)");
+    shio_kernel_destroy(a);
+    expect(shio_close(b), "forget close(b)");
+    shio_kernel_destroy(b);
+    expect(shio_close(c), "forget close(c)");
+    shio_kernel_destroy(c);
+    remove(path);
+    remove(b_path);
+    remove(c_path);
+    return 0;
+}
+
 static int backup_restore_mode(const char *path)
 {
     shio_kernel *source = NULL;
@@ -1668,7 +1839,7 @@ int main(int argc, char **argv)
                 "usage: %s <database-path> "
                 "[smoke|sync|hold|probe|check|read-hold|read-probe|read-locked|"
                 "rotate-many|resume-rotation|migration-progress|maintenance|"
-                "cooperative|compact|auto-compact|clone|transfer|backup-restore]\n",
+                "cooperative|compact|auto-compact|clone|transfer|forget|backup-restore]\n",
                 argv[0]);
         return 2;
     }
@@ -1757,6 +1928,10 @@ int main(int argc, char **argv)
 
     if (strcmp(mode, "transfer") == 0) {
         return transfer_mode(path);
+    }
+
+    if (strcmp(mode, "forget") == 0) {
+        return forget_mode(path);
     }
 
     if (strcmp(mode, "backup-restore") == 0) {

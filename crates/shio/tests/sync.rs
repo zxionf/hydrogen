@@ -290,3 +290,65 @@ async fn facade_clone_backup_changes_device_identity() {
     a.close().await.unwrap();
     clone.close().await.unwrap();
 }
+
+#[tokio::test]
+async fn facade_forget_device_clears_peer() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = Kernel::open(
+        options(&dir.path().join("a.redb")),
+        Credential::password(PASSWORD),
+    )
+    .await
+    .unwrap();
+    let info_a = a.sync().unwrap().enable_sync(None).unwrap();
+    let notes = a
+        .namespace("notes")
+        .unwrap()
+        .collection::<String>("note")
+        .unwrap();
+    notes
+        .put(RecordId::new_v7(), &"hello".to_owned())
+        .await
+        .unwrap();
+
+    let offer = a
+        .create_pairing_offer(Duration::from_secs(600))
+        .await
+        .unwrap();
+    let b = open_with_pairing(
+        options(&dir.path().join("b.redb")),
+        Credential::password(PASSWORD),
+        &offer,
+        Zeroizing::new(offer.secret.clone()),
+    )
+    .await
+    .unwrap();
+    let info_b = b.sync_info().unwrap();
+
+    // B 拉 A 的日志并上报进度；A 拉 B 的基线认识 B。
+    let page = a.sync().unwrap().changes_since(0, 1000).unwrap();
+    let frame = a.sync().unwrap().encode(&page).unwrap();
+    b.sync().unwrap().apply(&frame).unwrap();
+    let frame = b.sync().unwrap().progress_frame(info_a.device_id).unwrap();
+    assert!(a.apply_sync_progress(frame).await.unwrap() > 0);
+    let page = b.sync().unwrap().changes_since(0, 1000).unwrap();
+    let frame = b.sync().unwrap().encode(&page).unwrap();
+    a.sync().unwrap().apply(&frame).unwrap();
+
+    let report = a.forget_device(info_b.device_id).await.unwrap();
+    assert_eq!(report.device, info_b.device_id);
+    assert!(report.removed_peer_cursor);
+    assert!(report.removed_current_key);
+    assert!(report.removed_progress);
+    assert_eq!(report.removed_acks, 0);
+
+    let again = a.forget_device(info_b.device_id).await.unwrap();
+    assert!(!again.removed_peer_cursor);
+    assert!(matches!(
+        a.forget_device(info_a.device_id).await,
+        Err(Error::InvalidArgument(_))
+    ));
+
+    a.close().await.unwrap();
+    b.close().await.unwrap();
+}

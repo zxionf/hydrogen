@@ -46,6 +46,7 @@ kernel.close().await?;
 - 多设备克隆：`shio::clone_backup(options, credential, backup)` 从备份恢复出**新设备**。保留 `db_id`、key 链与记录，生成新 `device_id`，清理 `peer/`/`cur/`/`heard/`/`migration`/`baseline_key`，以新身份重建完整日志（全部记录 + `CurrentKey`）；未启用同步时只做复制。返回 `(Kernel, CloneInfo)`。
 - 记录导出/导入（**危险**）：`Kernel::export_records` 把逻辑记录写成明文 JSONL（`v64`/`v` 值、`rev`/时间戳/`data_version`/墓碑、SHA-256 与精确计数），`Kernel::import_records` 先完整校验再分批写入，按 `(updated_at, rev)` 做 LWW 合并、用目标库当前 key 重新加密；`dry_run` 只预演。导出文件不含 `db_id`、密钥、日志或游标，**不是备份**。
 - 导出文件校验：`shio::verify_export(path, max_value_size)` 不需要口令或数据库，规则与导入第一遍完全一致（结构、计数、SHA-256）；独立 CLI `crates/shio-tool` 提供 `export`/`import`/`verify`/`stats`，不链接 `shio-ffi`，不进入 Android 构建与 C ABI。
+- 设备解绑：`Kernel::forget_device(device)` 删除该对端的 `peer/`、`cur/`、`heard/`、`ack/`、`mig/` 状态，解除对自动日志裁剪与轮换退役的阻塞；不删记录与密钥，也不阻止它重新上线（回来时按新对端处理，必要时走快照重同步）。
 
 ## 4. 核心类型
 
@@ -477,6 +478,7 @@ C++ 与 Android 通过 `shio-ffi` 调用；契约头文件为 `crates/shio-ffi/i
 - 维护模式同样是增量符号：`shio_sync_begin_maintenance` / `shio_sync_end_maintenance` / `shio_sync_migrate_step`。窗口内普通写返回 `SHIO_BUSY`，读放行；`SHIO_ABI_VERSION` 保持 1。
 - 合作式调度 `shio_sync_migrate_tick` 同样以增量符号追加：不要求维护模式、不冻结写，调用间隙普通读写照常；`SHIO_ABI_VERSION` 保持 1。
 - 自动日志裁剪以增量符号追加：`shio_sync_progress_frame` / `shio_sync_apply_progress` / `shio_sync_compact_auto`；新增 `SHY2` kind=3 进度帧，旧版本会以未知 kind 拒绝该帧，但不会主动收到；`SHIO_ABI_VERSION` 保持 1。
+- 设备解绑以增量符号追加：`shio_sync_forget_device` 删除单个对端的设备级同步状态；不改记录、密钥或日志，`SHIO_ABI_VERSION` 保持 1。
 - 同步业务数据只以不透明的 `SHY2` 帧进出；Kotlin/Java 不解析帧内部结构。同步状态、轮换信息和应用报告是小体积 JSON。
 
 ```c
@@ -626,6 +628,8 @@ int32_t shio_sync_progress_frame(shio_kernel *k, const uint8_t *peer,
 int32_t shio_sync_apply_progress(shio_kernel *k, const uint8_t *frame,
                                  size_t frame_len, uint64_t *out_cursor);
 int32_t shio_sync_compact_auto(shio_kernel *k, uint64_t *out_count);
+int32_t shio_sync_forget_device(shio_kernel *k, const uint8_t *device_id,
+                                uint8_t **out_json, size_t *out_json_len);
 
 /*
  * 生成配对包；ttl_seconds 仅用于调用方展示/过期控制，0 使用 600 秒；
@@ -669,6 +673,7 @@ JSON 形状：
 - `shio_sync_migrate_step` 返回本步的 `{"scanned":N,"migrated":N,"done":bool}`；`done=1` 表示已收尾。取消只影响正在执行的这一步，之后仍可继续步进。
 - `shio_sync_migrate_tick` 返回本次 tick 的 `{"scanned":N,"migrated":N,"done":bool}`；`done=1` 表示已收尾。一次调用在 `budget_ms` 内可跑多批，每批单独提交；调用间隙普通读写不受限，不需要维护模式。`budget_ms` / `max_records` 越界返回 `SHIO_INVALID_ARGUMENT`，只读句柄返回 `SHIO_READ_ONLY`，未启用同步返回 `SHIO_SYNC_DISABLED`。
 - `shio_sync_progress_frame` 生成 77 字节 `SHY2` kind=3 帧（无条目，帧头 `next` = 本机在 `peer` 日志中的已消费游标）；`shio_sync_apply_progress` 校验 `db_id` 后把 `sender`/`cursor` 写入 `heard/<sender>`，`out_cursor` 返回落盘值（可为 NULL）。`shio_sync_compact_auto` 返回删除条数，没有已知对端或缺少报告时返回 0。维护模式返回 `SHIO_BUSY`，未启用同步返回 `SHIO_SYNC_DISABLED`。
+- `shio_sync_forget_device` 删除该设备的 `peer/`/`cur/`/`heard/` 与全部 `ack/<to>/<device>`、`mig/<key>/<device>`，返回 `{"device":"32hex","peer_cursor":bool,"current_key":bool,"progress":bool,"acks":N,"migrations":N}`；解绑本机返回 `SHIO_INVALID_ARGUMENT`，未知设备返回全 `false`/0。只读、维护、未启用同步分别沿用 `SHIO_READ_ONLY`/`SHIO_BUSY`/`SHIO_SYNC_DISABLED`。
 - 维护模式期间 `shio_insert` / `shio_put` / `shio_delete` / `shio_batch` / `shio_change_password` / `shio_rotate_data_key` 等写入口返回 `SHIO_BUSY`；`shio_sync_begin_maintenance` 在只读句柄返回 `SHIO_READ_ONLY`、未启用同步返回 `SHIO_SYNC_DISABLED`。
 - `shio_sync_apply` / `shio_sync_apply_snapshot` 返回 `{"applied":N,"skipped":N,"controls":N}`。
 - `shio_sync_create_pairing` 返回 `{"secret":"<Base32>","fingerprint":"<6 位十六进制>"}`；`secret` 只用于配对展示，不得写日志。
@@ -696,6 +701,7 @@ JSON 形状：
 - `shio.changes`、`shio.sync`、`shio.keys2` 是同步库新增表，旧版本不可见；旧版本也不会写变更日志。
 - 物理压缩只重排 redb 页，不改变记录格式、密钥链或同步状态；压缩前后的库对任何支持的版本都可读。
 - 自动日志裁剪只前移 `log_start` 并删除已确认消费的条目，不改记录、密钥或同步身份；落后于裁剪点的对端收到 `SyncResyncRequired`，按快照流程重同步。
+- 设备解绑只删设备级同步状态（`peer/`/`cur/`/`heard/`/`ack/`/`mig/`），不改记录、密钥、`rot/` 或日志；设备重新上线会重新登记，必要时走快照重同步。
 - 多设备克隆只改设备身份与设备级同步状态，不改记录格式、`db_id`、密钥或口令；克隆出的库可与其他设备（包括源设备）同时启用同步。
 - 记录导出/导入只读写逻辑记录与集合登记：导出是明文快照，不含身份/密钥/日志/游标；导入用目标库当前 key 重新加密，保留源 `rev`/时间戳/`data_version` 与墓碑标志，不改记录格式版本。
 
@@ -964,6 +970,15 @@ pub struct ApplyReport {
     pub controls: usize,
 }
 
+pub struct ForgetReport {
+    pub device: DeviceId,
+    pub removed_peer_cursor: bool,
+    pub removed_current_key: bool,
+    pub removed_progress: bool,
+    pub removed_acks: u64,
+    pub removed_migrations: u64,
+}
+
 pub struct SnapshotPage {
     pub at_seq: u64,
     pub next_key: Option<Vec<u8>>,
@@ -1074,6 +1089,7 @@ impl Engine {
     pub fn peer_cursor(&self, peer: DeviceId) -> Result<Option<u64>>;
     pub fn apply_peer_progress(&self, device: DeviceId, cursor: u64) -> Result<u64>;
     pub fn compact_changes_auto(&self) -> Result<u64>;
+    pub fn forget_device(&self, device: DeviceId) -> Result<ForgetReport>;
 
     pub fn create_pairing_bundle(&self, ttl: Duration) -> Result<Vec<u8>>;
     pub fn create_pairing_bundle_with_secret(
@@ -1098,6 +1114,7 @@ impl Engine {
 - `apply_page` 整页一个写事务，推进 `peer/<sender>` 游标；缺 key 返回 `RotationRequired`。
 - `peer_cursor` 返回本机在对方日志中的已消费游标，供生成进度帧；`apply_peer_progress` 把对方上报的「已读到本机哪一条」写入 `heard/<device>`，单调推进并按 `log_end` 截断。
 - `compact_changes_auto` 在所有已知对端（`cur/` 与 `heard/` 的并集，排除本机）都上报过进度后，裁剪到 `min(heard) + 1`，且至少保留最新一条日志；任一 `cur/` 对端缺报告时返回 0。
+- `forget_device` 单个写事务删除该设备的 `peer/`、`cur/`、`heard/` 并按尾部 16 字节匹配删除全部 `ack/`/`mig/` 键；拒绝解绑本机，未知设备返回全零报告。它只解除本机对该对端的等待，不删除记录/密钥/日志，也不是远程撤销：设备回来会重新写入 `cur/`/`heard/`，`peer/` 从 0 开始，必要时触发快照重同步。
 - `apply_snapshot_page` 同样整页原子，写入的记录日志以本机 `device_id` 为 `writer`；缺 key 返回 `RotationRequired`。
 - `begin_rotation` 任意设备可调用；并发轮换产生不同随机 `to`，写 key 按 `(created_at, key_id)` 收敛。
 - `migrate_all` 重加密记录时推进 `updated_at`（至少 +1），避免旧密钥的同一逻辑版本在 LWW 的 blob 次序里把已迁移记录翻回旧密钥。
@@ -1205,6 +1222,7 @@ impl Kernel {
     pub async fn sync_progress_frame(&self, peer: DeviceId) -> Result<Vec<u8>>;
     pub async fn apply_sync_progress(&self, frame: Vec<u8>) -> Result<u64>;
     pub async fn compact_changes_auto(&self) -> Result<u64>;
+    pub async fn forget_device(&self, device: DeviceId) -> Result<ForgetReport>;
     pub async fn migrate_tick(
         &self,
         to: KeyId,

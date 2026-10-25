@@ -15,10 +15,11 @@ use crate::error::{Error, Result};
 use crate::model::{DeviceId, KeyId, Timestamp};
 use crate::store::{catalog, changes, keys, keys2, meta2, records, sync_state, FORMAT, FORMAT_V2};
 use crate::sync::{
-    ApplyReport, ChangeEntry, ChangePage, MaintenanceOutcome, MigrationOptions, MigrationStep,
-    RecordChange, RotationInfo, RotationOffer, SnapshotPage, SnapshotRecord, SyncInfo,
-    DEFAULT_MIGRATION_BATCH_SIZE, DEFAULT_TICK_BATCH_SIZE, DEFAULT_TICK_BUDGET_MS, MAX_KEY_COUNT,
-    MAX_MIGRATION_BATCH_SIZE, MAX_PAGE_ENTRIES, MAX_TICK_BATCH_SIZE, MAX_TICK_BUDGET_MS,
+    ApplyReport, ChangeEntry, ChangePage, ForgetReport, MaintenanceOutcome, MigrationOptions,
+    MigrationStep, RecordChange, RotationInfo, RotationOffer, SnapshotPage, SnapshotRecord,
+    SyncInfo, DEFAULT_MIGRATION_BATCH_SIZE, DEFAULT_TICK_BATCH_SIZE, DEFAULT_TICK_BUDGET_MS,
+    MAX_KEY_COUNT, MAX_MIGRATION_BATCH_SIZE, MAX_PAGE_ENTRIES, MAX_TICK_BATCH_SIZE,
+    MAX_TICK_BUDGET_MS,
 };
 
 /// 已读取的同步状态。
@@ -163,6 +164,63 @@ impl Engine {
         };
         txn.commit()?;
         Ok(stored)
+    }
+
+    /// 解绑一个对端：删除它在本机的全部设备级同步状态。
+    ///
+    /// 删除 `peer/`、`cur/`、`heard/`、`ack/<to>/<device>` 与 `mig/<key>/<device>`；
+    /// 不删除记录、密钥、`rot/` 或变更日志，也不阻止该设备重新上线。
+    pub fn forget_device(&self, device: DeviceId) -> Result<ForgetReport> {
+        self.require_writable()?;
+        let state = self.read_sync_state()?.ok_or(Error::SyncDisabled)?;
+        if device == state.device {
+            return Err(Error::InvalidArgument("cannot forget the current device"));
+        }
+
+        let txn = self.handle.begin_write()?;
+        let mut report = ForgetReport {
+            device,
+            removed_peer_cursor: false,
+            removed_current_key: false,
+            removed_progress: false,
+            removed_acks: 0,
+            removed_migrations: 0,
+        };
+        {
+            let mut table = txn.open_table(sync_state::TABLE)?;
+            report.removed_peer_cursor =
+                table.remove(sync_state::peer(device).as_slice())?.is_some();
+            report.removed_current_key = table
+                .remove(sync_state::current(device).as_slice())?
+                .is_some();
+            report.removed_progress = table
+                .remove(sync_state::heard(device).as_slice())?
+                .is_some();
+
+            let ack_prefix = sync_state::ack_prefix();
+            let migrated_prefix = sync_state::migrated_prefix();
+            let mut stale: Vec<Vec<u8>> = Vec::new();
+            for item in table.iter()? {
+                let (key, _) = item?;
+                let key = key.value();
+                let is_ack = key.starts_with(ack_prefix) && key.len() == ack_prefix.len() + 32;
+                let is_migrated =
+                    key.starts_with(migrated_prefix) && key.len() == migrated_prefix.len() + 32;
+                if (is_ack || is_migrated) && key.ends_with(device.as_bytes()) {
+                    if is_ack {
+                        report.removed_acks += 1;
+                    } else {
+                        report.removed_migrations += 1;
+                    }
+                    stale.push(key.to_vec());
+                }
+            }
+            for key in &stale {
+                table.remove(key.as_slice())?;
+            }
+        }
+        txn.commit()?;
+        Ok(report)
     }
 
     /// 按对端进度裁剪变更日志；返回删除条数。

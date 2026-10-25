@@ -251,6 +251,23 @@ pub struct ApplyReport {
     pub controls: usize,
 }
 
+/// 设备解绑结果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ForgetReport {
+    /// 被解绑的设备。
+    pub device: DeviceId,
+    /// 是否删除了 `peer/<device>`。
+    pub removed_peer_cursor: bool,
+    /// 是否删除了 `cur/<device>`。
+    pub removed_current_key: bool,
+    /// 是否删除了 `heard/<device>`。
+    pub removed_progress: bool,
+    /// 删除的 `ack/<to>/<device>` 数量。
+    pub removed_acks: u64,
+    /// 删除的 `mig/<key>/<device>` 数量。
+    pub removed_migrations: u64,
+}
+
 /// 一页快照。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SnapshotPage {

@@ -1350,3 +1350,75 @@ fn export_and_import_roundtrip() {
     // SAFETY: 关闭后 destroy，且没有其它线程继续使用。
     unsafe { shio_kernel_destroy(third) };
 }
+
+#[test]
+fn forget_device_clears_peer_state() {
+    let directory = tempfile::tempdir().unwrap();
+    let create = br#"{"create":true}"#;
+    let a = open(&directory.path().join("a.db"), b"forget", create);
+    let info_a = enable_sync(a);
+    let device_a = uuid_bytes(info_a["device_id"].as_str().unwrap());
+    let namespace = CString::new("vault").unwrap();
+    let collection = CString::new("entries").unwrap();
+
+    let (frame, secret) = create_pairing(a);
+    let b = open_with_pairing(&directory.path().join("b.db"), b"forget", &frame, &secret);
+    let info_b = sync_info(b);
+    let device_b = uuid_bytes(info_b["device_id"].as_str().unwrap());
+
+    // A 写一条记录；B 拉 A 的日志并上报进度；A 拉 B 的基线认识 B。
+    insert(a, &namespace, &collection, br#"{"n":1}"#);
+    let (page, next, _) = changes(a, 0);
+    apply(b, &page);
+    let progress = progress_frame(b, &device_a);
+    assert_eq!(apply_progress(a, &progress), next);
+    let (page_b, _, _) = changes(b, 0);
+    apply(a, &page_b);
+
+    let mut json_pointer = ptr::null_mut();
+    let mut json_len = 0;
+    // SAFETY: 句柄、设备 ID 与输出指针有效。
+    let status =
+        unsafe { shio_sync_forget_device(a, device_b.as_ptr(), &mut json_pointer, &mut json_len) };
+    assert_eq!(status, SHIO_OK, "forget failed: {}", last_error());
+    let report = parse(take_buffer(json_pointer, json_len));
+    assert_eq!(report["device"], info_b["device_id"]);
+    assert_eq!(report["peer_cursor"], true);
+    assert_eq!(report["current_key"], true);
+    assert_eq!(report["progress"], true);
+    assert_eq!(report["acks"], 0);
+    assert_eq!(report["migrations"], 0);
+
+    // 解绑本机被拒绝，且不发布摘要。
+    let mut json_pointer = ptr::null_mut();
+    let mut json_len = 0;
+    // SAFETY: 句柄、设备 ID 与输出指针有效。
+    let status =
+        unsafe { shio_sync_forget_device(a, device_a.as_ptr(), &mut json_pointer, &mut json_len) };
+    assert_eq!(status, SHIO_INVALID_ARGUMENT);
+    assert!(json_pointer.is_null());
+
+    // 未知设备是幂等成功。
+    let unknown = [9u8; 16];
+    let mut json_pointer = ptr::null_mut();
+    let mut json_len = 0;
+    // SAFETY: 句柄、设备 ID 与输出指针有效。
+    let status =
+        unsafe { shio_sync_forget_device(a, unknown.as_ptr(), &mut json_pointer, &mut json_len) };
+    assert_eq!(status, SHIO_OK, "forget unknown failed: {}", last_error());
+    let report = parse(take_buffer(json_pointer, json_len));
+    assert_eq!(report["peer_cursor"], false);
+    assert_eq!(report["current_key"], false);
+    assert_eq!(report["progress"], false);
+    assert_eq!(report["acks"], 0);
+    assert_eq!(report["migrations"], 0);
+
+    // SAFETY: 句柄有效。
+    unsafe { shio_close(a) };
+    // SAFETY: 句柄有效。
+    unsafe { shio_close(b) };
+    // SAFETY: 关闭后 destroy，且没有其它线程继续使用。
+    unsafe { shio_kernel_destroy(a) };
+    // SAFETY: 关闭后 destroy，且没有其它线程继续使用。
+    unsafe { shio_kernel_destroy(b) };
+}

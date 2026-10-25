@@ -1301,3 +1301,122 @@ fn clone_backup_rejects_bad_targets() {
     assert!(Engine::clone_backup(&backup, options(&wrong), b"wrong password").is_err());
     assert!(!wrong.exists());
 }
+
+#[test]
+fn forget_device_unblocks_auto_compaction() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = create(&dir.path().join("a.redb"));
+    let info_a = enable(&a);
+    for index in 0..3 {
+        a.put("notes", "note", RecordId::new_v7(), &index, 1)
+            .unwrap();
+    }
+    let b = pair(&a, &dir.path().join("b.redb"));
+    let info_b = b.sync_info().unwrap();
+    let c = pair(&a, &dir.path().join("c.redb"));
+    let info_c = c.sync_info().unwrap();
+
+    // A 应用 B/C 的基线，认识它们的 cur/。
+    for source in [&b, &c] {
+        let page = source.changes_since(0, 1000).unwrap();
+        a.apply_page(&page).unwrap();
+    }
+
+    // B 拉完 A 的日志并上报进度；C 不上报。
+    let mut cursor = 0;
+    drain(&a, &mut cursor, &b);
+    let consumed = b.peer_cursor(info_a.device_id).unwrap().unwrap();
+    a.apply_peer_progress(info_b.device_id, consumed).unwrap();
+    assert_eq!(a.compact_changes_auto().unwrap(), 0);
+
+    let report = a.forget_device(info_c.device_id).unwrap();
+    assert_eq!(report.device, info_c.device_id);
+    assert!(report.removed_peer_cursor);
+    assert!(report.removed_current_key);
+    assert!(!report.removed_progress);
+    assert_eq!(report.removed_acks, 0);
+    assert_eq!(report.removed_migrations, 0);
+    assert!(a.compact_changes_auto().unwrap() > 0);
+}
+
+#[test]
+fn forget_device_clears_rotation_marks() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = create(&dir.path().join("a.redb"));
+    let info_a = enable(&a);
+    for index in 0..3 {
+        a.put("notes", "note", RecordId::new_v7(), &index, 1)
+            .unwrap();
+    }
+    let b = pair(&a, &dir.path().join("b.redb"));
+    let info_b = b.sync_info().unwrap();
+
+    let mut cursor = 0;
+    drain(&a, &mut cursor, &b);
+
+    // A 轮换；B 安装 offer 并 ack；A 应用 B 的 ack。
+    let rotation = a.begin_rotation().unwrap();
+    let old = rotation.from;
+    let to = rotation.to;
+    let mut cursor = b.peer_cursor(info_a.device_id).unwrap().unwrap();
+    drain(&a, &mut cursor, &b);
+    let mut cursor = 0;
+    drain(&b, &mut cursor, &a);
+
+    // B 迁移并公告；A 应用 Migrated。
+    b.migrate_all(to).unwrap();
+    drain(&b, &mut cursor, &a);
+
+    let report = a.forget_device(info_b.device_id).unwrap();
+    assert!(report.removed_peer_cursor);
+    assert!(report.removed_current_key);
+    assert!(report.removed_acks >= 1, "acks: {}", report.removed_acks);
+    assert!(
+        report.removed_migrations >= 1,
+        "migrations: {}",
+        report.removed_migrations
+    );
+
+    // 不再等待 B：A 自己迁移后即可退役旧 key。
+    a.migrate_all(to).unwrap();
+    a.retire_key(old).unwrap();
+}
+
+#[test]
+fn forget_device_guards() {
+    let dir = tempfile::tempdir().unwrap();
+    let plain = create(&dir.path().join("plain.redb"));
+    assert!(matches!(
+        plain.forget_device(DeviceId::from_bytes([1; 16])),
+        Err(Error::SyncDisabled)
+    ));
+
+    let path = dir.path().join("a.redb");
+    let a = create(&path);
+    let info = enable(&a);
+    assert!(matches!(
+        a.forget_device(info.device_id),
+        Err(Error::InvalidArgument(_))
+    ));
+
+    let unknown = DeviceId::from_bytes([9; 16]);
+    let report = a.forget_device(unknown).unwrap();
+    assert_eq!(report.device, unknown);
+    assert!(!report.removed_peer_cursor);
+    assert!(!report.removed_current_key);
+    assert!(!report.removed_progress);
+    assert_eq!(report.removed_acks, 0);
+    assert_eq!(report.removed_migrations, 0);
+    assert!(a.forget_device(unknown).is_ok());
+
+    a.begin_maintenance().unwrap();
+    assert!(matches!(a.forget_device(unknown), Err(Error::Busy)));
+    a.end_maintenance().unwrap();
+    drop(a);
+
+    let read_only = Engine::open(options(&path).read_only(true), PASSWORD).unwrap();
+    assert!(matches!(
+        read_only.forget_device(unknown),
+        Err(Error::ReadOnly)
+    ));
+}

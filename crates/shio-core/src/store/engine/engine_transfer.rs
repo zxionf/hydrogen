@@ -69,13 +69,6 @@ struct ParsedRecord {
     plaintext: Option<Vec<u8>>,
 }
 
-/// 文件校验摘要。
-struct ExportSummary {
-    records: u64,
-    collections: u64,
-    bytes: u64,
-}
-
 /// 单条记录的落库计划。
 struct ApplyPlan {
     rev: u64,
@@ -244,8 +237,9 @@ impl Engine {
 
         // 第一遍：完整校验，同时收集集合登记信息。
         let mut catalogs: BTreeMap<(String, String), i64> = BTreeMap::new();
-        let summary = self.scan_export(
+        let summary = Self::scan_export(
             source,
+            self.max_value_size,
             |namespace, collection, at| {
                 catalogs.insert((namespace.to_owned(), collection.to_owned()), at);
                 Ok(())
@@ -258,8 +252,9 @@ impl Engine {
         let mut applied = 0u64;
         let mut skipped = 0u64;
         let mut deleted = 0u64;
-        self.scan_export(
+        Self::scan_export(
             source,
+            self.max_value_size,
             |_, _, _| Ok(()),
             |record| {
                 batch.push(record);
@@ -300,8 +295,9 @@ impl Engine {
         let mut applied = 0u64;
         let mut skipped = 0u64;
         let mut deleted = 0u64;
-        let summary = self.scan_export(
+        let summary = Self::scan_export(
             source,
+            self.max_value_size,
             |_, _, _| Ok(()),
             |record| {
                 let key =
@@ -334,11 +330,11 @@ impl Engine {
 
     /// 解析并校验导出文件；`on_col`/`on_rec` 只会在校验通过的行上调用。
     fn scan_export<F, G>(
-        &self,
         source: &Path,
+        max_value_size: usize,
         mut on_col: F,
         mut on_rec: G,
-    ) -> Result<ExportSummary>
+    ) -> Result<ExportInfo>
     where
         F: FnMut(&str, &str, i64) -> Result<()>,
         G: FnMut(ParsedRecord) -> Result<()>,
@@ -348,8 +344,9 @@ impl Engine {
         let mut raw = String::new();
         let mut bytes = 0u64;
         let mut records = 0u64;
+        let mut deleted = 0u64;
         let mut collections = 0u64;
-        let mut header = false;
+        let mut format_version = None;
         let mut footer = false;
 
         loop {
@@ -368,7 +365,7 @@ impl Engine {
             }
             match parse_line(line)? {
                 Line::Head { v, fmt, .. } => {
-                    if header {
+                    if format_version.is_some() {
                         return Err(Error::Corrupted("export has a duplicate header"));
                     }
                     if v != EXPORT_VERSION {
@@ -379,10 +376,10 @@ impl Engine {
                             "unsupported source format version in export",
                         ));
                     }
-                    header = true;
+                    format_version = Some(fmt);
                 }
                 Line::Col { ns, col, at } => {
-                    if !header {
+                    if format_version.is_none() {
                         return Err(Error::Corrupted("export is missing its header"));
                     }
                     validate_name(NameKind::Namespace, &ns)?;
@@ -404,7 +401,7 @@ impl Engine {
                     v,
                     v64,
                 } => {
-                    if !header {
+                    if format_version.is_none() {
                         return Err(Error::Corrupted("export is missing its header"));
                     }
                     validate_name(NameKind::Namespace, &ns)?;
@@ -432,7 +429,12 @@ impl Engine {
                                 ))
                             }
                         };
-                        self.check_plaintext_len(value.len())?;
+                        if value.len() > max_value_size {
+                            return Err(Error::ValueTooLarge {
+                                size: value.len(),
+                                max: max_value_size,
+                            });
+                        }
                         Some(value)
                     };
                     hasher.update(line.as_bytes());
@@ -449,9 +451,12 @@ impl Engine {
                         plaintext,
                     })?;
                     records += 1;
+                    if del {
+                        deleted += 1;
+                    }
                 }
                 Line::End { rec, col, sha } => {
-                    if !header {
+                    if format_version.is_none() {
                         return Err(Error::Corrupted("export is missing its header"));
                     }
                     if rec != records || col != collections {
@@ -465,14 +470,16 @@ impl Engine {
             }
         }
 
-        if !header {
+        let Some(format_version) = format_version else {
             return Err(Error::Corrupted("export is empty"));
-        }
+        };
         if !footer {
             return Err(Error::Corrupted("export is truncated"));
         }
-        Ok(ExportSummary {
+        Ok(ExportInfo {
+            format_version,
             records,
+            deleted,
             collections,
             bytes,
         })
@@ -700,6 +707,14 @@ impl Engine {
         }
         Ok(())
     }
+}
+
+/// 校验导出文件并返回摘要；不需要打开数据库。
+///
+/// **危险**：文件本身是明文；本函数只读取并校验，不会产生新文件。
+/// `max_value_size` 用于值长度上限，可传 [`crate::model::DEFAULT_MAX_VALUE_SIZE`]。
+pub fn verify_export(source: &Path, max_value_size: usize) -> Result<ExportInfo> {
+    Engine::scan_export(source, max_value_size, |_, _, _| Ok(()), |_| Ok(()))
 }
 
 fn in_scope(options: &ExportOptions, namespace: &str, collection: &str) -> bool {

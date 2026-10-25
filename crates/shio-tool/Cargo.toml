@@ -1,0 +1,25 @@
+[package]
+name = "shio-tool"
+description = "shio 明文导出/导入命令行工具（危险操作，独立于内核默认 API）"
+edition.workspace = true
+version.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "shio-tool"
+path = "src/main.rs"
+
+[dependencies]
+rpassword = "7"
+serde_json.workspace = true
+shio.workspace = true
+tokio.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

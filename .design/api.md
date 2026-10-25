@@ -45,6 +45,7 @@ kernel.close().await?;
 - 离线物理压缩：`shio::compact_file(path)` 要求没有其它打开的句柄（同进程或其它进程），按独占方式取 `.lock`，冲突返回 `Error::Locked`；不解密、不改格式与身份，返回 `CompactReport { before_bytes, after_bytes, compacted }`。
 - 多设备克隆：`shio::clone_backup(options, credential, backup)` 从备份恢复出**新设备**。保留 `db_id`、key 链与记录，生成新 `device_id`，清理 `peer/`/`cur/`/`heard/`/`migration`/`baseline_key`，以新身份重建完整日志（全部记录 + `CurrentKey`）；未启用同步时只做复制。返回 `(Kernel, CloneInfo)`。
 - 记录导出/导入（**危险**）：`Kernel::export_records` 把逻辑记录写成明文 JSONL（`v64`/`v` 值、`rev`/时间戳/`data_version`/墓碑、SHA-256 与精确计数），`Kernel::import_records` 先完整校验再分批写入，按 `(updated_at, rev)` 做 LWW 合并、用目标库当前 key 重新加密；`dry_run` 只预演。导出文件不含 `db_id`、密钥、日志或游标，**不是备份**。
+- 导出文件校验：`shio::verify_export(path, max_value_size)` 不需要口令或数据库，规则与导入第一遍完全一致（结构、计数、SHA-256）；独立 CLI `crates/shio-tool` 提供 `export`/`import`/`verify`/`stats`，不链接 `shio-ffi`，不进入 Android 构建与 C ABI。
 
 ## 4. 核心类型
 
@@ -155,6 +156,9 @@ pub async fn clone_backup(
     credential: Credential,
     backup: PathBuf,
 ) -> Result<(Kernel, CloneInfo)>;
+
+/// 校验明文导出文件；不需要口令或数据库。
+pub fn verify_export(path: &Path, max_value_size: usize) -> Result<ExportInfo>;
 
 pub struct BackupInfo {
     pub format_version: u16,
@@ -1218,6 +1222,9 @@ pub async fn clone_backup(
     credential: Credential,
     backup: PathBuf,
 ) -> Result<(Kernel, CloneInfo)>;
+
+/// 校验明文导出文件；不需要口令或数据库。
+pub fn verify_export(path: &Path, max_value_size: usize) -> Result<ExportInfo>;
 
 #[cfg(feature = "sync")]
 pub async fn open_with_pairing(

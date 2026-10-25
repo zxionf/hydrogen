@@ -27,8 +27,8 @@ pub use shio_core::model::{
     DEFAULT_LIST_LIMIT, DEFAULT_MAX_VALUE_SIZE, MAX_LIST_LIMIT, MAX_NAME_LEN,
 };
 pub use shio_core::store::{
-    BackupInfo, CloneInfo, CompactReport, ExportInfo, ExportOptions, ImportMode, ImportOptions,
-    ImportReport, Stats, DEFAULT_IMPORT_BATCH, MAX_IMPORT_BATCH,
+    verify_export, BackupInfo, CloneInfo, CompactReport, ExportInfo, ExportOptions, ImportMode,
+    ImportOptions, ImportReport, Stats, DEFAULT_IMPORT_BATCH, MAX_IMPORT_BATCH,
 };
 #[cfg(feature = "sync")]
 pub use shio_core::sync::pairing_fingerprint;

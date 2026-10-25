@@ -294,3 +294,8 @@ Change: 20261025-record-transfer
 Context: 备份与克隆都要求共享 key 链或设备身份，无法把逻辑数据带出或带进不同密钥的库；跨安装/跨系统迁移需要一个可检查、可自校验、与库身份无关的交换格式，而明文落盘本身有泄露风险
 Decision: 新增 JSONL v1 导出/导入：head/col/rec/end 四类行，值用 v64（base64）或 v（UTF-8）二选一，尾部写精确行数与 SHA-256；导出在单个读事务内按编码键序扫描 catalog/records，解密后写同目录临时文件再原子改名，默认不覆盖，文件不含 db_id/密钥/日志/游标；导入先完整校验（结构、名称、UUID、值长度、计数、SHA-256、尾后数据）再第二遍按批写入，Merge 按 (updated_at, rev) 比较、相等时比较明文保证幂等，Replace 取 rev=max(本地+1,源)、updated_at=max(源,本地+1) 并保留本地 created_at，墓碑只在本地已有记录时生效，同步库按本机 device 追加 changes，dry-run 只读；以增量符号暴露 Engine/Kernel 与 shio_export/shio_import，ABI 保持 1；明确标为危险操作，独立 CLI 工具留到后续变更
 Consequences: 数据可跨 format 与跨 key 链迁移，导入可重跑且校验失败不写任何记录；导出文件不是备份，不含身份/密钥/游标，不能替代 backup/clone；导入在同步库中表现为大规模本机写入，日志会增长并靠后续裁剪回收；大库导出持有长读事务、导入两遍 IO；应用仍需自行校验值的业务 schema
+## [60] 2026-10-25 12:05:57 UTC
+Change: 20261025-plaintext-tool
+Context: 导出/导入能力只有 Rust 调用方可用；运维与普通用户需要不写代码地导出、校验、预览与统计，而明文落盘是危险操作，不能进入内核默认 API、C ABI 或 Android 包
+Decision: 新增独立 crate/crates/shio-tool 二进制（export/import/verify/stats）：口令只从 --password-stdin、SHIO_PASSWORD 或终端不回显读取，导入必须 --yes（--dry-run 除外），导出覆盖必须 --force 且 stderr 提示明文；verify/stats 复用新增的 shio::verify_export(path, max_value_size)（与导入第一遍同一校验，不打开数据库），退出码 0/1/2；工具不链接 shio-ffi、不进入 Android 构建、不新增 ABI 符号
+Consequences: 用户可以脚本化导出/校验/导入，先 dry-run 再确认；明文工具与内核 API/ABI 解耦，Android 侧若要导出仍需后续单独加 C ABI 或 JNI；rpassword 只作为工具依赖；CLI 测试直接跑真实二进制，每库默认 Argon2id 约 20 秒

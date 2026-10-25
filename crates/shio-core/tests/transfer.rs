@@ -619,3 +619,36 @@ fn open_engine_can_import_exported_file() {
         "persisted"
     );
 }
+
+#[test]
+fn verify_export_checks_files_without_a_database() {
+    let directory = tempfile::tempdir().unwrap();
+    let source = create(&directory.path().join("source.db"));
+    source
+        .put("vault", "entries", RecordId::new_v7(), &"one", 1)
+        .unwrap();
+    let file = directory.path().join("one.jsonl");
+    let info = export(&source, &file, &ExportOptions::default());
+
+    let verified = shio_core::store::verify_export(&file, shio_core::model::DEFAULT_MAX_VALUE_SIZE)
+        .expect("verify export");
+    assert_eq!(verified, info);
+
+    let text = std::fs::read_to_string(&file).unwrap();
+    let lines: Vec<&str> = text.lines().collect();
+    let truncated = directory.path().join("truncated.jsonl");
+    std::fs::write(&truncated, lines[..lines.len() - 1].join("\n") + "\n").unwrap();
+    assert!(matches!(
+        shio_core::store::verify_export(&truncated, shio_core::model::DEFAULT_MAX_VALUE_SIZE),
+        Err(Error::Corrupted(_))
+    ));
+
+    assert!(matches!(
+        shio_core::store::verify_export(&file, 1),
+        Err(Error::ValueTooLarge { .. })
+    ));
+    assert!(matches!(
+        shio_core::store::verify_export(&directory.path().join("missing.jsonl"), 1024),
+        Err(Error::NotFound) | Err(Error::Io(_))
+    ));
+}

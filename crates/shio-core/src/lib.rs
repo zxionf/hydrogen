@@ -27,9 +27,9 @@ pub mod sync;
 pub use error::{Error, Result};
 pub use model::{DeviceId, KeyId};
 pub use store::engine::{
-    BackupInfo, CloneInfo, CompactReport, Engine, EngineOptions, ExportInfo, ExportOptions,
-    ImportMode, ImportOptions, ImportReport, RawWriteOp, Stats, DEFAULT_IMPORT_BATCH,
-    MAX_IMPORT_BATCH,
+    verify_export, BackupInfo, CloneInfo, CompactReport, Engine, EngineOptions, ExportInfo,
+    ExportOptions, ImportMode, ImportOptions, ImportReport, RawWriteOp, Stats,
+    DEFAULT_IMPORT_BATCH, MAX_IMPORT_BATCH,
 };
 pub use sync::{
     ApplyReport, ChangeEntry, ChangePage, MaintenanceOutcome, MigrationOptions, MigrationProgress,

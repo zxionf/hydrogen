@@ -42,6 +42,8 @@ mod engine_sync;
 mod engine_transfer;
 mod pairing;
 
+pub use engine_transfer::verify_export;
+
 /// 轮换时每个写事务迁移的记录条数。
 const ROTATE_BATCH: usize = 256;
 
@@ -184,16 +186,16 @@ pub struct ExportOptions {
     pub overwrite: bool,
 }
 
-/// 导出结果摘要。
+/// 导出/校验结果摘要。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ExportInfo {
-    /// 源库格式版本。
+    /// 源库（或文件头）的格式版本。
     pub format_version: u16,
-    /// 写出的记录行数。
+    /// 记录行数。
     pub records: u64,
-    /// 写出的墓碑行数（`include_deleted=false` 时恒为 0）。
+    /// 墓碑行数（`include_deleted=false` 时恒为 0）。
     pub deleted: u64,
-    /// 写出的集合行数。
+    /// 集合行数。
     pub collections: u64,
     /// 导出文件字节数。
     pub bytes: u64,

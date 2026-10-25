@@ -6,6 +6,7 @@ sele CLI用于管理 `.design/` 与 `.agent/` 目录的 C++20 命令行工具，
 
 - `cargo build --workspace` 构建全部 crate；产物在 `target/`，已加入 `.gitignore`。
 - `cargo run -p shio --example notes` 运行最小示例（临时库，结束即删除）。
+- `cargo run -p shio-tool -- verify <file>`（以及 `export`/`import`/`stats`）是独立 CLI；`cargo test -p shio-tool` 用真实二进制跑端到端，约 20 秒（每库默认 Argon2id）。
 - `cargo test --workspace`：全部单元/集成/冒烟用例（含 shio-ffi 的 C ABI 同步、并发与错误边界用例）。
 - facade 端到端用默认 Argon2id 参数（64 MiB、t=3），5 个用例约 13 秒；不要在这一层加更多建库用例，参数下调放到 core 测试。
 - 提交前必过：`cargo fmt --all -- --check` 与 `cargo clippy --workspace --all-targets -- -D warnings`。
@@ -39,6 +40,7 @@ sele CLI用于管理 `.design/` 与 `.agent/` 目录的 C++20 命令行工具，
 - 自动日志裁剪：拉取方用 `Sync::progress_frame(peer)` / `Kernel::sync_progress_frame` 生成 `SHY2` kind=3 帧，持有方用 `Sync::apply_progress` / `Kernel::apply_sync_progress` 记到 `heard/<device>`；随后 `compact_changes_auto()` 才裁剪。手动 `compact_changes(before)` 保留。
 - 多设备克隆：`shio::clone_backup(options, credential, backup)` 是自由函数（不是 `Kernel` 方法），从备份恢复出新设备；保留 `db_id`/key 链/记录，换新 `device_id`，清理 `peer/`/`cur/`/`heard/`/`migration`/`baseline_key` 并按新身份重建完整日志。要与源设备同时同步时必须用它，不要用 `restore`（`restore` 保留身份）。
 - 记录导出/导入（危险）：`Kernel::export_records(target, ExportOptions)` 写明文 JSONL，`Kernel::import_records(source, ImportOptions)` 先完整校验再按批写入；C ABI 为 `shio_export` / `shio_import`。导出文件不含 `db_id`、密钥、日志或游标，**不能当备份用**。
+- 导出文件校验：`shio::verify_export(path, DEFAULT_MAX_VALUE_SIZE)` 不需要口令或数据库；独立 CLI `crates/shio-tool` 的 `verify` / `stats` 直接复用，`stats` 再按 `(namespace, collection)` 汇总记录与墓碑数。
 
 ## 踩坑
 
@@ -83,6 +85,9 @@ sele CLI用于管理 `.design/` 与 `.agent/` 目录的 C++20 命令行工具，
 - Merge 在 `(updated_at, rev)` 相等时按明文字节序决定；`Replace` 只压过本地副本（`rev = max(本地+1, 源)`、`updated_at = max(源, 本地+1)`），对端更晚的版本仍会在同步时胜出。
 - 墓碑只在本地已有同 ID 记录时生效；`include_deleted=false` 的导出不会删除目标库里的记录。
 - 导入走普通写入路径：同步库会为每条记录追加 `shio.changes`，大文件导入后日志会显著增长，靠后续裁剪回收；超限值按目标库 `max_value_size` 返回 `ValueTooLarge`，不是 `Corrupted`。
+- 工具口令只从 `--password-stdin`、`SHIO_PASSWORD` 或终端不回显读取，**不要**把口令放进 argv（`ps` 可见）；脚本用 `--password-stdin`。
+- `shio-tool import` 没有 `--yes` 时退出码 2，先用 `--dry-run` 预览；`--dry-run` 是只读的，只读库也能跑。
+- `shio-tool` 是独立二进制：不链接 `shio-ffi`、不进入 Android 构建、不新增 ABI 符号；`verify_export` 只是 core/facade API。
 - 恢复只接受不存在或 0 字节目标；先 `fs::copy` 到临时文件，用原口令只读打开完成 key check/结构校验，再移除空目标并 `rename`，最后按调用方选项重新打开。最终打开失败会删除目标；错误口令/损坏备份不会发布目标。
 - facade 的 `Kernel::restore` 强制 `create=false`，并在 Android 上先取得目标 `.lock` 独占锁；恢复后的库保留源 `db_id`/`device_id`/key 链/同步游标，仅用于同设备恢复——第二台设备要用 `clone_backup`。
 - `change_password` 的 `Busy` 判定要放在派生新 KEK 之前，避免白跑一次 Argon2id。
@@ -123,6 +128,7 @@ sele CLI用于管理 `.design/` 与 `.agent/` 目录的 C++20 命令行工具，
 - 自动日志裁剪：`auto-compact` 模式在同进程内配对两个库，B 拉完 A 的日志后上报进度（cursor=5），A 裁剪掉 4 条并保留最新一条（`log_start=log_end=5`）；落后游标返回 `SHIO_SYNC_RESYNC_REQUIRED`。x86_64 模拟器与 arm64 真机均输出 `AUTO_COMPACT_OK`；同轮回归 `smoke`/`sync`/`migration-progress`/`maintenance`/`cooperative`/`compact`/`backup-restore` 全部退出码 0。
 - 多设备克隆：`clone` 模式写入 3 条记录后备份，`shio_clone_backup` 产出新库；`device_id` 变化、`db_id` 不变、`log_start=1`、`log_end=4`（3 条记录 + `CurrentKey`），记录可读。x86_64 模拟器输出 `CLONE_OK`（arm64 真机当轮未连接，待补跑）；同轮回归 `smoke`/`sync`/`migration-progress`/`maintenance`/`cooperative`/`compact`/`auto-compact`/`backup-restore` 全部退出码 0。
 - 记录导出/导入：`transfer` 模式写 3 条记录（含 1 条墓碑）→ `shio_export` 摘要 `records=3`、`deleted=1`、`collections=1`，重复导出返回 `SHIO_INVALID_ARGUMENT`；新库 `shio_import` 得到 `applied=2`、`skipped=1`，墓碑读回 `SHIO_NOT_FOUND`；dry-run 报告 `applied=2` 且目标库仍为空。x86_64 模拟器输出 `TRANSFER_OK`（arm64 真机当轮未连接，待补跑）；同轮 `smoke`/`sync`/`migration-progress`/`maintenance`/`cooperative`/`compact`/`auto-compact`/`clone`/`backup-restore` 回归全部退出码 0。
+- 独立 CLI：`cargo run -p shio-tool -- export <db> --out <file>`、`import <db> <file> --yes`、`verify <file>`、`stats <file>`；口令只从 `--password-stdin`、`SHIO_PASSWORD` 或终端提示读取，不进 argv；导入必须 `--yes`（`--dry-run` 除外），导出覆盖必须 `--force`，stderr 始终提示明文；退出码 0/1/2。集成测试用 `CARGO_BIN_EXE_shio-tool` 覆盖往返、幂等、dry-run 不写、覆盖保护、错误口令、截断/篡改与 `--password-stdin`。
 - 合作式调度：`cooperative` 模式写入 18 条记录并发起轮换，`shio_sync_migrate_tick(kernel, to, 1, 4, ...)` 首次只推进一批；随后直接 `shio_put` 写入中间记录并读回（不进维护模式、写不被拒绝），继续 tick 到 `done=1`，检查进度 `active=false`/`done=true`、首尾记录可读，最后断言 `budget_ms=1001` 与 `max_records=257` 返回 `SHIO_INVALID_ARGUMENT`。x86_64 模拟器 `emulator-5554`、arm64 真机 `10AE4N38SA000LK` 均输出 `COOPERATIVE_OK`。
 - 轮换中断：`rotate-many` 建 60000 条记录后打印 `ROTATE_START` 再执行 `shio_rotate_data_key`；外部在启动后 `kill -9`，随后 `resume-rotation` 读取 `shio_sync_rotation_state` 的 `to`，用 `shio_sync_migrate_all_ex` 续跑并读首尾记录、写入新记录，输出 `ROTATE_RESUME_OK`。
 - 备份恢复：`backup-restore` 模式在 `format=2` 源库写入记录并 `sync_enable`，调用 `shio_backup` 检查摘要，拒绝已存在备份目标和非空恢复目标，错误口令返回 `SHIO_INVALID_KEY` 且不建目标；随后 `shio_restore` 打开目标、读取原记录并比较 `db_id`/`device_id`。x86_64 模拟器输出 `BACKUP_RESTORE_OK`。

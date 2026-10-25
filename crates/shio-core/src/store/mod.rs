@@ -15,9 +15,9 @@ pub mod records;
 pub mod sync_state;
 
 pub use engine::{
-    BackupInfo, CloneInfo, CompactReport, Engine, EngineOptions, ExportInfo, ExportOptions,
-    ImportMode, ImportOptions, ImportReport, RawWriteOp, Stats, DEFAULT_IMPORT_BATCH,
-    MAX_IMPORT_BATCH,
+    verify_export, BackupInfo, CloneInfo, CompactReport, Engine, EngineOptions, ExportInfo,
+    ExportOptions, ImportMode, ImportOptions, ImportReport, RawWriteOp, Stats,
+    DEFAULT_IMPORT_BATCH, MAX_IMPORT_BATCH,
 };
 
 /// 当前默认写出的数据库格式版本。

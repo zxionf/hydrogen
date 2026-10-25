@@ -342,3 +342,76 @@ async fn compact_file_requires_closed_handles_and_keeps_data() {
         Err(Error::NotFound)
     ));
 }
+
+#[tokio::test]
+async fn export_and_import_roundtrip() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = Kernel::open(
+        create(&dir.path().join("source.redb")),
+        Credential::password(PASSWORD),
+    )
+    .await
+    .unwrap();
+    let notes = collection(&source);
+    let id = RecordId::new_v7();
+    notes.insert(&note("明文导出")).await.unwrap();
+    notes.put(id, &note("second")).await.unwrap();
+
+    let file = dir.path().join("notes.jsonl");
+    let info = source
+        .export_records(file.clone(), shio::ExportOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(info.records, 2);
+    assert_eq!(info.deleted, 0);
+
+    let target = Kernel::open(
+        create(&dir.path().join("target.redb")),
+        Credential::password(PASSWORD),
+    )
+    .await
+    .unwrap();
+    let target_notes = collection(&target);
+    let preview = target
+        .import_records(
+            file.clone(),
+            shio::ImportOptions {
+                dry_run: true,
+                ..shio::ImportOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(preview.applied, 2);
+    assert!(target_notes.get(&id).await.unwrap().is_none());
+
+    let report = target
+        .import_records(file.clone(), shio::ImportOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(report.applied, 2);
+    assert_eq!(
+        target_notes.get(&id).await.unwrap().unwrap().value,
+        note("second")
+    );
+    assert_eq!(
+        target_notes
+            .list(ListOptions::default())
+            .await
+            .unwrap()
+            .items
+            .len(),
+        2
+    );
+
+    // 目标已存在时默认不覆盖。
+    assert!(matches!(
+        source
+            .export_records(file, shio::ExportOptions::default())
+            .await,
+        Err(Error::InvalidArgument(_))
+    ));
+
+    source.close().await.unwrap();
+    target.close().await.unwrap();
+}

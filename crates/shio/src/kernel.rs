@@ -14,7 +14,10 @@ use std::time::Duration;
 
 use secrecy::{ExposeSecret, SecretString};
 use shio_core::model::{validate_name, NameKind, DEFAULT_MAX_VALUE_SIZE};
-use shio_core::store::{BackupInfo, CloneInfo, CompactReport, Engine, EngineOptions, Stats};
+use shio_core::store::{
+    BackupInfo, CloneInfo, CompactReport, Engine, EngineOptions, ExportInfo, ExportOptions,
+    ImportOptions, ImportReport, Stats,
+};
 #[cfg(feature = "sync")]
 use shio_core::{DeviceId, KeyId, MaintenanceOutcome, MigrationStep};
 #[cfg(feature = "sync")]
@@ -282,6 +285,32 @@ impl Kernel {
     /// 在线备份到 `target`；目标必须不存在。
     pub async fn backup(&self, target: PathBuf) -> Result<BackupInfo> {
         self.inner.run(move |engine| engine.backup(&target)).await
+    }
+
+    /// 把逻辑记录导出为明文 JSONL。
+    ///
+    /// **危险**：输出文件包含全部记录值的明文；请自行控制落盘位置、权限与清理。
+    pub async fn export_records(
+        &self,
+        target: PathBuf,
+        options: ExportOptions,
+    ) -> Result<ExportInfo> {
+        self.inner
+            .run(move |engine| engine.export_records(&target, &options))
+            .await
+    }
+
+    /// 从明文 JSONL 导入记录。
+    ///
+    /// 先完整校验（结构、计数、SHA-256），再分批写入；`dry_run` 只预演。
+    pub async fn import_records(
+        &self,
+        source: PathBuf,
+        options: ImportOptions,
+    ) -> Result<ImportReport> {
+        self.inner
+            .run(move |engine| engine.import_records(&source, &options))
+            .await
     }
 
     /// 从 `backup` 恢复到 `options.path`，并返回已打开的目标句柄。

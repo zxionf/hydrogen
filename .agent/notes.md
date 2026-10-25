@@ -38,6 +38,7 @@ sele CLI用于管理 `.design/` 与 `.agent/` 目录的 C++20 命令行工具，
 - 离线物理压缩：`shio::compact_file(PathBuf)` 是自由函数（不是 `Kernel` 方法），要求先关闭所有句柄；内部取 `.lock` 独占，句柄未关返回 `Locked`。返回 `CompactReport { before_bytes, after_bytes, compacted }`，不需要口令。
 - 自动日志裁剪：拉取方用 `Sync::progress_frame(peer)` / `Kernel::sync_progress_frame` 生成 `SHY2` kind=3 帧，持有方用 `Sync::apply_progress` / `Kernel::apply_sync_progress` 记到 `heard/<device>`；随后 `compact_changes_auto()` 才裁剪。手动 `compact_changes(before)` 保留。
 - 多设备克隆：`shio::clone_backup(options, credential, backup)` 是自由函数（不是 `Kernel` 方法），从备份恢复出新设备；保留 `db_id`/key 链/记录，换新 `device_id`，清理 `peer/`/`cur/`/`heard/`/`migration`/`baseline_key` 并按新身份重建完整日志。要与源设备同时同步时必须用它，不要用 `restore`（`restore` 保留身份）。
+- 记录导出/导入（危险）：`Kernel::export_records(target, ExportOptions)` 写明文 JSONL，`Kernel::import_records(source, ImportOptions)` 先完整校验再按批写入；C ABI 为 `shio_export` / `shio_import`。导出文件不含 `db_id`、密钥、日志或游标，**不能当备份用**。
 
 ## 踩坑
 
@@ -76,6 +77,12 @@ sele CLI用于管理 `.design/` 与 `.agent/` 目录的 C++20 命令行工具，
 - 克隆保留 `rot/`/`ack/`/`mig/`/`upgrade`，只清设备级状态；清掉 `rot/` 会让缺新 key 的对端收到 `RotationRequired` 后无处取 offer。
 - 克隆清空 `peer/` 后，对端日志可能已经被压缩，首次拉取会拿到 `SyncResyncRequired`，需要走快照重同步；这是「新设备从零开始」的正常代价。
 - 克隆不改口令、不重新加密、不换 `db_id`；`options.create`/`read_only` 被忽略，返回的句柄可写。
+- 导出文件是明文：记录值、名称、ID、`rev` 与时间戳全部可见；先写同目录临时文件再原子改名，`overwrite=false` 时目标已存在直接 `InvalidArgument`。
+- 导出的完整性靠尾部 SHA-256 + 精确行数：任何一行被改动都会在校验阶段失败；要改内容就重新导出，不要手改 `end`。
+- 导入先完整扫描再写，校验失败不会动库；批内原子、整体非原子，重跑靠 LWW 与明文比较收敛（相同内容不会重复写）。
+- Merge 在 `(updated_at, rev)` 相等时按明文字节序决定；`Replace` 只压过本地副本（`rev = max(本地+1, 源)`、`updated_at = max(源, 本地+1)`），对端更晚的版本仍会在同步时胜出。
+- 墓碑只在本地已有同 ID 记录时生效；`include_deleted=false` 的导出不会删除目标库里的记录。
+- 导入走普通写入路径：同步库会为每条记录追加 `shio.changes`，大文件导入后日志会显著增长，靠后续裁剪回收；超限值按目标库 `max_value_size` 返回 `ValueTooLarge`，不是 `Corrupted`。
 - 恢复只接受不存在或 0 字节目标；先 `fs::copy` 到临时文件，用原口令只读打开完成 key check/结构校验，再移除空目标并 `rename`，最后按调用方选项重新打开。最终打开失败会删除目标；错误口令/损坏备份不会发布目标。
 - facade 的 `Kernel::restore` 强制 `create=false`，并在 Android 上先取得目标 `.lock` 独占锁；恢复后的库保留源 `db_id`/`device_id`/key 链/同步游标，仅用于同设备恢复——第二台设备要用 `clone_backup`。
 - `change_password` 的 `Busy` 判定要放在派生新 KEK 之前，避免白跑一次 Argon2id。
@@ -104,7 +111,7 @@ sele CLI用于管理 `.design/` 与 `.agent/` 目录的 C++20 命令行工具，
 
 - AVD：`shio_x86_64`，系统镜像 `system-images;android-35;google_apis;x86_64`；Emulator 37.2.12。Linux 开发机上当前 AVD 为 `Medium_Phone`（x86_64、Android 17），另有一台 arm64 真机 `10AE4N38SA000LK`（Android 16）。
 - NDK：`ANDROID_HOME=/home/zxionf/Android/Sdk`，`NDK_HOME=/home/zxionf/Android/Sdk/ndk/29.0.14206865`（另有 30.0.14904198）；`rustup target` 已装 `aarch64-linux-android` 与 `x86_64-linux-android`。
-- Harness：`crates/shio-ffi/examples/android_smoke.c`，模式 `smoke`、`sync`、`hold`、`probe`、`check`、`read-hold`、`read-probe`、`read-locked`、`rotate-many`、`resume-rotation`、`migration-progress`、`maintenance`、`cooperative`、`compact`、`auto-compact`、`clone`、`backup-restore`。用 NDK 的 `x86_64-linux-android24-clang` 编译，与 `libshio_ffi.so` 一起 push 到 `/data/local/tmp/shio-smoke`，运行时设 `LD_LIBRARY_PATH=.`。
+- Harness：`crates/shio-ffi/examples/android_smoke.c`，模式 `smoke`、`sync`、`hold`、`probe`、`check`、`read-hold`、`read-probe`、`read-locked`、`rotate-many`、`resume-rotation`、`migration-progress`、`maintenance`、`cooperative`、`compact`、`auto-compact`、`clone`、`transfer`、`backup-restore`。用 NDK 的 `x86_64-linux-android24-clang` 编译，与 `libshio_ffi.so` 一起 push 到 `/data/local/tmp/shio-smoke`，运行时设 `LD_LIBRARY_PATH=.`。
 - 结果：`smoke` 输出 `ANDROID_SMOKE_OK`，覆盖 create/open、stats、insert/get/put/list/batch/delete、close/重开、改口令、轮换、只读拒写；同进程第二写者返回 `SHIO_LOCKED`。
 - 跨进程锁：`hold` 模式持锁 20 秒，另一进程 `probe` 输出 `PROBE_LOCKED`；`kill -9 $(pidof android_smoke)` 后 `check` 输出 `CHECK_OK`，确认锁随进程退出释放且库可重开。
 - 只读并发：写者持锁时 `read-locked` 输出 `READ_LOCKED`；`read-hold` 持共享锁时 `probe` 输出 `PROBE_LOCKED`、`read-probe` 输出 `READ_PROBE_OK`。若写者被 `kill -9`，redb 可能先要求写句柄修复，直接只读打开会返回 `Database repair aborted`；先跑一次 `check`（写打开）再只读即可。
@@ -115,6 +122,7 @@ sele CLI用于管理 `.design/` 与 `.agent/` 目录的 C++20 命令行工具，
 - 物理压缩：`compact` 模式写入 40 条并删除 39 条，句柄未关闭时 `shio_compact_file` 返回 `SHIO_LOCKED` 且不产生缓冲区；关闭后压缩把文件从 86016 字节收缩到 57344 字节，连续压缩返回 `compacted=0`，重开后保留记录可读并可继续写入。x86_64 模拟器 `emulator-5554` 与 arm64 真机 `10AE4N38SA000LK` 均输出 `COMPACT_OK`。
 - 自动日志裁剪：`auto-compact` 模式在同进程内配对两个库，B 拉完 A 的日志后上报进度（cursor=5），A 裁剪掉 4 条并保留最新一条（`log_start=log_end=5`）；落后游标返回 `SHIO_SYNC_RESYNC_REQUIRED`。x86_64 模拟器与 arm64 真机均输出 `AUTO_COMPACT_OK`；同轮回归 `smoke`/`sync`/`migration-progress`/`maintenance`/`cooperative`/`compact`/`backup-restore` 全部退出码 0。
 - 多设备克隆：`clone` 模式写入 3 条记录后备份，`shio_clone_backup` 产出新库；`device_id` 变化、`db_id` 不变、`log_start=1`、`log_end=4`（3 条记录 + `CurrentKey`），记录可读。x86_64 模拟器输出 `CLONE_OK`（arm64 真机当轮未连接，待补跑）；同轮回归 `smoke`/`sync`/`migration-progress`/`maintenance`/`cooperative`/`compact`/`auto-compact`/`backup-restore` 全部退出码 0。
+- 记录导出/导入：`transfer` 模式写 3 条记录（含 1 条墓碑）→ `shio_export` 摘要 `records=3`、`deleted=1`、`collections=1`，重复导出返回 `SHIO_INVALID_ARGUMENT`；新库 `shio_import` 得到 `applied=2`、`skipped=1`，墓碑读回 `SHIO_NOT_FOUND`；dry-run 报告 `applied=2` 且目标库仍为空。x86_64 模拟器输出 `TRANSFER_OK`（arm64 真机当轮未连接，待补跑）；同轮 `smoke`/`sync`/`migration-progress`/`maintenance`/`cooperative`/`compact`/`auto-compact`/`clone`/`backup-restore` 回归全部退出码 0。
 - 合作式调度：`cooperative` 模式写入 18 条记录并发起轮换，`shio_sync_migrate_tick(kernel, to, 1, 4, ...)` 首次只推进一批；随后直接 `shio_put` 写入中间记录并读回（不进维护模式、写不被拒绝），继续 tick 到 `done=1`，检查进度 `active=false`/`done=true`、首尾记录可读，最后断言 `budget_ms=1001` 与 `max_records=257` 返回 `SHIO_INVALID_ARGUMENT`。x86_64 模拟器 `emulator-5554`、arm64 真机 `10AE4N38SA000LK` 均输出 `COOPERATIVE_OK`。
 - 轮换中断：`rotate-many` 建 60000 条记录后打印 `ROTATE_START` 再执行 `shio_rotate_data_key`；外部在启动后 `kill -9`，随后 `resume-rotation` 读取 `shio_sync_rotation_state` 的 `to`，用 `shio_sync_migrate_all_ex` 续跑并读首尾记录、写入新记录，输出 `ROTATE_RESUME_OK`。
 - 备份恢复：`backup-restore` 模式在 `format=2` 源库写入记录并 `sync_enable`，调用 `shio_backup` 检查摘要，拒绝已存在备份目标和非空恢复目标，错误口令返回 `SHIO_INVALID_KEY` 且不建目标；随后 `shio_restore` 打开目标、读取原记录并比较 `db_id`/`device_id`。x86_64 模拟器输出 `BACKUP_RESTORE_OK`。
@@ -128,7 +136,7 @@ sele CLI用于管理 `.design/` 与 `.agent/` 目录的 C++20 命令行工具，
 - 导出：`shio_abi_version`、`shio_last_error`、`shio_open`、`shio_close`、`shio_kernel_destroy`、`shio_free`、`shio_insert`、`shio_put`、`shio_get`、`shio_delete`、`shio_purge`、`shio_list`、`shio_collections`、`shio_batch`、`shio_change_password`、`shio_rotate_data_key`、`shio_flush`、`shio_stats`。
 - `shio_purge` 是物理删除（facade `Collection::purge`）：`shio_delete` 只写墓碑；同步启用后物理删除返回 `SHIO_SYNC_ENABLED`，记录不存在时返回成功且 `out_existed=0`。
 - `shio_collections` 返回命名空间下已登记集合名，JSON 字符串数组、按名称升序；未写入过任何集合时返回 `[]`。
-- P4 追加 18 个同步/配对符号：`shio_sync_enable/info/changes/apply/offers/apply_offers/snapshot_start/snapshot_page/apply_snapshot/begin_rotation/rotation_state/ack_rotation/migrate_all/retire/prune_offers/compact/create_pairing` 与 `shio_open_with_pairing`；S1 再追加 `shio_sync_migrate_all_ex`、`shio_sync_migration_progress`、`shio_sync_cancel_migration` 与错误码 `SHIO_CANCELLED(-23)`；S2 追加 `shio_backup`、`shio_restore`；维护模式追加 `shio_sync_begin_maintenance`、`shio_sync_end_maintenance`、`shio_sync_migrate_step`（窗口内普通写返回 `SHIO_BUSY`，步进返回 `{"scanned","migrated","done"}`）；合作式调度追加 `shio_sync_migrate_tick`（时间预算内多批推进，不冻结写）；物理压缩追加 `shio_compact_file`（离线整理空闲页，不需要句柄）；自动日志裁剪追加 `shio_sync_progress_frame`、`shio_sync_apply_progress`、`shio_sync_compact_auto`（`SHY2` kind=3 进度帧 + `heard/<device>`）；多设备克隆追加 `shio_clone_backup`（换 `device_id` 并重建日志，返回句柄与摘要 JSON）。完整签名见 `include/shio.h` 与 `.design/api.md` §8。ABI 版本仍为 1（只增符号）。
+- P4 追加 18 个同步/配对符号：`shio_sync_enable/info/changes/apply/offers/apply_offers/snapshot_start/snapshot_page/apply_snapshot/begin_rotation/rotation_state/ack_rotation/migrate_all/retire/prune_offers/compact/create_pairing` 与 `shio_open_with_pairing`；S1 再追加 `shio_sync_migrate_all_ex`、`shio_sync_migration_progress`、`shio_sync_cancel_migration` 与错误码 `SHIO_CANCELLED(-23)`；S2 追加 `shio_backup`、`shio_restore`；维护模式追加 `shio_sync_begin_maintenance`、`shio_sync_end_maintenance`、`shio_sync_migrate_step`（窗口内普通写返回 `SHIO_BUSY`，步进返回 `{"scanned","migrated","done"}`）；合作式调度追加 `shio_sync_migrate_tick`（时间预算内多批推进，不冻结写）；物理压缩追加 `shio_compact_file`（离线整理空闲页，不需要句柄）；自动日志裁剪追加 `shio_sync_progress_frame`、`shio_sync_apply_progress`、`shio_sync_compact_auto`（`SHY2` kind=3 进度帧 + `heard/<device>`）；多设备克隆追加 `shio_clone_backup`（换 `device_id` 并重建日志，返回句柄与摘要 JSON）；记录导出/导入追加 `shio_export`、`shio_import`（明文 JSONL，先校验后写入，报告为摘要 JSON）。完整签名见 `include/shio.h` 与 `.design/api.md` §8。ABI 版本仍为 1（只增符号）。
 - `shio_open` 的 options JSON：`create`、`read_only`、`max_value_size`、`cache_size`；未知字段拒绝。字符串为 NUL 结尾 UTF-8，载荷/口令/ID 显式带长度。
 - 同步业务帧是 `SHY2` 不透明字节，调用方不要把帧内容塞进 JSON 或自行改写；状态、轮换信息和应用报告才是 JSON。首版建库先 `shio_open`，紧接着 `shio_sync_enable`，成功后才写业务记录；失败就关闭并删除尚未使用的库。
 - `shio_sync_changes` 的 `after` 是上一页 `out_next`；日志被压缩后返回 `SHIO_SYNC_RESYNC_REQUIRED`，改用 `snapshot_start/page`。`shio_sync_snapshot_page` 的 `out_next` 是另一条不透明游标，`out_done=1` 时为空。

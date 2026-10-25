@@ -1152,3 +1152,201 @@ fn clone_backup_rotates_device_identity() {
     // SAFETY: 关闭后 destroy，且没有其它线程继续使用。
     unsafe { shio_kernel_destroy(clone) };
 }
+
+fn list_len(handle: *mut ShioKernel, namespace: &CString, collection: &CString) -> usize {
+    let mut pointer = ptr::null_mut();
+    let mut len = 0;
+    // SAFETY: 句柄、名称与输出指针有效。
+    let status = unsafe {
+        shio_list(
+            handle,
+            namespace.as_ptr(),
+            collection.as_ptr(),
+            ptr::null(),
+            100,
+            0,
+            &mut pointer,
+            &mut len,
+        )
+    };
+    assert_eq!(status, SHIO_OK, "list failed: {}", last_error());
+    let page = parse(take_buffer(pointer, len));
+    page["items"].as_array().unwrap().len()
+}
+
+#[test]
+fn export_and_import_roundtrip() {
+    let directory = tempfile::tempdir().unwrap();
+    let source_path = directory.path().join("source.db");
+    let target_path = directory.path().join("target.db");
+    let preview_path = directory.path().join("preview.db");
+    let third_path = directory.path().join("third.db");
+    let export_path = directory.path().join("rows.jsonl");
+    let truncated_path = directory.path().join("truncated.jsonl");
+    let create = br#"{"create":true}"#;
+    let namespace = CString::new("vault").unwrap();
+    let collection = CString::new("entries").unwrap();
+    let password = b"transfer-password";
+
+    let source = open(&source_path, password, create);
+    let kept = insert(source, &namespace, &collection, br#"{"name":"kept"}"#);
+    let kept_id = kept["id"].as_str().unwrap().to_owned();
+    let removed = insert(source, &namespace, &collection, br#"{"name":"removed"}"#);
+    let removed_id = removed["id"].as_str().unwrap().to_owned();
+    let removed_bytes = uuid_bytes(&removed_id);
+    // SAFETY: 句柄、名称与 ID 有效。
+    let status = unsafe {
+        shio_delete(
+            source,
+            namespace.as_ptr(),
+            collection.as_ptr(),
+            removed_bytes.as_ptr(),
+            ptr::null_mut(),
+        )
+    };
+    assert_eq!(status, SHIO_OK, "delete failed: {}", last_error());
+
+    let export_c = CString::new(export_path.to_str().unwrap()).unwrap();
+    let options = br#"{"include_deleted":true}"#;
+    let mut json_pointer = ptr::null_mut();
+    let mut json_len = 0;
+    // SAFETY: 句柄、路径、options 与输出指针有效。
+    let status = unsafe {
+        shio_export(
+            source,
+            export_c.as_ptr(),
+            options.as_ptr(),
+            options.len(),
+            &mut json_pointer,
+            &mut json_len,
+        )
+    };
+    assert_eq!(status, SHIO_OK, "export failed: {}", last_error());
+    let summary = parse(take_buffer(json_pointer, json_len));
+    assert_eq!(summary["format_version"], 1);
+    assert_eq!(summary["records"], 2);
+    assert_eq!(summary["deleted"], 1);
+    assert_eq!(summary["collections"], 1);
+    assert!(summary["bytes"].as_u64().unwrap() > 0);
+
+    let target = open(&target_path, password, create);
+    let import_options = br#"{"batch_size":1}"#;
+    let mut json_pointer = ptr::null_mut();
+    let mut json_len = 0;
+    // SAFETY: 句柄、路径、options 与输出指针有效。
+    let status = unsafe {
+        shio_import(
+            target,
+            export_c.as_ptr(),
+            import_options.as_ptr(),
+            import_options.len(),
+            &mut json_pointer,
+            &mut json_len,
+        )
+    };
+    assert_eq!(status, SHIO_OK, "import failed: {}", last_error());
+    let report = parse(take_buffer(json_pointer, json_len));
+    assert_eq!(report["records"], 2);
+    assert_eq!(report["applied"], 1);
+    assert_eq!(report["skipped"], 1);
+    assert_eq!(report["dry_run"], false);
+    assert_eq!(report["collections"], 1);
+    let value = get(target, &namespace, &collection, &kept_id);
+    assert_eq!(value["value"]["name"], "kept");
+    assert_eq!(list_len(target, &namespace, &collection), 1);
+
+    // dry-run：只预演，不写入。
+    let preview = open(&preview_path, password, create);
+    let dry = br#"{"dry_run":true}"#;
+    let mut json_pointer = ptr::null_mut();
+    let mut json_len = 0;
+    // SAFETY: 句柄、路径、options 与输出指针有效。
+    let status = unsafe {
+        shio_import(
+            preview,
+            export_c.as_ptr(),
+            dry.as_ptr(),
+            dry.len(),
+            &mut json_pointer,
+            &mut json_len,
+        )
+    };
+    assert_eq!(status, SHIO_OK, "dry-run failed: {}", last_error());
+    let preview_report = parse(take_buffer(json_pointer, json_len));
+    assert_eq!(preview_report["applied"], 1);
+    assert_eq!(preview_report["dry_run"], true);
+    assert_eq!(list_len(preview, &namespace, &collection), 0);
+
+    // 目标已存在：拒绝覆盖，且不发布摘要。
+    let mut ignored_json = ptr::null_mut();
+    let mut ignored_len = 0;
+    // SAFETY: 句柄、路径与输出指针有效。
+    let status = unsafe {
+        shio_export(
+            source,
+            export_c.as_ptr(),
+            ptr::null(),
+            0,
+            &mut ignored_json,
+            &mut ignored_len,
+        )
+    };
+    assert_eq!(status, SHIO_INVALID_ARGUMENT);
+    assert!(ignored_json.is_null());
+
+    // 截断文件在写入前失败，目标库保持空。
+    let text = std::fs::read_to_string(&export_path).unwrap();
+    let mut lines: Vec<&str> = text.lines().collect();
+    lines.pop();
+    std::fs::write(&truncated_path, lines.join("\n") + "\n").unwrap();
+    let truncated_c = CString::new(truncated_path.to_str().unwrap()).unwrap();
+    let third = open(&third_path, password, create);
+    let mut json_pointer = ptr::null_mut();
+    let mut json_len = 0;
+    // SAFETY: 句柄、路径与输出指针有效。
+    let status = unsafe {
+        shio_import(
+            third,
+            truncated_c.as_ptr(),
+            ptr::null(),
+            0,
+            &mut json_pointer,
+            &mut json_len,
+        )
+    };
+    assert_eq!(status, SHIO_CORRUPTED);
+    assert!(json_pointer.is_null());
+    assert_eq!(list_len(third, &namespace, &collection), 0);
+
+    // 未知 mode 被拒绝。
+    let bad_mode = br#"{"mode":"overwrite"}"#;
+    // SAFETY: 句柄、路径、options 与输出指针有效。
+    let status = unsafe {
+        shio_import(
+            third,
+            export_c.as_ptr(),
+            bad_mode.as_ptr(),
+            bad_mode.len(),
+            &mut json_pointer,
+            &mut json_len,
+        )
+    };
+    assert_eq!(status, SHIO_INVALID_ARGUMENT);
+
+    // SAFETY: 句柄有效。
+    unsafe { shio_close(source) };
+    // SAFETY: 句柄有效。
+    unsafe { shio_close(target) };
+    // SAFETY: 句柄有效。
+    unsafe { shio_close(preview) };
+    // SAFETY: 句柄有效。
+    unsafe { shio_close(third) };
+    // SAFETY: 关闭后 destroy，且没有其它线程继续使用。
+    unsafe { shio_kernel_destroy(source) };
+    // SAFETY: 关闭后 destroy，且没有其它线程继续使用。
+    unsafe { shio_kernel_destroy(target) };
+    // SAFETY: 关闭后 destroy，且没有其它线程继续使用。
+    unsafe { shio_kernel_destroy(preview) };
+    // SAFETY: 关闭后 destroy，且没有其它线程继续使用。
+    unsafe { shio_kernel_destroy(third) };
+}

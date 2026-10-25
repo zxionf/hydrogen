@@ -44,6 +44,7 @@ kernel.close().await?;
 - `shio::version()` 返回编译期内核版本（与包版本一致），不需要打开数据库；库的格式版本用 `Kernel::stats().format_version` 查询。
 - 离线物理压缩：`shio::compact_file(path)` 要求没有其它打开的句柄（同进程或其它进程），按独占方式取 `.lock`，冲突返回 `Error::Locked`；不解密、不改格式与身份，返回 `CompactReport { before_bytes, after_bytes, compacted }`。
 - 多设备克隆：`shio::clone_backup(options, credential, backup)` 从备份恢复出**新设备**。保留 `db_id`、key 链与记录，生成新 `device_id`，清理 `peer/`/`cur/`/`heard/`/`migration`/`baseline_key`，以新身份重建完整日志（全部记录 + `CurrentKey`）；未启用同步时只做复制。返回 `(Kernel, CloneInfo)`。
+- 记录导出/导入（**危险**）：`Kernel::export_records` 把逻辑记录写成明文 JSONL（`v64`/`v` 值、`rev`/时间戳/`data_version`/墓碑、SHA-256 与精确计数），`Kernel::import_records` 先完整校验再分批写入，按 `(updated_at, rev)` 做 LWW 合并、用目标库当前 key 重新加密；`dry_run` 只预演。导出文件不含 `db_id`、密钥、日志或游标，**不是备份**。
 
 ## 4. 核心类型
 
@@ -102,6 +103,20 @@ impl Kernel {
         backup: PathBuf,
     ) -> Result<Kernel>;
 
+    /// 导出逻辑记录为明文 JSONL；目标已存在且 overwrite=false 时拒绝。
+    pub async fn export_records(
+        &self,
+        target: PathBuf,
+        options: ExportOptions,
+    ) -> Result<ExportInfo>;
+
+    /// 从明文 JSONL 导入；先完整校验（计数、SHA-256）再分批写入。
+    pub async fn import_records(
+        &self,
+        source: PathBuf,
+        options: ImportOptions,
+    ) -> Result<ImportReport>;
+
     pub fn namespace(&self, name: &str) -> Result<Namespace>;
 
     pub async fn flush(&self) -> Result<()>;
@@ -157,6 +172,45 @@ pub struct CloneInfo {
     pub peer_count: u64,
     pub log_entries: u64,
 }
+
+pub struct ExportOptions {
+    pub namespace: Option<String>,
+    pub collection: Option<String>,
+    pub include_deleted: bool,
+    pub overwrite: bool,
+}
+
+pub struct ExportInfo {
+    pub format_version: u16,
+    pub records: u64,
+    pub deleted: u64,
+    pub collections: u64,
+    pub bytes: u64,
+}
+
+pub enum ImportMode {
+    Merge,
+    Replace,
+}
+
+pub struct ImportOptions {
+    pub mode: ImportMode,
+    pub dry_run: bool,
+    pub batch_size: usize,
+}
+
+pub struct ImportReport {
+    pub records: u64,
+    pub applied: u64,
+    pub skipped: u64,
+    pub deleted: u64,
+    pub collections: u64,
+    pub bytes: u64,
+    pub dry_run: bool,
+}
+
+pub const DEFAULT_IMPORT_BATCH: usize = 256;
+pub const MAX_IMPORT_BATCH: usize = 4096;
 
 pub struct CompactReport {
     pub before_bytes: u64,
@@ -413,6 +467,7 @@ C++ 与 Android 通过 `shio-ffi` 调用；契约头文件为 `crates/shio-ffi/i
 - 存储维护 S1 的轮换取消通过旁路状态与批次边界实现，不引入回调或取消令牌；轮换接口是兼容性例外，允许不兼容旧客户端，其他非轮换接口仍按增量方式演进。
 - 存储维护 S2 的备份/恢复是新增非轮换符号；`shio_backup` 通过显式输出参数返回摘要 JSON，`shio_restore` 直接返回已打开的目标句柄。
 - 多设备克隆以增量符号追加：`shio_clone_backup` 返回已打开的目标句柄与摘要 JSON；不改 `shio_backup`/`shio_restore` 语义，`SHIO_ABI_VERSION` 保持 1。
+- 记录导出/导入以增量符号追加：`shio_export` / `shio_import` 操作明文 JSONL；文件损坏或截断返回 `SHIO_CORRUPTED` 且不写入任何记录，`SHIO_ABI_VERSION` 保持 1（不安全的地方由调用方显式选择导出路径与覆盖开关）。
 - 物理压缩以增量符号追加：`shio_compact_file` 只整理 redb 空闲页，不需要口令，不改格式/身份/游标；`SHIO_ABI_VERSION` 保持 1。
 - C ABI 补齐同样只做增量符号：`shio_purge` 暴露 facade 已有的物理删除（同步启用时返回 `SHIO_SYNC_ENABLED`，不写墓碑），`shio_collections` 返回按名称升序的 JSON 字符串数组；`SHIO_ABI_VERSION` 保持 1。
 - 维护模式同样是增量符号：`shio_sync_begin_maintenance` / `shio_sync_end_maintenance` / `shio_sync_migrate_step`。窗口内普通写返回 `SHIO_BUSY`，读放行；`SHIO_ABI_VERSION` 保持 1。
@@ -438,6 +493,12 @@ int32_t shio_clone_backup(const char *backup_path, const char *target_path,
                           const uint8_t *options_json, size_t options_len,
                           shio_kernel **out_handle,
                           uint8_t **out_json, size_t *out_json_len);
+int32_t shio_export(shio_kernel *handle, const char *target_path,
+                    const uint8_t *options_json, size_t options_len,
+                    uint8_t **out_json, size_t *out_json_len);
+int32_t shio_import(shio_kernel *handle, const char *source_path,
+                    const uint8_t *options_json, size_t options_len,
+                    uint8_t **out_json, size_t *out_json_len);
 int32_t shio_compact_file(const char *path,
                           uint8_t **out_json, size_t *out_json_len);
 int32_t shio_close(shio_kernel *kernel);
@@ -594,6 +655,8 @@ JSON 形状：
 - `shio_backup` 返回 `{"format_version":N,"db_bytes":N,"table_count":N,"row_count":N}`；备份文件使用原库口令打开，不携带明文或密钥。目标已存在返回 `SHIO_INVALID_ARGUMENT`；失败不会留下目标或临时文件。
 - `shio_restore` 的目标必须不存在或为 0 字节；`options_json` 的 `create` 被忽略。恢复失败返回对应错误并删除临时文件/未完成的目标；成功返回已打开的目标句柄。目标非空返回 `SHIO_INVALID_ARGUMENT`。
 - `shio_clone_backup` 保留 `db_id`/key 链/记录，生成新 `device_id` 并按新身份重建日志；`options_json` 的 `create`/`read_only` 被忽略。摘要为 `{"format_version":N,"db_bytes":N,"db_id":"…","previous_device_id":"…","device_id":"…","peer_count":N,"log_entries":N}`，未启用同步时后四项为 `null`/0。目标非空返回 `SHIO_INVALID_ARGUMENT`，失败不发布句柄或摘要。
+- `shio_export` 的 `options_json` 可为空：`{"namespace":"…","collection":"…","include_deleted":false,"overwrite":false}`，未知字段拒绝；`collection` 必须与 `namespace` 同时给出。摘要为 `{"format_version":N,"records":N,"deleted":N,"collections":N,"bytes":N}`。目标已存在且未开 `overwrite` 返回 `SHIO_INVALID_ARGUMENT`，失败不留下文件。
+- `shio_import` 的 `options_json` 可为空：`{"mode":"merge"|"replace","dry_run":false,"batch_size":256}`；`batch_size` 上限 4096，0 取默认。摘要为 `{"records":N,"applied":N,"skipped":N,"deleted":N,"collections":N,"bytes":N,"dry_run":bool}`。文件损坏/截断/校验和不符返回 `SHIO_CORRUPTED`，且不会写入任何记录。
 - `shio_compact_file` 返回 `{"before_bytes":N,"after_bytes":N,"compacted":bool}`；要求句柄全部关闭，否则返回 `SHIO_LOCKED`；路径不存在返回 `SHIO_NOT_FOUND`；0 字节文件返回 `SHIO_INVALID_ARGUMENT`。`compacted=false` 表示已无可整理空闲页。
 - `shio_sync_info` / `shio_sync_enable` 返回 `{"db_id":"32hex","device_id":"32hex","current_key_id":"32hex","log_start":N,"log_end":N,"baseline_done":bool}`。
 - `shio_sync_begin_rotation` / `shio_sync_rotation_state` 返回 `{"from":"32hex","to":"32hex","created_at":millis,"acked":["32hex",...]}`；没有进行中的轮换时 `rotation_state` 返回 `null`。
@@ -630,6 +693,7 @@ JSON 形状：
 - 物理压缩只重排 redb 页，不改变记录格式、密钥链或同步状态；压缩前后的库对任何支持的版本都可读。
 - 自动日志裁剪只前移 `log_start` 并删除已确认消费的条目，不改记录、密钥或同步身份；落后于裁剪点的对端收到 `SyncResyncRequired`，按快照流程重同步。
 - 多设备克隆只改设备身份与设备级同步状态，不改记录格式、`db_id`、密钥或口令；克隆出的库可与其他设备（包括源设备）同时启用同步。
+- 记录导出/导入只读写逻辑记录与集合登记：导出是明文快照，不含身份/密钥/日志/游标；导入用目标库当前 key 重新加密，保留源 `rev`/时间戳/`data_version` 与墓碑标志，不改记录格式版本。
 
 ## 10. 示例
 
@@ -965,6 +1029,9 @@ impl Engine {
         password: &[u8],
     ) -> Result<(Engine, CloneInfo)>;
 
+    pub fn export_records(&self, target: &Path, options: &ExportOptions) -> Result<ExportInfo>;
+    pub fn import_records(&self, source: &Path, options: &ImportOptions) -> Result<ImportReport>;
+
     pub fn enable_sync(&self, device_id: Option<DeviceId>) -> Result<SyncInfo>;
     pub fn sync_info(&self) -> Result<SyncInfo>;
     pub fn changes_since(&self, after: u64, limit: usize) -> Result<ChangePage>;
@@ -1021,6 +1088,8 @@ impl Engine {
 - `backup` 在一个 redb 读事务中复制全部已知表到临时文件，校验表行数与 `meta` 原始字节后原子改名；目标已存在返回 `InvalidArgument`。备份不压缩同步日志，也不解密/重加密。
 - `restore` 接受不存在的目标或 0 字节文件；先复制到同目录临时文件，用原口令打开校验，再替换空目标。校验失败删除临时文件；目标非空返回 `InvalidArgument`。`options.create` 被忽略，恢复出的库保留源库身份与同步状态。
 - `clone_backup` 同样接受不存在的目标或 0 字节文件。同步已启用时：新随机 `device_id`、`enabled_at` 刷新、`log_start=1`、清空 `peer/`/`cur/`/`heard/`/`migration`/`baseline_key` 与 `shio.changes`，再用基线流程按记录键序重发全部记录与 `CurrentKey`；`rot/`/`ack/`/`mig/`/`upgrade` 与 `db_id`、key 链保留。未启用同步时只复制。`options.create` 与 `read_only` 被忽略。
+- `export_records` 在单个读事务里按编码键序扫描 `shio.catalog` 与 `shio.records`，解密后以 `v64` 写出；墓碑仅在 `include_deleted` 时输出且不带值。目标先写同目录临时文件，`flush` 后原子改名；文件头记录 `v`/`fmt`/`at`，尾部记录精确行数与 SHA-256。
+- `import_records` 先完整扫描校验（结构、名称、UUID、值编码与长度、精确计数、SHA-256、尾后数据），再第二遍按批写入。Merge 按 `(updated_at, rev)` 比较，相等时比较明文（相同即跳过，保证幂等）；Replace 取 `rev = max(本地+1, 源)`、`updated_at = max(源, 本地+1)` 并保留本地 `created_at`。墓碑没有对应本地记录时跳过；同步启用时按本机 `device_id` 追加变更日志。
 - `enable_sync` 在 `format=1` 上执行不可回退升级；`format=2` 直接初始化。
 - `apply_page` 整页一个写事务，推进 `peer/<sender>` 游标；缺 key 返回 `RotationRequired`。
 - `peer_cursor` 返回本机在对方日志中的已消费游标，供生成进度帧；`apply_peer_progress` 把对方上报的「已读到本机哪一条」写入 `heard/<device>`，单调推进并按 `log_end` 截断。

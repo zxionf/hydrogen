@@ -289,3 +289,8 @@ Change: 20261025-multi-device-clone
 Context: S2 的 restore 保留 db_id/device_id/key 链与游标，语义是同一台设备的灾难恢复；把同一备份恢复到第二台设备并同时启用同步会出现两个实体共享 device_id，cur/、heard/、peer/ 与日志 writer 全部重叠
 Decision: 新增 clone_backup：保留 db_id、key 链、记录与口令，生成新的随机非零 device_id，清理 peer/、cur/、heard/、migration、baseline_key 与全部 shio.changes，把 log_start 置 1、刷新 enabled_at，再复用 run_baseline 按记录键序重发全部记录与 CurrentKey 并写 cur/<新设备>；保留 rot/、ack/、mig/、upgrade 与 upgrade/key/（key 事实而非本设备进度）。未启用同步的库只做复制；create/read_only 被忽略，返回可写句柄。以增量符号暴露 Engine::clone_backup、shio::clone_backup 与 shio_clone_backup，ABI 保持 1
 Consequences: 同一 db_id 的两台设备可同时同步，克隆本身是完整同步源（配对包不带记录，日志必须重基线）；代价是克隆一次性写 记录数+1 条日志。清空 peer/ 后对端日志若已裁剪，首次拉取会收到 SyncResyncRequired，走快照重同步；清空 cur/ 会让自动日志裁剪等对端重新上报。已知限制：克隆时若轮换仍在进行，依赖保留下来的 rot/ 提供 offer
+## [59] 2026-10-25 11:48:46 UTC
+Change: 20261025-record-transfer
+Context: 备份与克隆都要求共享 key 链或设备身份，无法把逻辑数据带出或带进不同密钥的库；跨安装/跨系统迁移需要一个可检查、可自校验、与库身份无关的交换格式，而明文落盘本身有泄露风险
+Decision: 新增 JSONL v1 导出/导入：head/col/rec/end 四类行，值用 v64（base64）或 v（UTF-8）二选一，尾部写精确行数与 SHA-256；导出在单个读事务内按编码键序扫描 catalog/records，解密后写同目录临时文件再原子改名，默认不覆盖，文件不含 db_id/密钥/日志/游标；导入先完整校验（结构、名称、UUID、值长度、计数、SHA-256、尾后数据）再第二遍按批写入，Merge 按 (updated_at, rev) 比较、相等时比较明文保证幂等，Replace 取 rev=max(本地+1,源)、updated_at=max(源,本地+1) 并保留本地 created_at，墓碑只在本地已有记录时生效，同步库按本机 device 追加 changes，dry-run 只读；以增量符号暴露 Engine/Kernel 与 shio_export/shio_import，ABI 保持 1；明确标为危险操作，独立 CLI 工具留到后续变更
+Consequences: 数据可跨 format 与跨 key 链迁移，导入可重跑且校验失败不写任何记录；导出文件不是备份，不含身份/密钥/游标，不能替代 backup/clone；导入在同步库中表现为大规模本机写入，日志会增长并靠后续裁剪回收；大库导出持有长读事务、导入两遍 IO；应用仍需自行校验值的业务 schema

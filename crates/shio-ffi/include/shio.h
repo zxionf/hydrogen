@@ -144,6 +144,32 @@ int32_t shio_clone_backup(const char *backup_path,
                           size_t *out_json_len);
 
 /*
+ * 把逻辑记录导出为明文 JSONL（危险：目标文件是明文）。
+ * options_json 可省略：{"namespace":"…","collection":"…","include_deleted":false,"overwrite":false}。
+ * 返回 {"format_version":N,"records":N,"deleted":N,"collections":N,"bytes":N}。
+ * 目标已存在且 overwrite=false 返回 SHIO_INVALID_ARGUMENT，失败不留下文件。
+ */
+int32_t shio_export(shio_kernel *handle,
+                    const char *target_path,
+                    const uint8_t *options_json,
+                    size_t options_len,
+                    uint8_t **out_json,
+                    size_t *out_json_len);
+
+/*
+ * 从明文 JSONL 导入记录；先完整校验（结构/计数/SHA-256），再分批写入。
+ * options_json 可省略：{"mode":"merge"|"replace","dry_run":false,"batch_size":256}。
+ * 返回 {"records":N,"applied":N,"skipped":N,"deleted":N,"collections":N,"bytes":N,"dry_run":bool}。
+ * 文件损坏或截断返回 SHIO_CORRUPTED，且不会写入任何记录。
+ */
+int32_t shio_import(shio_kernel *handle,
+                    const char *source_path,
+                    const uint8_t *options_json,
+                    size_t options_len,
+                    uint8_t **out_json,
+                    size_t *out_json_len);
+
+/*
  * 离线物理压缩：整理空闲页并收缩文件；要求没有其它打开的句柄。
  * 返回 {"before_bytes":N,"after_bytes":N,"compacted":bool}；
  * 句柄未关闭返回 SHIO_LOCKED，路径不存在返回 SHIO_NOT_FOUND。

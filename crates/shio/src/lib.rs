@@ -26,7 +26,10 @@ pub use shio_core::model::{
     validate_name, ListOptions, NameKind, Page, RecordId, RecordMeta, Stored, Timestamp, WriteOp,
     DEFAULT_LIST_LIMIT, DEFAULT_MAX_VALUE_SIZE, MAX_LIST_LIMIT, MAX_NAME_LEN,
 };
-pub use shio_core::store::{BackupInfo, CloneInfo, CompactReport, Stats};
+pub use shio_core::store::{
+    BackupInfo, CloneInfo, CompactReport, ExportInfo, ExportOptions, ImportMode, ImportOptions,
+    ImportReport, Stats, DEFAULT_IMPORT_BATCH, MAX_IMPORT_BATCH,
+};
 #[cfg(feature = "sync")]
 pub use shio_core::sync::pairing_fingerprint;
 #[cfg(feature = "sync")]

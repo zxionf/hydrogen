@@ -1187,6 +1187,152 @@ static int clone_mode(const char *path)
     return 0;
 }
 
+static int transfer_mode(const char *path)
+{
+    const char *options = "{\"create\":true}";
+    const char *export_options = "{\"include_deleted\":true}";
+    const char *dry_options = "{\"dry_run\":true}";
+    char export_path[1024];
+    char target_path[1024];
+    char third_path[1024];
+    shio_kernel *source = NULL;
+    shio_kernel *target = NULL;
+    shio_kernel *third = NULL;
+    uint8_t *buf = NULL;
+    size_t len = 0;
+    uint8_t *json = NULL;
+    size_t json_len = 0;
+    uint8_t id[16];
+    int32_t existed = 0;
+    int32_t status;
+    char *text = NULL;
+    int index = 0;
+
+    snprintf(export_path, sizeof(export_path), "%s.jsonl", path);
+    snprintf(target_path, sizeof(target_path), "%s.copy", path);
+    snprintf(third_path, sizeof(third_path), "%s.third", path);
+    remove(path);
+    remove(export_path);
+    remove(target_path);
+    remove(third_path);
+
+    expect(shio_open(path, (const uint8_t *)PASSWORD, strlen(PASSWORD),
+                     (const uint8_t *)options, strlen(options), &source),
+           "transfer open(source)");
+    for (index = 0; index < 3; index++) {
+        char payload[48];
+        snprintf(payload, sizeof(payload), "{\"n\":%d}", index);
+        record_id(index, id);
+        expect(shio_put(source, "vault", "entries", id,
+                        (const uint8_t *)payload, strlen(payload), &buf, &len),
+               "transfer put(source)");
+        shio_free(buf, len);
+        buf = NULL;
+        len = 0;
+    }
+    record_id(2, id);
+    expect(shio_delete(source, "vault", "entries", id, &existed),
+           "transfer delete(source)");
+    if (!existed) {
+        fprintf(stderr, "transfer delete did not hit a record\n");
+        return 1;
+    }
+
+    expect(shio_export(source, export_path,
+                       (const uint8_t *)export_options, strlen(export_options),
+                       &json, &json_len),
+           "transfer export");
+    text = take_text(json, json_len, "transfer export");
+    json = NULL;
+    json_len = 0;
+    if (json_u64(text, "records", "transfer export") != 3 ||
+        json_u64(text, "deleted", "transfer export") != 1 ||
+        json_u64(text, "collections", "transfer export") != 1 ||
+        json_u64(text, "bytes", "transfer export") == 0) {
+        fprintf(stderr, "transfer export summary mismatch: %s\n", text);
+        return 1;
+    }
+    free(text);
+
+    /* 目标已存在：默认拒绝覆盖，且不发布摘要。 */
+    status = shio_export(source, export_path, NULL, 0, &json, &json_len);
+    if (status != SHIO_INVALID_ARGUMENT || json != NULL) {
+        fprintf(stderr, "transfer overwrite guard failed: %d\n", status);
+        return 1;
+    }
+
+    expect(shio_open(target_path, (const uint8_t *)PASSWORD, strlen(PASSWORD),
+                     (const uint8_t *)options, strlen(options), &target),
+           "transfer open(target)");
+    expect(shio_import(target, export_path, NULL, 0, &json, &json_len),
+           "transfer import");
+    text = take_text(json, json_len, "transfer import");
+    json = NULL;
+    json_len = 0;
+    if (json_u64(text, "records", "transfer import") != 3 ||
+        json_u64(text, "applied", "transfer import") != 2 ||
+        json_u64(text, "skipped", "transfer import") != 1) {
+        fprintf(stderr, "transfer import report mismatch: %s\n", text);
+        return 1;
+    }
+    free(text);
+
+    record_id(0, id);
+    expect(shio_get(target, "vault", "entries", id, &buf, &len),
+           "transfer get(target)");
+    text = take_text(buf, len, "transfer get(target)");
+    contains(text, "\"n\":0", "transfer get(target)");
+    free(text);
+
+    record_id(2, id);
+    status = shio_get(target, "vault", "entries", id, &buf, &len);
+    if (status != SHIO_NOT_FOUND) {
+        fprintf(stderr, "transfer tombstone came back: %d\n", status);
+        return 1;
+    }
+
+    /* dry-run：只预演，不写入。 */
+    expect(shio_open(third_path, (const uint8_t *)PASSWORD, strlen(PASSWORD),
+                     (const uint8_t *)options, strlen(options), &third),
+           "transfer open(third)");
+    expect(shio_import(third, export_path,
+                       (const uint8_t *)dry_options, strlen(dry_options),
+                       &json, &json_len),
+           "transfer dry-run");
+    text = take_text(json, json_len, "transfer dry-run");
+    json = NULL;
+    json_len = 0;
+    if (json_u64(text, "applied", "transfer dry-run") != 2 ||
+        json_u64(text, "skipped", "transfer dry-run") != 1) {
+        fprintf(stderr, "transfer dry-run report mismatch: %s\n", text);
+        return 1;
+    }
+    contains(text, "\"dry_run\":true", "transfer dry-run");
+    free(text);
+
+    record_id(0, id);
+    status = shio_get(third, "vault", "entries", id, &buf, &len);
+    if (status != SHIO_NOT_FOUND) {
+        fprintf(stderr, "transfer dry-run wrote data: %d\n", status);
+        return 1;
+    }
+
+    printf("transfer records: 3 applied: 2 skipped: 1\n");
+    printf("TRANSFER_OK\n");
+
+    expect(shio_close(source), "transfer close(source)");
+    shio_kernel_destroy(source);
+    expect(shio_close(target), "transfer close(target)");
+    shio_kernel_destroy(target);
+    expect(shio_close(third), "transfer close(third)");
+    shio_kernel_destroy(third);
+    remove(path);
+    remove(export_path);
+    remove(target_path);
+    remove(third_path);
+    return 0;
+}
+
 static int backup_restore_mode(const char *path)
 {
     shio_kernel *source = NULL;
@@ -1522,7 +1668,7 @@ int main(int argc, char **argv)
                 "usage: %s <database-path> "
                 "[smoke|sync|hold|probe|check|read-hold|read-probe|read-locked|"
                 "rotate-many|resume-rotation|migration-progress|maintenance|"
-                "cooperative|compact|auto-compact|clone|backup-restore]\n",
+                "cooperative|compact|auto-compact|clone|transfer|backup-restore]\n",
                 argv[0]);
         return 2;
     }
@@ -1607,6 +1753,10 @@ int main(int argc, char **argv)
 
     if (strcmp(mode, "clone") == 0) {
         return clone_mode(path);
+    }
+
+    if (strcmp(mode, "transfer") == 0) {
+        return transfer_mode(path);
     }
 
     if (strcmp(mode, "backup-restore") == 0) {

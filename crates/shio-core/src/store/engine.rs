@@ -39,6 +39,7 @@ use crate::sync::{ChangeEntry, MigrationProgress, RecordChange};
 
 mod engine_backup;
 mod engine_sync;
+mod engine_transfer;
 mod pairing;
 
 /// 轮换时每个写事务迁移的记录条数。
@@ -166,6 +167,91 @@ pub struct CloneInfo {
     pub peer_count: u64,
     /// 重建后的日志条数；未重置日志时为 0。
     pub log_entries: u64,
+}
+
+/// 记录导出选项。
+///
+/// 导出文件是**明文**：只应在用户明确要求时调用，并注意落盘位置与清理。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ExportOptions {
+    /// 只导出该命名空间；`None` 表示全部。
+    pub namespace: Option<String>,
+    /// 只导出该集合；必须与 `namespace` 同时给出。
+    pub collection: Option<String>,
+    /// 是否包含墓碑。
+    pub include_deleted: bool,
+    /// 目标已存在时是否覆盖。
+    pub overwrite: bool,
+}
+
+/// 导出结果摘要。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExportInfo {
+    /// 源库格式版本。
+    pub format_version: u16,
+    /// 写出的记录行数。
+    pub records: u64,
+    /// 写出的墓碑行数（`include_deleted=false` 时恒为 0）。
+    pub deleted: u64,
+    /// 写出的集合行数。
+    pub collections: u64,
+    /// 导出文件字节数。
+    pub bytes: u64,
+}
+
+/// 导入默认批大小。
+pub const DEFAULT_IMPORT_BATCH: usize = 256;
+/// 导入批大小上限。
+pub const MAX_IMPORT_BATCH: usize = 4096;
+
+/// 导入冲突策略。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ImportMode {
+    /// 按 `(updated_at, rev)` 合并；本地更新的版本保留。
+    #[default]
+    Merge,
+    /// 覆盖本地同 ID 记录；只压过本地副本，不保证压过对端更新的版本。
+    Replace,
+}
+
+/// 导入选项。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportOptions {
+    /// 冲突策略。
+    pub mode: ImportMode,
+    /// 只校验不写入。
+    pub dry_run: bool,
+    /// 每批记录数；0 取默认值。
+    pub batch_size: usize,
+}
+
+impl Default for ImportOptions {
+    fn default() -> Self {
+        Self {
+            mode: ImportMode::Merge,
+            dry_run: false,
+            batch_size: DEFAULT_IMPORT_BATCH,
+        }
+    }
+}
+
+/// 导入结果摘要。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ImportReport {
+    /// 文件中的记录行数。
+    pub records: u64,
+    /// 实际写入的记录数（dry-run 时为预估）。
+    pub applied: u64,
+    /// 因本地版本更新、内容相同或墓碑无对应记录而跳过的行数。
+    pub skipped: u64,
+    /// 实际写入的墓碑行数。
+    pub deleted: u64,
+    /// 文件中补登记的集合行数。
+    pub collections: u64,
+    /// 读入的文件字节数。
+    pub bytes: u64,
+    /// 是否为 dry-run。
+    pub dry_run: bool,
 }
 
 /// 批量写操作，载荷为已序列化的明文。

@@ -238,6 +238,59 @@ struct OpenOptionsJson {
     cache_size: Option<usize>,
 }
 
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct ExportOptionsJson {
+    namespace: Option<String>,
+    collection: Option<String>,
+    include_deleted: bool,
+    overwrite: bool,
+}
+
+fn parse_export_options(json: &[u8]) -> shio::Result<shio::ExportOptions> {
+    let parsed: ExportOptionsJson = if json.is_empty() {
+        ExportOptionsJson::default()
+    } else {
+        serde_json::from_slice(json).map_err(Error::Deserialize)?
+    };
+    Ok(shio::ExportOptions {
+        namespace: parsed.namespace,
+        collection: parsed.collection,
+        include_deleted: parsed.include_deleted,
+        overwrite: parsed.overwrite,
+    })
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct ImportOptionsJson {
+    mode: Option<String>,
+    dry_run: bool,
+    batch_size: Option<usize>,
+}
+
+fn parse_import_options(json: &[u8]) -> shio::Result<shio::ImportOptions> {
+    let parsed: ImportOptionsJson = if json.is_empty() {
+        ImportOptionsJson::default()
+    } else {
+        serde_json::from_slice(json).map_err(Error::Deserialize)?
+    };
+    let mode = match parsed.mode.as_deref() {
+        None | Some("merge") => shio::ImportMode::Merge,
+        Some("replace") => shio::ImportMode::Replace,
+        Some(_) => {
+            return Err(Error::InvalidArgument(
+                "import mode must be merge or replace",
+            ))
+        }
+    };
+    Ok(shio::ImportOptions {
+        mode,
+        dry_run: parsed.dry_run,
+        batch_size: parsed.batch_size.unwrap_or(shio::DEFAULT_IMPORT_BATCH),
+    })
+}
+
 fn parse_open_options(path: &str, json: &[u8]) -> shio::Result<OpenOptions> {
     let parsed = if json.is_empty() {
         OpenOptionsJson::default()
@@ -672,6 +725,84 @@ pub unsafe extern "C" fn shio_clone_backup(
             *out_handle = Box::into_raw(boxed);
         }
         Ok(())
+    })
+}
+
+/// 把逻辑记录导出为明文 JSONL。
+///
+/// **危险**：目标文件包含全部记录值的明文；调用方负责落盘位置与清理。
+///
+/// # Safety
+///
+/// 路径、可选的 options JSON 与输出指针必须按 `include/shio.h` 的契约有效。
+#[no_mangle]
+pub unsafe extern "C" fn shio_export(
+    handle: *mut ShioKernel,
+    target_path: *const c_char,
+    options_json: *const u8,
+    options_len: usize,
+    out_json: *mut *mut u8,
+    out_json_len: *mut usize,
+) -> i32 {
+    ffi_guard(|| {
+        reset_output(out_json, out_json_len)?;
+        // SAFETY: 由调用方契约保证路径指针有效。
+        let target = unsafe { input_str(target_path)? };
+        // SAFETY: 由调用方契约保证 options 指针有效。
+        let options_bytes = unsafe { input_bytes(options_json, options_len)? };
+        let options = parse_export_options(options_bytes)?;
+        // SAFETY: 调用方保证句柄来自 `shio_open` 且未 destroy。
+        let handle =
+            unsafe { handle.as_ref() }.ok_or(Error::InvalidArgument("kernel handle is null"))?;
+        let kernel = handle.kernel()?;
+        let info = handle.block_on(kernel.export_records(PathBuf::from(target), options))?;
+        let value = json!({
+            "format_version": info.format_version,
+            "records": info.records,
+            "deleted": info.deleted,
+            "collections": info.collections,
+            "bytes": info.bytes,
+        });
+        set_output(value_to_bytes(&value)?, out_json, out_json_len)
+    })
+}
+
+/// 从明文 JSONL 导入记录；先完整校验，再分批写入。
+///
+/// # Safety
+///
+/// 路径、可选的 options JSON 与输出指针必须按 `include/shio.h` 的契约有效。
+#[no_mangle]
+pub unsafe extern "C" fn shio_import(
+    handle: *mut ShioKernel,
+    source_path: *const c_char,
+    options_json: *const u8,
+    options_len: usize,
+    out_json: *mut *mut u8,
+    out_json_len: *mut usize,
+) -> i32 {
+    ffi_guard(|| {
+        reset_output(out_json, out_json_len)?;
+        // SAFETY: 由调用方契约保证路径指针有效。
+        let source = unsafe { input_str(source_path)? };
+        // SAFETY: 由调用方契约保证 options 指针有效。
+        let options_bytes = unsafe { input_bytes(options_json, options_len)? };
+        let options = parse_import_options(options_bytes)?;
+        // SAFETY: 调用方保证句柄来自 `shio_open` 且未 destroy。
+        let handle =
+            unsafe { handle.as_ref() }.ok_or(Error::InvalidArgument("kernel handle is null"))?;
+        let kernel = handle.kernel()?;
+        let report = handle.block_on(kernel.import_records(PathBuf::from(source), options))?;
+        let value = json!({
+            "records": report.records,
+            "applied": report.applied,
+            "skipped": report.skipped,
+            "deleted": report.deleted,
+            "collections": report.collections,
+            "bytes": report.bytes,
+            "dry_run": report.dry_run,
+        });
+        set_output(value_to_bytes(&value)?, out_json, out_json_len)
     })
 }
 

@@ -16,7 +16,7 @@ use super::*;
 use crate::store::{catalog, changes, keys, keys2, meta, meta2, records, sync_state, META_KEY};
 
 /// 目标已存在时是否允许清空；恢复只允许 0 字节文件。
-fn path_exists(path: &Path) -> Result<bool> {
+pub(super) fn path_exists(path: &Path) -> Result<bool> {
     match std::fs::metadata(path) {
         Ok(_) => Ok(true),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
@@ -25,12 +25,12 @@ fn path_exists(path: &Path) -> Result<bool> {
 }
 
 /// 同目录临时路径；`Drop` 时删除尚未发布的文件。
-struct TempPath {
+pub(super) struct TempPath {
     path: PathBuf,
 }
 
 impl TempPath {
-    fn sibling(target: &Path) -> Result<Self> {
+    pub(super) fn sibling(target: &Path) -> Result<Self> {
         let name = target
             .file_name()
             .ok_or(Error::InvalidArgument("target path has no file name"))?;
@@ -46,7 +46,7 @@ impl TempPath {
         })
     }
 
-    fn path(&self) -> &Path {
+    pub(super) fn path(&self) -> &Path {
         &self.path
     }
 }

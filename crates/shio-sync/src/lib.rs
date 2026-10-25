@@ -194,6 +194,25 @@ impl<'a> Sync<'a> {
         self.engine.compact_changes(before)
     }
 
+    /// 生成本机上报给 `peer` 的进度帧；未消费过对方日志时游标为 0。
+    pub fn progress_frame(&self, peer: DeviceId) -> Result<Vec<u8>> {
+        let info = self.info()?;
+        let cursor = self.engine.peer_cursor(peer)?.unwrap_or(0);
+        frame::encode_progress(info.db_id, info.device_id, cursor)
+    }
+
+    /// 应用对端的进度帧；返回落盘后的已消费游标。
+    pub fn apply_progress(&self, frame: &[u8]) -> Result<u64> {
+        let info = self.info()?;
+        let (device, cursor) = frame::decode_progress(info.db_id, frame)?;
+        self.engine.apply_peer_progress(device, cursor)
+    }
+
+    /// 按对端进度自动裁剪变更日志；返回删除条数。
+    pub fn compact_changes_auto(&self) -> Result<u64> {
+        self.engine.compact_changes_auto()
+    }
+
     pub fn pairing_offer(&self, ttl: Duration) -> Result<PairingOffer> {
         let (frame, mut secret) = self.engine.create_pairing_bundle_with_secret(ttl)?;
         let secret_text = encode_secret(&secret);
@@ -452,6 +471,21 @@ impl SyncHandle {
 
     pub fn compact(&self, before: u64) -> Result<u64> {
         self.sync().compact(before)
+    }
+
+    /// 生成本机上报给 `peer` 的进度帧。
+    pub fn progress_frame(&self, peer: DeviceId) -> Result<Vec<u8>> {
+        self.sync().progress_frame(peer)
+    }
+
+    /// 应用对端的进度帧；返回落盘后的已消费游标。
+    pub fn apply_progress(&self, frame: &[u8]) -> Result<u64> {
+        self.sync().apply_progress(frame)
+    }
+
+    /// 按对端进度自动裁剪变更日志；返回删除条数。
+    pub fn compact_changes_auto(&self) -> Result<u64> {
+        self.sync().compact_changes_auto()
     }
 
     pub fn pairing_offer(&self, ttl: Duration) -> Result<PairingOffer> {

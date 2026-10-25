@@ -13,9 +13,9 @@ use std::sync::{Arc, Barrier};
 use std::time::{Duration, Instant};
 
 use shio_core::crypto::kdf::KdfParams;
-use shio_core::model::{ListOptions, RecordId};
+use shio_core::model::{ListOptions, RecordId, Timestamp};
 use shio_core::store::{Engine, EngineOptions};
-use shio_core::{ChangeEntry, DeviceId, Error, KeyId, MigrationOptions};
+use shio_core::{ChangeEntry, ChangePage, DeviceId, Error, KeyId, MigrationOptions};
 
 const PASSWORD: &[u8] = b"correct horse battery staple";
 
@@ -1052,4 +1052,98 @@ fn backup_during_online_writes_stays_readable() {
             .value,
         "before-backup"
     );
+}
+
+#[test]
+fn auto_compaction_follows_peer_progress() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("a.redb");
+    let engine = create(&path);
+    enable(&engine);
+    for index in 0..12 {
+        engine
+            .put("notes", "note", RecordId::new_v7(), &index, 1)
+            .unwrap();
+    }
+
+    // 没有对端任何信息时不裁剪。
+    assert_eq!(engine.compact_changes_auto().unwrap(), 0);
+
+    // 模拟一个对端只发来当前 key 公告，尚未上报进度。
+    let peer = DeviceId::from_bytes([7u8; 16]);
+    let key_id = engine.stats().unwrap().key_id;
+    let page = ChangePage {
+        sender: peer,
+        after: 0,
+        next: 1,
+        has_more: false,
+        log_start: 1,
+        log_end: 1,
+        entries: vec![ChangeEntry::CurrentKey {
+            key_id,
+            at: Timestamp::now(),
+        }],
+    };
+    engine.apply_page(&page).unwrap();
+    assert_eq!(engine.peer_cursor(peer).unwrap(), Some(1));
+    assert_eq!(engine.compact_changes_auto().unwrap(), 0);
+
+    let log_end = engine.sync_info().unwrap().log_end;
+    assert!(log_end >= 13);
+    let cursor = 5;
+    assert_eq!(engine.apply_peer_progress(peer, cursor).unwrap(), cursor);
+    assert_eq!(engine.compact_changes_auto().unwrap(), cursor);
+    let info = engine.sync_info().unwrap();
+    assert_eq!(info.log_start, cursor + 1);
+    assert_eq!(info.log_end, log_end);
+
+    // 已消费的游标仍可继续读；更早的游标要求重新走快照。
+    let page = engine.changes_since(cursor, 1000).unwrap();
+    assert_eq!(page.entries.len(), (log_end - cursor) as usize);
+    assert!(matches!(
+        engine.changes_since(cursor - 1, 1000),
+        Err(Error::SyncResyncRequired { log_start }) if log_start == cursor + 1
+    ));
+
+    // 进度单调：更小的上报值不回退，也不产生新的裁剪。
+    assert_eq!(engine.apply_peer_progress(peer, 2).unwrap(), cursor);
+    assert_eq!(engine.compact_changes_auto().unwrap(), 0);
+
+    // 超过 log_end 的上报值被截断。
+    assert_eq!(
+        engine.apply_peer_progress(peer, log_end + 100).unwrap(),
+        log_end
+    );
+    // 保留最新一条，`log_end` 不回落。
+    assert_eq!(engine.compact_changes_auto().unwrap(), log_end - cursor - 1);
+    let info = engine.sync_info().unwrap();
+    assert_eq!(info.log_start, log_end);
+    assert_eq!(info.log_end, log_end);
+
+    // 维护模式拒绝进度上报与自动裁剪。
+    engine.begin_maintenance().unwrap();
+    assert!(matches!(
+        engine.apply_peer_progress(peer, 1),
+        Err(Error::Busy)
+    ));
+    assert!(matches!(engine.compact_changes_auto(), Err(Error::Busy)));
+    engine.end_maintenance().unwrap();
+}
+
+#[test]
+fn auto_compaction_requires_sync() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = create(&dir.path().join("plain.redb"));
+    assert!(matches!(
+        engine.compact_changes_auto(),
+        Err(Error::SyncDisabled)
+    ));
+    assert!(matches!(
+        engine.apply_peer_progress(DeviceId::from_bytes([1u8; 16]), 1),
+        Err(Error::SyncDisabled)
+    ));
+    assert!(matches!(
+        engine.peer_cursor(DeviceId::from_bytes([1u8; 16])),
+        Err(Error::SyncDisabled)
+    ));
 }

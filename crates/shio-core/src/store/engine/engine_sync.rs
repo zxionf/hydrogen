@@ -122,6 +122,111 @@ impl Engine {
         Ok(removed)
     }
 
+    /// 本机在 `peer` 日志中的已消费游标；未消费过返回 `None`。
+    pub fn peer_cursor(&self, peer: DeviceId) -> Result<Option<u64>> {
+        if self.read_sync_state()?.is_none() {
+            return Err(Error::SyncDisabled);
+        }
+        let txn = self.handle.begin_read()?;
+        let table = txn.open_table(sync_state::TABLE)?;
+        let key = sync_state::peer(peer);
+        match table.get(key.as_slice())? {
+            Some(value) => Ok(Some(decode_cursor(
+                value.value(),
+                "peer cursor has wrong length",
+            )?)),
+            None => Ok(None),
+        }
+    }
+
+    /// 记录对端已消费到本机日志的游标；单调推进并返回落盘值。
+    ///
+    /// 上报值超过当前 `log_end` 时按 `log_end` 截断。
+    pub fn apply_peer_progress(&self, device: DeviceId, cursor: u64) -> Result<u64> {
+        self.require_writable()?;
+        if self.read_sync_state()?.is_none() {
+            return Err(Error::SyncDisabled);
+        }
+        let log_end = self.changes_log_end()?;
+        let cursor = cursor.min(log_end);
+        let txn = self.handle.begin_write()?;
+        let stored = {
+            let mut table = txn.open_table(sync_state::TABLE)?;
+            let key = sync_state::heard(device);
+            let previous = match table.get(key.as_slice())? {
+                Some(value) => decode_cursor(value.value(), "heard cursor has wrong length")?,
+                None => 0,
+            };
+            let next = previous.max(cursor);
+            table.insert(key.as_slice(), next.to_be_bytes().as_slice())?;
+            next
+        };
+        txn.commit()?;
+        Ok(stored)
+    }
+
+    /// 按对端进度裁剪变更日志；返回删除条数。
+    ///
+    /// 已知对端取 `cur/` 与 `heard/` 的并集；`cur/` 中有设备未上报进度时不裁剪。
+    pub fn compact_changes_auto(&self) -> Result<u64> {
+        self.require_writable()?;
+        let state = self.read_sync_state()?.ok_or(Error::SyncDisabled)?;
+        let devices: Vec<DeviceId> = self
+            .known_devices()?
+            .into_iter()
+            .filter(|device| *device != state.device)
+            .collect();
+        let minimum = {
+            let txn = self.handle.begin_read()?;
+            let table = txn.open_table(sync_state::TABLE)?;
+            let mut minimum: Option<u64> = None;
+            for device in &devices {
+                let key = sync_state::heard(*device);
+                let Some(value) = table.get(key.as_slice())? else {
+                    return Ok(0);
+                };
+                let cursor = decode_cursor(value.value(), "heard cursor has wrong length")?;
+                minimum = Some(minimum.map_or(cursor, |current| current.min(cursor)));
+            }
+            // 只上报过进度、但尚未被我们应用过变更的设备同样在拉取本机日志。
+            let prefix = sync_state::heard_prefix();
+            for item in table.range(prefix..)? {
+                let (key, value) = item?;
+                let key = key.value();
+                if !key.starts_with(prefix) {
+                    break;
+                }
+                if key.len() != prefix.len() + 16 {
+                    continue;
+                }
+                if key[prefix.len()..] == state.device.as_bytes()[..] {
+                    continue;
+                }
+                let cursor = decode_cursor(value.value(), "heard cursor has wrong length")?;
+                minimum = Some(minimum.map_or(cursor, |current| current.min(cursor)));
+            }
+            minimum
+        };
+        let Some(minimum) = minimum else {
+            return Ok(0);
+        };
+        // 至少保留最新一条：否则 `log_end` 会随空表回到 0，序列号被重置，
+        // 已有游标的对端将永远看不到新变更。
+        let log_end = self.changes_log_end()?;
+        let before = minimum.saturating_add(1).min(log_end);
+        if before == 0 || before <= state.log_start {
+            return Ok(0);
+        }
+        self.compact_changes(before)
+    }
+
+    fn changes_log_end(&self) -> Result<u64> {
+        let txn = self.handle.begin_read()?;
+        let table = txn.open_table(changes::TABLE)?;
+        let last = table.last()?.map(|(key, _)| key.value()).unwrap_or(0);
+        Ok(last)
+    }
+
     /// 读取本机同步状态。
     pub(super) fn read_sync_state(&self) -> Result<Option<SyncState>> {
         let txn = self.handle.begin_read()?;
@@ -642,6 +747,12 @@ fn random_unique_key_id(used: &BTreeSet<KeyId>) -> Result<KeyId> {
         }
     }
 }
+
+fn decode_cursor(bytes: &[u8], message: &'static str) -> Result<u64> {
+    let raw: [u8; 8] = bytes.try_into().map_err(|_| Error::Corrupted(message))?;
+    Ok(u64::from_be_bytes(raw))
+}
+
 impl Engine {
     /// 整页应用：记录、轮换 offer 与控制条目在同一个写事务内生效。
     pub fn apply_page(&self, page: &ChangePage) -> Result<ApplyReport> {

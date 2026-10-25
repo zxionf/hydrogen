@@ -17,6 +17,7 @@ pub const HEADER_LEN: usize = 77;
 pub const KIND_CHANGES: u8 = 0;
 pub const KIND_OFFERS: u8 = 1;
 pub const KIND_SNAPSHOT: u8 = 2;
+pub const KIND_PROGRESS: u8 = 3;
 
 const FRAME_LEN_OFFSET: usize = 0;
 const MAGIC_OFFSET: usize = 4;
@@ -103,6 +104,37 @@ pub fn decode_change_page(expected_db: [u8; 16], frame: &[u8]) -> Result<ChangeP
         log_end: header.log_end,
         entries,
     })
+}
+
+/// 进度帧：`sender` 报告自己在接收方日志中的已消费游标（帧头 `next`）。
+pub fn encode_progress(db_id: [u8; 16], device: DeviceId, cursor: u64) -> Result<Vec<u8>> {
+    encode_frame(
+        FrameMeta {
+            kind: KIND_PROGRESS,
+            db_id,
+            sender: device,
+            after: 0,
+            log_start: 0,
+            log_end: 0,
+            next: cursor,
+        },
+        Vec::new(),
+    )
+}
+
+/// 解码进度帧，返回 `(报告方设备, 已消费游标)`。
+pub fn decode_progress(expected_db: [u8; 16], frame: &[u8]) -> Result<(DeviceId, u64)> {
+    let (header, entries) = parse_frame(frame)?;
+    if header.kind != KIND_PROGRESS {
+        return Err(Error::InvalidArgument("frame is not a progress report"));
+    }
+    if header.db_id != expected_db {
+        return Err(Error::InvalidArgument("frame belongs to another database"));
+    }
+    if header.count != 0 || !entries.is_empty() {
+        return Err(Error::Corrupted("progress frame carries entries"));
+    }
+    Ok((header.sender, header.next))
 }
 
 pub fn encode_offers(db_id: [u8; 16], page: &OfferPage) -> Result<Vec<u8>> {
@@ -313,7 +345,10 @@ fn parse_frame(frame: &[u8]) -> Result<(Header, Vec<&[u8]>)> {
         });
     }
     let kind = frame[KIND_OFFSET];
-    if !matches!(kind, KIND_CHANGES | KIND_OFFERS | KIND_SNAPSHOT) {
+    if !matches!(
+        kind,
+        KIND_CHANGES | KIND_OFFERS | KIND_SNAPSHOT | KIND_PROGRESS
+    ) {
         return Err(Error::InvalidArgument("unknown frame kind"));
     }
     if frame[FLAGS_OFFSET] != 0 {

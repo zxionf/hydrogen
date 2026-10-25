@@ -178,3 +178,64 @@ async fn facade_maintenance_mode_steps_migration() {
 
     kernel.close().await.unwrap();
 }
+
+#[tokio::test]
+async fn facade_auto_compaction_follows_reported_progress() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = Kernel::open(
+        options(&dir.path().join("a.redb")),
+        Credential::password(PASSWORD),
+    )
+    .await
+    .unwrap();
+    let info_a = a.sync().unwrap().enable_sync(None).unwrap();
+    let notes = a
+        .namespace("notes")
+        .unwrap()
+        .collection::<String>("note")
+        .unwrap();
+    for index in 0..4 {
+        notes
+            .put(RecordId::new_v7(), &format!("value-{index}"))
+            .await
+            .unwrap();
+    }
+
+    let offer = a
+        .create_pairing_offer(Duration::from_secs(600))
+        .await
+        .unwrap();
+    let b = open_with_pairing(
+        options(&dir.path().join("b.redb")),
+        Credential::password(PASSWORD),
+        &offer,
+        Zeroizing::new(offer.secret.clone()),
+    )
+    .await
+    .unwrap();
+
+    let sync_a = a.sync().unwrap();
+    let sync_b = b.sync().unwrap();
+    let page = sync_a.changes_since(0, 1000).unwrap();
+    sync_b.apply(&sync_a.encode(&page).unwrap()).unwrap();
+
+    // B 上报进度；A 自动裁剪到最新一条之前。
+    let frame = b.sync_progress_frame(info_a.device_id).await.unwrap();
+    let cursor = a.apply_sync_progress(frame).await.unwrap();
+    assert_eq!(cursor, page.next);
+    assert_eq!(a.compact_changes_auto().await.unwrap(), cursor - 1);
+    assert_eq!(a.sync_info().unwrap().log_start, cursor);
+
+    // 落后游标要求重同步；最新一条仍可读。
+    assert!(matches!(
+        sync_a.changes_since(cursor - 2, 100),
+        Err(Error::SyncResyncRequired { .. })
+    ));
+    assert_eq!(
+        sync_a.changes_since(cursor - 1, 100).unwrap().entries.len(),
+        1
+    );
+
+    a.close().await.unwrap();
+    b.close().await.unwrap();
+}

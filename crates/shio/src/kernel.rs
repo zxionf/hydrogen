@@ -16,7 +16,7 @@ use secrecy::{ExposeSecret, SecretString};
 use shio_core::model::{validate_name, NameKind, DEFAULT_MAX_VALUE_SIZE};
 use shio_core::store::{BackupInfo, CompactReport, Engine, EngineOptions, Stats};
 #[cfg(feature = "sync")]
-use shio_core::{KeyId, MaintenanceOutcome, MigrationStep};
+use shio_core::{DeviceId, KeyId, MaintenanceOutcome, MigrationStep};
 #[cfg(feature = "sync")]
 use shio_sync::{PairingOffer, Sync as SyncApi, SyncHandle, SyncInfo};
 use tokio::sync::Notify;
@@ -412,6 +412,30 @@ impl Kernel {
     ) -> Result<MigrationStep> {
         self.inner
             .run_write(move |engine| engine.migrate_tick(to, budget, max_records))
+            .await
+    }
+
+    /// 生成本机上报给 `peer` 的进度帧；对端用它判断可安全裁剪到哪里。
+    #[cfg(feature = "sync")]
+    pub async fn sync_progress_frame(&self, peer: DeviceId) -> Result<Vec<u8>> {
+        self.inner
+            .run(move |engine| SyncApi::new(engine).progress_frame(peer))
+            .await
+    }
+
+    /// 应用对端的进度帧；返回落盘后的已消费游标。
+    #[cfg(feature = "sync")]
+    pub async fn apply_sync_progress(&self, frame: Vec<u8>) -> Result<u64> {
+        self.inner
+            .run_write(move |engine| SyncApi::new(engine).apply_progress(&frame))
+            .await
+    }
+
+    /// 按对端进度自动裁剪变更日志；返回删除条数。
+    #[cfg(feature = "sync")]
+    pub async fn compact_changes_auto(&self) -> Result<u64> {
+        self.inner
+            .run_write(|engine| SyncApi::new(engine).compact_changes_auto())
             .await
     }
 }

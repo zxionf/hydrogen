@@ -421,6 +421,7 @@ password (UTF-8 bytes)
 | `b"baseline_key"` | 记录键字节 | 基线扫描的最后一个记录键；缺失表示从起点开始 |
 | `b"log_start"` | `u64` 大端 | 当前保留的最早日志序号；空日志为 1 |
 | `b"peer/" + dev16` | `u64` 大端 | 已消费的对方日志序号 |
+| `b"heard/" + dev16` | `u64` 大端 | 该设备已消费到本机日志的序号；单调，自动裁剪的依据 |
 | `b"rot/" + to16` | `ChangeBlob`（kind=1） | 轮换 offer 的持久副本 |
 | `b"ack/" + to16 + dev16` | `u8` = 1 | 已收到该设备对 `to` 的 ack |
 | `b"cur/" + dev16` | `key_id16` | 该设备最近公告的当前写 key |
@@ -611,7 +612,7 @@ password (UTF-8 bytes)
 1. `format=2` 的 `RecordBlob`：`ct_len + 76 == value.len()`；`key_id` 必须存在于 `shio.keys2`。
 2. `meta.key_id` 必须存在于 `shio.keys2`，且是本机当前写 key。
 3. `kind=0` 日志与记录 header 必须一致；日志中的 blob 必须是 `SHR2`（升级期间同步尚未启用，因此日志里不出现 `SHR1`）。
-4. `shio.sync` 的 `db`、`dev` 不可更换；`peer/` 游标单调增加；`log_start` 只前移。
+4. `shio.sync` 的 `db`、`dev` 不可更换；`peer/`、`heard/` 游标单调增加；`log_start` 只前移，自动裁剪至少保留最新一条日志。
 5. `rot/`、`ack/`、`cur/`、`mig/` 的 id 必须是 16 字节；`ack/` 与 `mig/` 只写 1。
 6. 升级完成后不得再写 `shio.keys`；旧二进制不得打开 meta=2 的库。
 7. 同步模式禁止 `purge`；删除只写墓碑。

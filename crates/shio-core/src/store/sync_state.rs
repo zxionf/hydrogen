@@ -36,6 +36,7 @@ pub const KEY_UPGRADE: &[u8] = b"upgrade";
 pub const KEY_MIGRATION: &[u8] = b"migration";
 
 const PEER_PREFIX: &[u8] = b"peer/";
+const HEARD_PREFIX: &[u8] = b"heard/";
 const ROTATION_PREFIX: &[u8] = b"rot/";
 const ACK_PREFIX: &[u8] = b"ack/";
 const CURRENT_PREFIX: &[u8] = b"cur/";
@@ -45,6 +46,11 @@ const UPGRADE_KEY_PREFIX: &[u8] = b"upgrade/key/";
 /// 对端游标键。
 pub fn peer(device: DeviceId) -> Vec<u8> {
     prefixed(PEER_PREFIX, device.as_bytes())
+}
+
+/// 对端已消费到本机日志的进度键。
+pub fn heard(device: DeviceId) -> Vec<u8> {
+    prefixed(HEARD_PREFIX, device.as_bytes())
 }
 
 /// 轮换 offer 键。
@@ -86,6 +92,10 @@ pub fn upgrade_key(legacy: u16) -> Vec<u8> {
 /// 所有 `ACk_PREFIX`/`CURRENT_PREFIX`/`MIGRATED_PREFIX` 等前缀，供迭代。
 pub const fn peer_prefix() -> &'static [u8] {
     PEER_PREFIX
+}
+/// 对端进度前缀。
+pub const fn heard_prefix() -> &'static [u8] {
+    HEARD_PREFIX
 }
 /// 轮换 offer 前缀。
 pub const fn rotation_prefix() -> &'static [u8] {

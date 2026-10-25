@@ -920,6 +920,161 @@ static int compact_mode(const char *path)
     return 0;
 }
 
+static void uuid_parse(const char *text, uint8_t out[16], const char *what)
+{
+    char compact[33];
+    size_t out_index = 0;
+    size_t index;
+
+    for (index = 0; text[index] != '\0'; index++) {
+        if (text[index] == '-') {
+            continue;
+        }
+        if (out_index + 1 >= sizeof(compact)) {
+            fprintf(stderr, "%s: uuid is too long\n", what);
+            exit(1);
+        }
+        compact[out_index++] = text[index];
+    }
+    compact[out_index] = '\0';
+    if (out_index != 32) {
+        fprintf(stderr, "%s: uuid has %zu hex digits\n", what, out_index);
+        exit(1);
+    }
+    hex_decode_16(compact, out);
+}
+
+static int auto_compact_mode(const char *path)
+{
+    static const char *PEER_PASSWORD = "android-auto-compact-peer";
+    const char *options = "{\"create\":true}";
+    char peer_path[1024];
+    shio_kernel *a = NULL;
+    shio_kernel *b = NULL;
+    uint8_t *buf = NULL;
+    size_t len = 0;
+    uint8_t *frame = NULL;
+    size_t frame_len = 0;
+    uint8_t *json = NULL;
+    size_t json_len = 0;
+    uint8_t device_a[16];
+    uint64_t cursor = 0;
+    uint64_t removed = 0;
+    uint64_t log_start = 0;
+    uint64_t log_end = 0;
+    char *text = NULL;
+    char *secret = NULL;
+    int32_t status;
+    int i = 0;
+
+    snprintf(peer_path, sizeof(peer_path), "%s.peer", path);
+    remove(path);
+    remove(peer_path);
+
+    expect(shio_open(path, (const uint8_t *)PASSWORD, strlen(PASSWORD),
+                     (const uint8_t *)options, strlen(options), &a),
+           "auto-compact open(a)");
+    expect(shio_sync_enable(a, NULL, &buf, &len), "auto-compact enable(a)");
+    text = take_text(buf, len, "auto-compact enable(a)");
+    {
+        char *device = json_string(text, "device_id", "auto-compact enable(a)");
+        uuid_parse(device, device_a, "auto-compact enable(a)");
+        free(device);
+    }
+    free(text);
+
+    expect(shio_sync_create_pairing(a, 600, &frame, &frame_len, &json, &json_len),
+           "auto-compact pairing");
+    text = take_text(json, json_len, "auto-compact pairing");
+    secret = json_string(text, "secret", "auto-compact pairing");
+    free(text);
+    expect(shio_open_with_pairing(peer_path,
+                                  (const uint8_t *)PEER_PASSWORD,
+                                  strlen(PEER_PASSWORD),
+                                  (const uint8_t *)options, strlen(options),
+                                  frame, frame_len,
+                                  (const uint8_t *)secret, strlen(secret), &b),
+           "auto-compact open(b)");
+    shio_free(frame, frame_len);
+    frame = NULL;
+    frame_len = 0;
+    free(secret);
+    secret = NULL;
+
+    for (i = 0; i < 4; i++) {
+        char payload[48];
+        uint8_t id[16];
+        memset(id, 0, sizeof(id));
+        id[0] = 0xc0;
+        id[15] = (uint8_t)i;
+        snprintf(payload, sizeof(payload), "{\"n\":%d}", i);
+        expect(shio_put(a, "vault", "entries", id,
+                        (const uint8_t *)payload, strlen(payload), &buf, &len),
+               "auto-compact put(a)");
+        shio_free(buf, len);
+        buf = NULL;
+        len = 0;
+    }
+
+    pull_changes(a, b, "auto-compact changes(a->b)");
+
+    /* B 上报进度：它已经读到 A 的日志末尾。 */
+    expect(shio_sync_progress_frame(b, device_a, &frame, &frame_len),
+           "auto-compact progress(b)");
+    expect(shio_sync_apply_progress(a, frame, frame_len, &cursor),
+           "auto-compact apply_progress(a)");
+    shio_free(frame, frame_len);
+    frame = NULL;
+    frame_len = 0;
+    if (cursor < 2) {
+        fprintf(stderr, "auto-compact cursor too small: %llu\n",
+                (unsigned long long)cursor);
+        return 1;
+    }
+
+    expect(shio_sync_compact_auto(a, &removed), "auto-compact compact(a)");
+    if (removed != cursor - 1) {
+        fprintf(stderr, "auto-compact removed %llu, expected %llu\n",
+                (unsigned long long)removed, (unsigned long long)(cursor - 1));
+        return 1;
+    }
+
+    text = sync_info_text(a, "auto-compact info(a)");
+    log_start = json_u64(text, "log_start", "auto-compact info(a)");
+    log_end = json_u64(text, "log_end", "auto-compact info(a)");
+    free(text);
+    if (log_start != cursor || log_end != cursor) {
+        fprintf(stderr, "auto-compact range %llu..%llu, expected %llu\n",
+                (unsigned long long)log_start, (unsigned long long)log_end,
+                (unsigned long long)cursor);
+        return 1;
+    }
+
+    /* 落后游标要求重同步；最新一条仍可读。 */
+    status = shio_sync_changes(a, cursor - 2, 100, &frame, &frame_len, NULL, NULL);
+    if (status != SHIO_SYNC_RESYNC_REQUIRED) {
+        fprintf(stderr, "auto-compact stale cursor returned %d\n", (int)status);
+        return 1;
+    }
+    expect(shio_sync_changes(a, cursor - 1, 100, &frame, &frame_len, NULL, NULL),
+           "auto-compact changes(last)");
+    shio_free(frame, frame_len);
+    frame = NULL;
+    frame_len = 0;
+
+    printf("auto-compact cursor: %llu removed: %llu\n",
+           (unsigned long long)cursor, (unsigned long long)removed);
+    printf("AUTO_COMPACT_OK\n");
+
+    expect(shio_close(a), "auto-compact close(a)");
+    shio_kernel_destroy(a);
+    expect(shio_close(b), "auto-compact close(b)");
+    shio_kernel_destroy(b);
+    remove(path);
+    remove(peer_path);
+    return 0;
+}
+
 static int backup_restore_mode(const char *path)
 {
     shio_kernel *source = NULL;
@@ -1255,7 +1410,7 @@ int main(int argc, char **argv)
                 "usage: %s <database-path> "
                 "[smoke|sync|hold|probe|check|read-hold|read-probe|read-locked|"
                 "rotate-many|resume-rotation|migration-progress|maintenance|"
-                "cooperative|compact|backup-restore]\n",
+                "cooperative|compact|auto-compact|backup-restore]\n",
                 argv[0]);
         return 2;
     }
@@ -1332,6 +1487,10 @@ int main(int argc, char **argv)
 
     if (strcmp(mode, "compact") == 0) {
         return compact_mode(path);
+    }
+
+    if (strcmp(mode, "auto-compact") == 0) {
+        return auto_compact_mode(path);
     }
 
     if (strcmp(mode, "backup-restore") == 0) {

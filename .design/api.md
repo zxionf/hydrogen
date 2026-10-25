@@ -398,6 +398,7 @@ C++ 与 Android 通过 `shio-ffi` 调用；契约头文件为 `crates/shio-ffi/i
 - C ABI 补齐同样只做增量符号：`shio_purge` 暴露 facade 已有的物理删除（同步启用时返回 `SHIO_SYNC_ENABLED`，不写墓碑），`shio_collections` 返回按名称升序的 JSON 字符串数组；`SHIO_ABI_VERSION` 保持 1。
 - 维护模式同样是增量符号：`shio_sync_begin_maintenance` / `shio_sync_end_maintenance` / `shio_sync_migrate_step`。窗口内普通写返回 `SHIO_BUSY`，读放行；`SHIO_ABI_VERSION` 保持 1。
 - 合作式调度 `shio_sync_migrate_tick` 同样以增量符号追加：不要求维护模式、不冻结写，调用间隙普通读写照常；`SHIO_ABI_VERSION` 保持 1。
+- 自动日志裁剪以增量符号追加：`shio_sync_progress_frame` / `shio_sync_apply_progress` / `shio_sync_compact_auto`；新增 `SHY2` kind=3 进度帧，旧版本会以未知 kind 拒绝该帧，但不会主动收到；`SHIO_ABI_VERSION` 保持 1。
 - 同步业务数据只以不透明的 `SHY2` 帧进出；Kotlin/Java 不解析帧内部结构。同步状态、轮换信息和应用报告是小体积 JSON。
 
 ```c
@@ -531,6 +532,11 @@ int32_t shio_sync_retire(shio_kernel *k, const uint8_t *from);
 int32_t shio_sync_prune_offers(shio_kernel *k, const uint8_t *to);
 int32_t shio_sync_compact(shio_kernel *k, uint64_t before,
                           uint64_t *out_count);
+int32_t shio_sync_progress_frame(shio_kernel *k, const uint8_t *peer,
+                                 uint8_t **out_frame, size_t *out_frame_len);
+int32_t shio_sync_apply_progress(shio_kernel *k, const uint8_t *frame,
+                                 size_t frame_len, uint64_t *out_cursor);
+int32_t shio_sync_compact_auto(shio_kernel *k, uint64_t *out_count);
 
 /*
  * 生成配对包；ttl_seconds 仅用于调用方展示/过期控制，0 使用 600 秒；
@@ -570,6 +576,7 @@ JSON 形状：
 - `shio_sync_migrate_all_ex` 在取消时返回 `SHIO_CANCELLED`；已提交批次保留，旧 key 不删除。恢复中断轮换先取 `shio_sync_rotation_state` 的 `to`，再迁移。
 - `shio_sync_migrate_step` 返回本步的 `{"scanned":N,"migrated":N,"done":bool}`；`done=1` 表示已收尾。取消只影响正在执行的这一步，之后仍可继续步进。
 - `shio_sync_migrate_tick` 返回本次 tick 的 `{"scanned":N,"migrated":N,"done":bool}`；`done=1` 表示已收尾。一次调用在 `budget_ms` 内可跑多批，每批单独提交；调用间隙普通读写不受限，不需要维护模式。`budget_ms` / `max_records` 越界返回 `SHIO_INVALID_ARGUMENT`，只读句柄返回 `SHIO_READ_ONLY`，未启用同步返回 `SHIO_SYNC_DISABLED`。
+- `shio_sync_progress_frame` 生成 77 字节 `SHY2` kind=3 帧（无条目，帧头 `next` = 本机在 `peer` 日志中的已消费游标）；`shio_sync_apply_progress` 校验 `db_id` 后把 `sender`/`cursor` 写入 `heard/<sender>`，`out_cursor` 返回落盘值（可为 NULL）。`shio_sync_compact_auto` 返回删除条数，没有已知对端或缺少报告时返回 0。维护模式返回 `SHIO_BUSY`，未启用同步返回 `SHIO_SYNC_DISABLED`。
 - 维护模式期间 `shio_insert` / `shio_put` / `shio_delete` / `shio_batch` / `shio_change_password` / `shio_rotate_data_key` 等写入口返回 `SHIO_BUSY`；`shio_sync_begin_maintenance` 在只读句柄返回 `SHIO_READ_ONLY`、未启用同步返回 `SHIO_SYNC_DISABLED`。
 - `shio_sync_apply` / `shio_sync_apply_snapshot` 返回 `{"applied":N,"skipped":N,"controls":N}`。
 - `shio_sync_create_pairing` 返回 `{"secret":"<Base32>","fingerprint":"<6 位十六进制>"}`；`secret` 只用于配对展示，不得写日志。
@@ -596,6 +603,7 @@ JSON 形状：
 - `key_id` 允许新旧密钥并存，是轮换与多设备密钥分发的基础；`format=1` 为 u16，`format=2` 为 16 字节 `KeyId`。
 - `shio.changes`、`shio.sync`、`shio.keys2` 是同步库新增表，旧版本不可见；旧版本也不会写变更日志。
 - 物理压缩只重排 redb 页，不改变记录格式、密钥链或同步状态；压缩前后的库对任何支持的版本都可读。
+- 自动日志裁剪只前移 `log_start` 并删除已确认消费的条目，不改记录、密钥或同步身份；落后于裁剪点的对端收到 `SyncResyncRequired`，按快照流程重同步。
 
 ## 10. 示例
 
@@ -961,6 +969,9 @@ impl Engine {
     pub fn prune_rotation_offers(&self, to: KeyId) -> Result<()>;
 
     pub fn compact_changes(&self, before: u64) -> Result<u64>;
+    pub fn peer_cursor(&self, peer: DeviceId) -> Result<Option<u64>>;
+    pub fn apply_peer_progress(&self, device: DeviceId, cursor: u64) -> Result<u64>;
+    pub fn compact_changes_auto(&self) -> Result<u64>;
 
     pub fn create_pairing_bundle(&self, ttl: Duration) -> Result<Vec<u8>>;
     pub fn create_pairing_bundle_with_secret(
@@ -980,6 +991,8 @@ impl Engine {
 - `restore` 接受不存在的目标或 0 字节文件；先复制到同目录临时文件，用原口令打开校验，再替换空目标。校验失败删除临时文件；目标非空返回 `InvalidArgument`。`options.create` 被忽略，恢复出的库保留源库身份与同步状态。
 - `enable_sync` 在 `format=1` 上执行不可回退升级；`format=2` 直接初始化。
 - `apply_page` 整页一个写事务，推进 `peer/<sender>` 游标；缺 key 返回 `RotationRequired`。
+- `peer_cursor` 返回本机在对方日志中的已消费游标，供生成进度帧；`apply_peer_progress` 把对方上报的「已读到本机哪一条」写入 `heard/<device>`，单调推进并按 `log_end` 截断。
+- `compact_changes_auto` 在所有已知对端（`cur/` 与 `heard/` 的并集，排除本机）都上报过进度后，裁剪到 `min(heard) + 1`，且至少保留最新一条日志；任一 `cur/` 对端缺报告时返回 0。
 - `apply_snapshot_page` 同样整页原子，写入的记录日志以本机 `device_id` 为 `writer`；缺 key 返回 `RotationRequired`。
 - `begin_rotation` 任意设备可调用；并发轮换产生不同随机 `to`，写 key 按 `(created_at, key_id)` 收敛。
 - `migrate_all` 重加密记录时推进 `updated_at`（至少 +1），避免旧密钥的同一逻辑版本在 LWW 的 blob 次序里把已迁移记录翻回旧密钥。
@@ -1084,6 +1097,9 @@ impl Kernel {
     pub async fn begin_maintenance(&self) -> Result<()>;
     pub async fn end_maintenance(&self) -> Result<MaintenanceOutcome>;
     pub async fn migrate_step(&self, to: KeyId, max_records: usize) -> Result<MigrationStep>;
+    pub async fn sync_progress_frame(&self, peer: DeviceId) -> Result<Vec<u8>>;
+    pub async fn apply_sync_progress(&self, frame: Vec<u8>) -> Result<u64>;
+    pub async fn compact_changes_auto(&self) -> Result<u64>;
     pub async fn migrate_tick(
         &self,
         to: KeyId,

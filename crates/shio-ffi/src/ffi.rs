@@ -1733,6 +1733,88 @@ pub unsafe extern "C" fn shio_sync_compact(
     })
 }
 
+/// 生成本机上报给 `peer` 的进度帧；对端用它判断可以安全裁剪到哪里。
+///
+/// # Safety
+///
+/// 句柄、16 字节对端设备 ID 与输出指针必须按 `include/shio.h` 的契约有效。
+#[no_mangle]
+pub unsafe extern "C" fn shio_sync_progress_frame(
+    handle: *mut ShioKernel,
+    peer: *const u8,
+    out_frame: *mut *mut u8,
+    out_frame_len: *mut usize,
+) -> i32 {
+    ffi_guard(|| {
+        reset_output(out_frame, out_frame_len)?;
+        let peer = input_optional_device_id(peer)?
+            .ok_or(Error::InvalidArgument("peer device id is null"))?;
+        // SAFETY: 调用方保证句柄来自 `shio_open` 且未 destroy。
+        let handle =
+            unsafe { handle.as_ref() }.ok_or(Error::InvalidArgument("kernel handle is null"))?;
+        let frame = handle.kernel()?.sync()?.progress_frame(peer)?;
+        set_output(frame, out_frame, out_frame_len)
+    })
+}
+
+/// 应用对端的进度帧；`out_cursor` 返回落盘后的已消费游标。
+///
+/// # Safety
+///
+/// 句柄、帧与可选输出指针必须按 `include/shio.h` 的契约有效。
+#[no_mangle]
+pub unsafe extern "C" fn shio_sync_apply_progress(
+    handle: *mut ShioKernel,
+    frame: *const u8,
+    frame_len: usize,
+    out_cursor: *mut u64,
+) -> i32 {
+    ffi_guard(|| {
+        if !out_cursor.is_null() {
+            // SAFETY: 调用方提供了可写指针。
+            unsafe { *out_cursor = 0 };
+        }
+        // SAFETY: 由调用方契约保证帧指针有效。
+        let frame = unsafe { input_bytes(frame, frame_len)? };
+        // SAFETY: 调用方保证句柄来自 `shio_open` 且未 destroy。
+        let handle =
+            unsafe { handle.as_ref() }.ok_or(Error::InvalidArgument("kernel handle is null"))?;
+        let cursor = handle.kernel()?.sync()?.apply_progress(frame)?;
+        if !out_cursor.is_null() {
+            // SAFETY: 调用方提供了可写指针。
+            unsafe { *out_cursor = cursor };
+        }
+        Ok(())
+    })
+}
+
+/// 按对端进度自动裁剪变更日志；没有任何已知对端或缺少进度时不裁剪。
+///
+/// # Safety
+///
+/// 句柄与可选输出指针必须按 `include/shio.h` 的契约有效。
+#[no_mangle]
+pub unsafe extern "C" fn shio_sync_compact_auto(
+    handle: *mut ShioKernel,
+    out_count: *mut u64,
+) -> i32 {
+    ffi_guard(|| {
+        if !out_count.is_null() {
+            // SAFETY: 调用方提供了可写指针。
+            unsafe { *out_count = 0 };
+        }
+        // SAFETY: 调用方保证句柄来自 `shio_open` 且未 destroy。
+        let handle =
+            unsafe { handle.as_ref() }.ok_or(Error::InvalidArgument("kernel handle is null"))?;
+        let count = handle.kernel()?.sync()?.compact_changes_auto()?;
+        if !out_count.is_null() {
+            // SAFETY: 调用方提供了可写指针。
+            unsafe { *out_count = count };
+        }
+        Ok(())
+    })
+}
+
 /// 生成配对包。
 ///
 /// # Safety

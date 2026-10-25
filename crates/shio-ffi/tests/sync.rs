@@ -934,3 +934,123 @@ fn sync_rejects_foreign_database_frame() {
     // SAFETY: 关闭后 destroy，且没有其它线程继续使用。
     unsafe { shio_kernel_destroy(c) };
 }
+
+fn progress_frame(handle: *mut ShioKernel, peer: &[u8; 16]) -> Vec<u8> {
+    let mut frame = ptr::null_mut();
+    let mut frame_len = 0;
+    // SAFETY: 句柄、设备 ID 与输出指针有效。
+    let status =
+        unsafe { shio_sync_progress_frame(handle, peer.as_ptr(), &mut frame, &mut frame_len) };
+    assert_eq!(status, SHIO_OK, "progress_frame failed: {}", last_error());
+    take_buffer(frame, frame_len)
+}
+
+fn apply_progress(handle: *mut ShioKernel, frame: &[u8]) -> u64 {
+    let mut cursor = 0;
+    // SAFETY: 句柄、帧与输出指针有效。
+    let status =
+        unsafe { shio_sync_apply_progress(handle, frame.as_ptr(), frame.len(), &mut cursor) };
+    assert_eq!(status, SHIO_OK, "apply_progress failed: {}", last_error());
+    cursor
+}
+
+fn compact_auto(handle: *mut ShioKernel) -> u64 {
+    let mut count = 0;
+    // SAFETY: 句柄与输出指针有效。
+    let status = unsafe { shio_sync_compact_auto(handle, &mut count) };
+    assert_eq!(status, SHIO_OK, "compact_auto failed: {}", last_error());
+    count
+}
+
+#[test]
+fn progress_report_drives_auto_log_compaction() {
+    let directory = tempfile::tempdir().unwrap();
+    let create = br#"{"create":true}"#;
+    let a = open(&directory.path().join("a.db"), b"auto-compact", create);
+    let info_a = enable_sync(a);
+    let device_a = uuid_bytes(info_a["device_id"].as_str().unwrap());
+
+    let (frame, secret) = create_pairing(a);
+    let b = open_with_pairing(
+        &directory.path().join("b.db"),
+        b"auto-compact",
+        &frame,
+        &secret,
+    );
+
+    let namespace = CString::new("vault").unwrap();
+    let collection = CString::new("entries").unwrap();
+    for index in 0..5u8 {
+        let id = [index + 1; 16];
+        let payload = format!(r#"{{"n":{index}}}"#);
+        let mut buffer = ptr::null_mut();
+        let mut len = 0;
+        // SAFETY: 句柄与输入输出指针有效。
+        let status = unsafe {
+            shio_put(
+                a,
+                namespace.as_ptr(),
+                collection.as_ptr(),
+                id.as_ptr(),
+                payload.as_ptr(),
+                payload.len(),
+                &mut buffer,
+                &mut len,
+            )
+        };
+        assert_eq!(status, SHIO_OK, "put failed: {}", last_error());
+        assert!(!take_buffer(buffer, len).is_empty());
+    }
+
+    let (change_frame, next, _) = changes(a, 0);
+    apply(b, &change_frame);
+
+    // B 上报「我读到 next」；A 据此只删到最新一条之前。
+    let progress = progress_frame(b, &device_a);
+    let cursor = apply_progress(a, &progress);
+    assert_eq!(cursor, next);
+    assert_eq!(compact_auto(a), cursor - 1);
+    let info = sync_info(a);
+    assert_eq!(info["log_start"].as_u64().unwrap(), cursor);
+    assert_eq!(info["log_end"].as_u64().unwrap(), cursor);
+
+    // 落后游标要求重新走快照。
+    let mut frame_ptr = ptr::null_mut();
+    let mut frame_len = 0;
+    let mut out_next = 0;
+    let mut out_more = 0;
+    // SAFETY: 句柄与输出指针有效。
+    let status = unsafe {
+        shio_sync_changes(
+            a,
+            cursor - 2,
+            100,
+            &mut frame_ptr,
+            &mut frame_len,
+            &mut out_next,
+            &mut out_more,
+        )
+    };
+    assert_eq!(status, SHIO_SYNC_RESYNC_REQUIRED);
+    assert!(frame_ptr.is_null() && frame_len == 0);
+
+    // 未启用同步的库拒绝自动裁剪。
+    let plain = open(&directory.path().join("plain.db"), b"auto-compact", create);
+    assert_eq!(
+        unsafe { shio_sync_compact_auto(plain, ptr::null_mut()) },
+        SHIO_SYNC_DISABLED
+    );
+    // SAFETY: 句柄有效且没有其它线程使用。
+    unsafe { shio_close(plain) };
+    // SAFETY: 同上。
+    unsafe { shio_kernel_destroy(plain) };
+
+    // SAFETY: 句柄有效且没有其它线程使用。
+    unsafe { shio_close(a) };
+    // SAFETY: 同上。
+    unsafe { shio_kernel_destroy(a) };
+    // SAFETY: 同上。
+    unsafe { shio_close(b) };
+    // SAFETY: 同上。
+    unsafe { shio_kernel_destroy(b) };
+}

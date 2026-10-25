@@ -387,6 +387,27 @@ int32_t shio_sync_compact(shio_kernel *handle,
                           uint64_t *out_count);
 
 /*
+ * 生成本机上报给 peer 的进度帧（SHY2 kind=3）。
+ * peer 是接收方设备 ID（16 字节，非空）。
+ */
+int32_t shio_sync_progress_frame(shio_kernel *handle,
+                                 const uint8_t *peer,
+                                 uint8_t **out_frame,
+                                 size_t *out_frame_len);
+
+/* 应用对端的进度帧；out_cursor 返回落盘后的已消费游标，可为 NULL。 */
+int32_t shio_sync_apply_progress(shio_kernel *handle,
+                                 const uint8_t *frame,
+                                 size_t frame_len,
+                                 uint64_t *out_cursor);
+
+/*
+ * 按对端进度自动裁剪变更日志。
+ * 只有全部已知对端都上报过进度时才推进；out_count 为删除条数，可为 NULL。
+ */
+int32_t shio_sync_compact_auto(shio_kernel *handle, uint64_t *out_count);
+
+/*
  * 生成配对包；ttl_seconds 仅用于调用方展示/过期控制，0 使用 600 秒；
  * 接收端固定按 10 分钟窗口校验 created_at。
  * out_frame 为 SHW2 外层帧，out_json 为 {"secret":"...","fingerprint":"..."}。

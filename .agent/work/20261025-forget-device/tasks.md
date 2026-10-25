@@ -9,4 +9,4 @@
 - [x] 步骤 7 FFI 测试：摘要字段、本机拒绝、未知设备全零
 - [x] 步骤 8 facade 测试：配对 → 进度上报 → 解绑 → 幂等与本机拒绝
 - [x] 步骤 9 Android harness：`forget` 模式（A/B/C，裁剪先 0 后非 0），x86_64 模拟器通过；同轮 10 个既有模式回归全 0
-- [x] 步骤 10 发布准备与验收：workspace 版本 `0.2.0` → `0.3.0`（`SPEC.md` 同步）；`cargo test --workspace --all-features`、`fmt --check`、`clippy -D warnings`、`cc -fsyntax-only` 通过（arm64 真机当轮未连接，待补跑）
+- [x] 步骤 10 发布准备与验收：workspace 版本 `0.2.0` → `0.3.0`（`SPEC.md` 同步）；`cargo test --workspace --all-features`、`fmt --check`、`clippy -D warnings`、`cc -fsyntax-only` 通过；arm64 真机 `10AE4N38SA000LK` 复跑 `forget` 与 11 模式回归通过

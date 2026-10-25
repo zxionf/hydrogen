@@ -9,4 +9,4 @@
 - [x] 步骤 7 facade：`shio::clone_backup`、`CloneInfo` 导出、目标 `.lock` 独占
 - [x] 步骤 8 测试：core（身份/日志/`peer` 清理/新配对设备只靠日志拿到全量/旧设备增量/非同步库/错误路径）、FFI 端到端、facade 端到端
 - [x] 步骤 9 Android harness：`clone` 模式（源库启用同步并写 3 条 → 备份 → 克隆 → 校验身份、日志 `1..4`、记录可读）
-- [x] 步骤 10 文档与验收：`api.md` §3/§4/§8/§9/§12、`data.md` §15.5、`notes.md`、`阶段计划.md`、`STATE.md`、决策 #58；x86_64 模拟器 `CLONE_OK`，`smoke`/`sync`/`migration-progress`/`maintenance`/`cooperative`/`compact`/`auto-compact`/`backup-restore` 回归通过；`cargo test --workspace --all-features`、`fmt --check`、`clippy -D warnings`、`cc -fsyntax-only` 通过（arm64 真机当轮未连接，待补跑）
+- [x] 步骤 10 文档与验收：`api.md` §3/§4/§8/§9/§12、`data.md` §15.5、`notes.md`、`阶段计划.md`、`STATE.md`、决策 #58；x86_64 模拟器 `CLONE_OK`，`smoke`/`sync`/`migration-progress`/`maintenance`/`cooperative`/`compact`/`auto-compact`/`backup-restore` 回归通过；`cargo test --workspace --all-features`、`fmt --check`、`clippy -D warnings`、`cc -fsyntax-only` 通过；arm64 真机 `10AE4N38SA000LK` 复跑 `clone` 与 11 模式回归通过
